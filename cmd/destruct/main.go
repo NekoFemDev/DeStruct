@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,6 +71,18 @@ Options:
   --decompile         Use decompiler (hermes: output .js, flutter: output .dart,
                        elf: output C-like pseudocode for every function in one
                        file - AArch64 binaries only)
+  --split-functions, -sf
+                      With --decompile (ELF), write each function to a
+                       separate .c file under <input>_decompiled/ and emit
+                       functions.json metadata (address, name, size, success)
+  --cross-references, -x
+                      With --decompile (ELF), add cross-reference comments
+                       (callers/callees) and emit an xrefs.json file
+  --simplify-cfg      Run CFG simplification / unreachable-block removal
+                       for AArch64 ELF decompilation (experimental)
+  --no-enhance        Disable enhanced comments when using --decompile (ELF)
+  --no-location-comments Disable source-location comments when using --decompile (ELF)
+  --print-options     Print the parsed configuration and exit
   -s, --search        Search for string in bytecode
   -t, --patch-string  Quick patch: replace instruction with string operand (true/false/nop)
   -p, --patch         Generate simplified format for manual patching
@@ -113,6 +126,10 @@ Examples:
 
 func handleJVM(args []string) {
 	opts, input := parseFlags(args)
+	if opts.printOptions {
+		printOptionsJSON("jvm", opts)
+		return
+	}
 	if input == "" {
 		fmt.Fprintln(os.Stderr, "Error: input file required")
 		os.Exit(1)
@@ -471,6 +488,10 @@ func handlePatch(args []string) {
 
 func handleFlutter(args []string) {
 	opts, input := parseFlags(args)
+	if opts.printOptions {
+		printOptionsJSON("flutter", opts)
+		return
+	}
 	if input == "" {
 		fmt.Fprintln(os.Stderr, "Error: input file required")
 		os.Exit(1)
@@ -511,14 +532,35 @@ func handleELF(args []string) {
 		os.Exit(1)
 	}
 
+	// --cross-references implies --decompile for ELF, since it needs the
+	// decompilation pass to analyse function bodies.
+	if opts.crossReferences {
+		opts.decompile = true
+	}
+
+	// --decompile automatically enables enhancement output; use
+	// --no-enhance / --no-location-comments to opt out.
+	enhance := opts.decompile && !opts.noEnhance
+	sourceLocations := opts.decompile && !opts.noLocationComments
+
+	if opts.printOptions {
+		printOptionsJSON("elf", opts)
+		return
+	}
+
 	p := pipeline.New(pipeline.Options{
-		Input:     input,
-		Output:    opts.output,
-		Format:    pipeline.FormatELF,
-		Verbose:   opts.verbose,
-		Deobf:     opts.deobfuscate,
-		Project:   opts.project,
-		Decompile: opts.decompile,
+		Input:           input,
+		Output:          opts.output,
+		Format:          pipeline.FormatELF,
+		Verbose:         opts.verbose,
+		Deobf:           opts.deobfuscate,
+		Project:         opts.project,
+		Decompile:       opts.decompile,
+		EnhanceComments: enhance,
+		SourceLocations: sourceLocations,
+		SplitFunctions:  opts.splitFunctions,
+		CrossReferences: opts.crossReferences,
+		SimplifyCFG:     opts.simplifyCfg,
 	})
 
 	if err := p.Run(); err != nil {
@@ -531,6 +573,10 @@ func handleELF(args []string) {
 
 func handlePE(args []string) {
 	opts, input := parseFlags(args)
+	if opts.printOptions {
+		printOptionsJSON("pe", opts)
+		return
+	}
 	if input == "" {
 		fmt.Fprintln(os.Stderr, "Error: input file required")
 		os.Exit(1)
@@ -553,20 +599,61 @@ func handlePE(args []string) {
 	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
 }
 
+func cliOptionsMap(opts cliOpts) map[string]interface{} {
+	return map[string]interface{}{
+		"output":             opts.output,
+		"verbose":            opts.verbose,
+		"deobfuscate":        opts.deobfuscate,
+		"project":            opts.project,
+		"decompile":          opts.decompile,
+		"search":             opts.search,
+		"patch":              opts.patch,
+		"hex":                opts.hex,
+		"hermesDec":          opts.hermesDec,
+		"patchMap":           opts.patchMap,
+		"inputFile":          opts.inputFile,
+		"patchString":        opts.patchString,
+		"checkOnly":          opts.checkOnly,
+		"printOptions":       opts.printOptions,
+		"noEnhance":          opts.noEnhance,
+		"noLocationComments": opts.noLocationComments,
+		"splitFunctions":     opts.splitFunctions,
+		"crossReferences":    opts.crossReferences,
+		"simplifyCfg":        opts.simplifyCfg,
+	}
+}
+
+func printOptionsJSON(command string, opts cliOpts) {
+	cfg := cliOptionsMap(opts)
+	cfg["command"] = command
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(data))
+}
+
 type cliOpts struct {
-	output      string
-	verbose     bool
-	deobfuscate bool
-	project     bool
-	decompile   bool
-	search      string
-	patch       bool
-	hex         bool
-	hermesDec   bool
-	patchMap    bool
-	inputFile   string
-	patchString string
-	checkOnly   bool
+	output             string
+	verbose            bool
+	deobfuscate        bool
+	project            bool
+	decompile          bool
+	search             string
+	patch              bool
+	hex                bool
+	hermesDec          bool
+	patchMap           bool
+	inputFile          string
+	patchString        string
+	checkOnly          bool
+	printOptions       bool
+	noEnhance          bool
+	noLocationComments bool
+	splitFunctions     bool
+	crossReferences    bool
+	simplifyCfg        bool
 }
 
 func parseFlags(args []string) (cliOpts, string) {
@@ -615,6 +702,18 @@ func parseFlags(args []string) (cliOpts, string) {
 			opts.hermesDec = true
 		case "--patch-map":
 			opts.patchMap = true
+		case "--print-options":
+			opts.printOptions = true
+		case "--no-enhance":
+			opts.noEnhance = true
+		case "--no-location-comments":
+			opts.noLocationComments = true
+		case "--split-functions", "-sf":
+			opts.splitFunctions = true
+		case "--cross-references", "-x":
+			opts.crossReferences = true
+		case "--simplify-cfg":
+			opts.simplifyCfg = true
 		case "--no-project":
 			opts.project = false
 		default:

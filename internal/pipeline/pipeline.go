@@ -2,13 +2,16 @@ package pipeline
 
 import (
 	"archive/zip"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/destruct/destruct/internal/arm64lift"
 	"github.com/destruct/destruct/internal/csharp"
@@ -29,13 +32,18 @@ const (
 )
 
 type Options struct {
-	Input     string
-	Output    string
-	Format    Format
-	Verbose   bool
-	Deobf     bool
-	Project   bool
-	Decompile bool
+	Input           string
+	Output          string
+	Format          Format
+	Verbose         bool
+	Deobf           bool
+	Project         bool
+	Decompile       bool
+	EnhanceComments bool
+	SourceLocations bool
+	SplitFunctions  bool
+	CrossReferences bool
+	SimplifyCFG     bool
 }
 
 type Pipeline struct {
@@ -62,6 +70,15 @@ func (p *Pipeline) Run() error {
 		return p.decompileAndGenerateJVM()
 
 	case FormatELF:
+		if p.opts.Decompile && p.opts.SplitFunctions {
+			return p.decompileELFArm64()
+		}
+		if p.opts.Decompile && p.opts.EnhanceComments {
+			if err := p.decompileELFArm64(); err != nil {
+				return err
+			}
+			return p.ApplyARM64DecompilationEnhancements()
+		}
 		return p.disassembleELF()
 
 	default:
@@ -379,13 +396,29 @@ func (p *Pipeline) decompileELFArm64() error {
 
 	resolver := elf.SymbolResolver()
 	strResolver := func(addr uint64) (string, bool) { return elf.ReadCString(addr) }
+	dataReader := elf.DataReader()
 
-	outPath := filepath.Join(p.opts.Output, filepath.Base(p.opts.Input)+".decompiled.c")
-	f, err := os.Create(outPath)
-	if err != nil {
-		return fmt.Errorf("create output file: %w", err)
+	baseName := filepath.Base(p.opts.Input)
+
+	// Split-function mode writes every function to its own file inside
+	// <basename>_decompiled/ plus a functions.json index. The classic mode
+	// keeps the whole binary in a single .decompiled.c file.
+	var splitDir string
+	var f *os.File
+	var metas []functionMeta
+	if p.opts.SplitFunctions {
+		splitDir = filepath.Join(p.opts.Output, baseName+"_decompiled")
+		if err := os.MkdirAll(splitDir, 0o755); err != nil {
+			return fmt.Errorf("creating split output directory: %w", err)
+		}
+	} else {
+		outPath := filepath.Join(p.opts.Output, baseName+".decompiled.c")
+		f, err = os.Create(outPath)
+		if err != nil {
+			return fmt.Errorf("create output file: %w", err)
+		}
+		defer f.Close()
 	}
-	defer f.Close()
 
 	candidates := functionCandidatesFromSymbols(elf)
 	if len(candidates) == 0 {
@@ -408,47 +441,62 @@ func (p *Pipeline) decompileELFArm64() error {
 		}
 	}
 
+	// Optional cross-reference pre-pass: discover callers/callees before
+	// emitting output so each function can carry XREF comments.
+	var xrefs map[uint64]*functionXrefs
+	if p.opts.CrossReferences {
+		xrefs = computeCrossReferences(candidates, elf, d, resolver)
+	}
+
 	var ok, empty, failed int
 	lastReport := time.Now()
 	for _, c := range candidates {
-		var sec *native.SectionHeader
-		for j := range elf.Sections {
-			s := &elf.Sections[j]
-			if c.addr >= s.Addr && c.addr < s.Addr+s.Size {
-				sec = s
-				break
-			}
-		}
-		if sec == nil {
+		code, codeOK := readFunctionCode(c, elf)
+		if !codeOK {
 			continue
 		}
-		fileOff := sec.Offset + (c.addr - sec.Addr)
-		if fileOff+c.size > uint64(len(elf.Data)) {
-			continue
-		}
-		code := elf.Data[fileOff : fileOff+c.size]
 		insns, err := d.DisassembleDetailed(code, c.addr)
 		if err != nil || len(insns) == 0 {
 			continue
 		}
 
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					failed++
-					fmt.Fprintf(f, "// %s\n// [failed to decompile: %v]\n\n", arm64lift.Demangle(c.name), r)
+		if p.opts.SplitFunctions {
+			meta := p.writeSplitFunction(splitDir, c, insns, resolver, strResolver, dataReader, xrefs[c.addr])
+			if meta.Success {
+				if meta.Empty {
+					empty++
+				} else {
+					ok++
 				}
-			}()
-			stmts := arm64lift.LiftFunction(insns, nil, resolver, strResolver)
-			if len(stmts) == 0 {
-				empty++
 			} else {
-				ok++
+				failed++
 			}
-			fmt.Fprintf(f, "// %s\n", arm64lift.Demangle(c.name))
-			arm64lift.RenderStmts(f, stmts, 0)
-			fmt.Fprintln(f)
-		}()
+			metas = append(metas, functionMeta{
+				Address: fmt.Sprintf("0x%x", c.addr),
+				Name:    c.name,
+				Size:    c.size,
+				Success: meta.Success,
+			})
+		} else {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						failed++
+						fmt.Fprintf(f, "// %s\n// [failed to decompile: %v]\n\n", arm64lift.Demangle(c.name), r)
+					}
+				}()
+				stmts := arm64lift.LiftFunctionWithData(insns, nil, resolver, strResolver, dataReader, p.opts.SimplifyCFG)
+				if len(stmts) == 0 {
+					empty++
+				} else {
+					ok++
+				}
+				fmt.Fprintf(f, "// %s\n", arm64lift.Demangle(c.name))
+				writeXrefComments(f, xrefs[c.addr])
+				arm64lift.RenderStmts(f, stmts, 0)
+				fmt.Fprintln(f)
+			}()
+		}
 
 		if p.opts.Verbose {
 			fmt.Printf("  [%d/%d/%d ok/empty/failed] %s\n", ok, empty, failed, c.name)
@@ -458,7 +506,30 @@ func (p *Pipeline) decompileELFArm64() error {
 		}
 	}
 
-	fmt.Printf("Decompiled %d functions (%d empty, %d failed) to %s\n", ok, empty, failed, outPath)
+	if p.opts.SplitFunctions {
+		jsonPath := filepath.Join(splitDir, "functions.json")
+		data, err := json.MarshalIndent(metas, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to write functions.json: %v\n", err)
+		} else if err := os.WriteFile(jsonPath, data, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to write functions.json: %v\n", err)
+		}
+		if p.opts.CrossReferences {
+			xrefsPath := filepath.Join(splitDir, "xrefs.json")
+			if err := writeXrefsJSON(xrefsPath, xrefs); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to write xrefs.json: %v\n", err)
+			}
+		}
+		fmt.Printf("Decompiled %d functions (%d empty, %d failed) to %s/\n", ok, empty, failed, splitDir)
+	} else {
+		if p.opts.CrossReferences {
+			xrefsPath := filepath.Join(p.opts.Output, baseName+".xrefs.json")
+			if err := writeXrefsJSON(xrefsPath, xrefs); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to write xrefs.json: %v\n", err)
+			}
+		}
+		fmt.Printf("Decompiled %d functions (%d empty, %d failed) to %s\n", ok, empty, failed, filepath.Join(p.opts.Output, baseName+".decompiled.c"))
+	}
 	return nil
 }
 
@@ -473,28 +544,135 @@ type funcCandidate struct {
 	name string
 }
 
+// functionMeta describes one decompiled function for functions.json.
+type functionMeta struct {
+	Address string `json:"address"`
+	Name    string `json:"name"`
+	Size    uint64 `json:"size"`
+	Success bool   `json:"success"`
+}
+
+// splitFuncResult is the outcome of writing a single split-function file.
+type splitFuncResult struct {
+	Success bool
+	Empty   bool
+}
+
+// functionFileName picks a filesystem-safe name for a per-function output
+// file. Real symbol names are sanitized and kept together with the address
+// to avoid collisions; discovered functions use the classic sub_<addr>.c form.
+func functionFileName(c funcCandidate) string {
+	base := "sub"
+	if c.name != "" && !strings.HasPrefix(c.name, "sub_") {
+		base = sanitizeFunctionName(c.name)
+	}
+	return fmt.Sprintf("%s_%x.c", base, c.addr)
+}
+
+// sanitizeFunctionName replaces characters that are unsafe in filenames.
+func sanitizeFunctionName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "sub"
+	}
+	return b.String()
+}
+
+// writeSplitFunction writes one function to its own .c file inside splitDir.
+func (p *Pipeline) writeSplitFunction(
+	splitDir string,
+	c funcCandidate,
+	insns []native.DetailedInstruction,
+	resolver arm64lift.SymbolResolver,
+	strResolver arm64lift.StringResolver,
+	dataReader func(uint64, int) ([]byte, bool),
+	fx *functionXrefs,
+) splitFuncResult {
+	filePath := filepath.Join(splitDir, functionFileName(c))
+	outF, err := os.Create(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot create %s: %v\n", filePath, err)
+		return splitFuncResult{Success: false}
+	}
+	defer outF.Close()
+
+	var result splitFuncResult
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				result = splitFuncResult{Success: false}
+				fmt.Fprintf(outF, "// %s\n// [failed to decompile: %v]\n\n", arm64lift.Demangle(c.name), r)
+			}
+		}()
+		stmts := arm64lift.LiftFunctionWithData(insns, nil, resolver, strResolver, dataReader, p.opts.SimplifyCFG)
+		result.Empty = len(stmts) == 0
+		result.Success = true
+		fmt.Fprintf(outF, "// %s\n", arm64lift.Demangle(c.name))
+		writeXrefComments(outF, fx)
+		arm64lift.RenderStmts(outF, stmts, 0)
+		fmt.Fprintln(outF)
+	}()
+
+	return result
+}
+
 // functionCandidatesFromSymbols builds the ordinary, name-bearing
 // candidate list from elf.Symbols (.symtab, or .dynsym when that's all
 // a stripped binary has left - see ELFParser.SymbolResolver's own doc
-// comment) - empty when neither has a single usable (STT_FUNC,
-// non-zero size, non-empty name) entry, which is exactly the signal
-// decompileELFArm64 uses to fall back to .eh_frame_hdr-based discovery
-// instead.
+// comment). Symbols with a zero size get a size estimated from the
+// distance to the next function symbol, which dramatically improves
+// candidate discovery for stripped shared libraries whose .dynsym
+// exports real function addresses but leaves their sizes at 0.
 func functionCandidatesFromSymbols(elf *native.ELFParser) []funcCandidate {
 	const sttFunc = 2
+
+	// Collect function symbol addresses in sorted order for size estimation.
+	funcAddrs := make([]uint64, 0, len(elf.Symbols))
+	for _, sym := range elf.Symbols {
+		if sym.Info&0xf == sttFunc && sym.Value != 0 {
+			funcAddrs = append(funcAddrs, sym.Value)
+		}
+	}
+	sort.Slice(funcAddrs, func(i, j int) bool { return funcAddrs[i] < funcAddrs[j] })
+
 	var candidates []funcCandidate
-	for i := range elf.Symbols {
-		sym := elf.Symbols[i]
-		if sym.Info&0xf != sttFunc || sym.Size == 0 {
+	for _, sym := range elf.Symbols {
+		if sym.Info&0xf != sttFunc {
 			continue
 		}
 		name := elf.GetSymbolName(sym)
-		if name == "" {
+		if name == "" || sym.Value == 0 {
 			continue
 		}
-		candidates = append(candidates, funcCandidate{addr: sym.Value, size: sym.Size, name: name})
+		size := sym.Size
+		if size == 0 {
+			size = estimateSymbolSize(sym.Value, funcAddrs)
+		}
+		if size == 0 {
+			continue
+		}
+		candidates = append(candidates, funcCandidate{addr: sym.Value, size: size, name: name})
 	}
 	return candidates
+}
+
+// estimateSymbolSize returns the distance from addr to the next known
+// function address, capped by a sane maximum. This is the standard
+// fallback for dynamic symbol tables that list exports without sizes.
+func estimateSymbolSize(addr uint64, sortedAddrs []uint64) uint64 {
+	for _, next := range sortedAddrs {
+		if next > addr {
+			return next - addr
+		}
+	}
+	return 0
 }
 
 // withDiscoveredFunctions builds the candidate list for functions

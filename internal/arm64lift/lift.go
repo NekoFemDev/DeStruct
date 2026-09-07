@@ -16,6 +16,7 @@
 package arm64lift
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strings"
 
@@ -219,20 +220,31 @@ type StringResolver func(addr uint64) (s string, ok bool)
 // nil, in which case a computed data address is rendered as a raw
 // number rather than resolved text.
 func LiftFunction(instructions []native.DetailedInstruction, paramNames []string, resolver SymbolResolver, strResolver StringResolver) []ir.Stmt {
+	return LiftFunctionWithData(instructions, paramNames, resolver, strResolver, nil, true)
+}
+
+// LiftFunctionWithData is LiftFunction with an optional dataReader for
+// reading bytes from the original binary by virtual address. When
+// non-nil it enables jump-table switch statement detection.
+func LiftFunctionWithData(instructions []native.DetailedInstruction, paramNames []string, resolver SymbolResolver, strResolver StringResolver, dataReader func(uint64, int) ([]byte, bool), simplify bool) []ir.Stmt {
 	budget := blockVisitBudget
 	l := &lifter{
-		regs:     make(map[string]ir.Expr),
-		stack:    make(map[int32]string),
-		params:   paramNames,
-		resolver: resolver,
-		strings:  strResolver,
-		addrRegs: make(map[string]uint64),
-		consumed: make(map[ir.Expr]bool),
-		budget:   &budget,
+		regs:       make(map[string]ir.Expr),
+		stack:      make(map[int32]string),
+		params:     paramNames,
+		resolver:   resolver,
+		strings:    strResolver,
+		addrRegs:   make(map[string]uint64),
+		consumed:   make(map[ir.Expr]bool),
+		budget:     &budget,
+		dataReader: dataReader,
 	}
 	l.seedParams()
 
 	blocks := buildCFG(instructions)
+	if simplify {
+		blocks = simplifyCFG(blocks)
+	}
 	if len(blocks) <= 1 {
 		// No branching at all - the original straight-line path handles
 		// this case exactly as before CFG support was added. This is
@@ -241,7 +253,11 @@ func LiftFunction(instructions []native.DetailedInstruction, paramNames []string
 		// commonly a trailing tail call (see liftTailCall) or a
 		// mid-function void call - must be flushed as its own statement
 		// now, or it would just vanish.
-		stmts := l.run(instructions)
+		var insts []native.DetailedInstruction
+		if len(blocks) == 1 {
+			insts = blocks[0].Instructions
+		}
+		stmts := l.run(insts)
 		return append(stmts, l.flushRemaining()...)
 	}
 
@@ -427,6 +443,15 @@ func (l *lifter) liftBlockGraphDispatch(b *BasicBlock, byAddr map[uint64]*BasicB
 		return stmts
 	}
 
+	// No conditional branch ending this block - but check for the
+	// AArch64 jump-table switch idiom before falling back to a straight-
+	// line lift of the block's instructions.
+	if b.Instructions[len(b.Instructions)-1].Mnemonic == "br" {
+		if swStmts, ok := l.tryLiftSwitch(b, byAddr, visited, loop); ok {
+			return swStmts
+		}
+	}
+
 	// No conditional branch ending this block - lift it straight-line
 	// and continue into whichever single successor it has (if any).
 	stmts = append(stmts, l.run(b.Instructions)...)
@@ -482,6 +507,107 @@ func (l *lifter) liftBlockGraphDispatch(b *BasicBlock, byAddr map[uint64]*BasicB
 	// read whatever this path's straight-line run left sitting unused
 	// in a register, so flush it now.
 	return append(stmts, l.flushRemaining()...)
+}
+
+// tryLiftSwitch detects the standard AArch64 jump-table switch idiom:
+//
+//	adrp	base, #jump_table_page
+//	add	base, base, #jump_table_off
+//	ldrsw	off, [base, index, lsl #2]
+//	add	target, off, base
+//	br	target
+//
+// When the idiom is found and the table's entries can be read from the
+// binary, it emits an ir.SwitchStmt on the original index register with
+// one case per valid table entry, lifting each target block as the case
+// body. This is intentionally conservative: it only commits when at
+// least two case targets resolve to real basic blocks in the CFG.
+func (l *lifter) tryLiftSwitch(b *BasicBlock, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, loop *loopCtx) ([]ir.Stmt, bool) {
+	if l.dataReader == nil || len(b.Instructions) < 3 {
+		return nil, false
+	}
+	last := b.Instructions[len(b.Instructions)-1]
+	if last.Mnemonic != "br" || len(last.Operands) != 1 || last.Operands[0].Type != native.OperandReg {
+		return nil, false
+	}
+	targetReg := last.Operands[0].Reg
+
+	var baseReg, indexReg string
+	for i := len(b.Instructions) - 2; i >= 0; i-- {
+		inst := b.Instructions[i]
+		switch inst.Mnemonic {
+		case "add":
+			if len(inst.Operands) == 3 &&
+				inst.Operands[0].Type == native.OperandReg && inst.Operands[0].Reg == targetReg &&
+				inst.Operands[1].Type == native.OperandReg &&
+				inst.Operands[2].Type == native.OperandReg && inst.Operands[2].Reg == targetReg {
+				baseReg = inst.Operands[1].Reg
+			}
+		case "ldrsw":
+			if len(inst.Operands) == 2 &&
+				inst.Operands[0].Type == native.OperandReg && inst.Operands[0].Reg == targetReg &&
+				inst.Operands[1].Type == native.OperandMem &&
+				inst.Operands[1].Mem.Index != "" &&
+				(baseReg == "" || inst.Operands[1].Mem.Base == baseReg) {
+				baseReg = inst.Operands[1].Mem.Base
+				indexReg = inst.Operands[1].Mem.Index
+			}
+		}
+	}
+	if baseReg == "" || indexReg == "" {
+		return nil, false
+	}
+	tableBase, ok := l.addrRegs[baseReg]
+	if !ok {
+		return nil, false
+	}
+
+	const maxCases = 64
+	var targets []uint64
+	for i := 0; i < maxCases; i++ {
+		data, ok := l.dataReader(tableBase+uint64(i*4), 4)
+		if !ok || len(data) < 4 {
+			break
+		}
+		off := int32(binary.LittleEndian.Uint32(data))
+		target := uint64(int64(tableBase) + int64(off))
+		if _, exists := byAddr[target]; !exists {
+			break
+		}
+		targets = append(targets, target)
+	}
+	if len(targets) < 2 {
+		return nil, false
+	}
+
+	// Lift the prefix (adrp/add/ldrsw/add) so the index register's
+	// expression is available for the switch target.
+	stmts := l.run(b.Instructions[:len(b.Instructions)-1])
+
+	sw := &ir.SwitchStmt{Target: l.regValue(indexReg)}
+	for i, target := range targets {
+		body := l.liftSwitchCase(target, byAddr, visited, loop)
+		if body == nil {
+			body = []ir.Stmt{}
+		}
+		sw.Cases = append(sw.Cases, &ir.CaseClause{
+			Values: []ir.Expr{&ir.IntLit{Value: int64(i)}},
+			Body:   &ir.Block{Statements: body},
+		})
+	}
+	return append(stmts, sw), true
+}
+
+// liftSwitchCase lifts one target block of a jump-table switch as a
+// case body. It uses a forked lifter and a fresh visited set so the
+// case body is independent of the switch block's own state.
+func (l *lifter) liftSwitchCase(target uint64, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, loop *loopCtx) []ir.Stmt {
+	blk, ok := byAddr[target]
+	if !ok {
+		return nil
+	}
+	forked := l.fork()
+	return forked.liftBlockGraph(blk, byAddr, cloneVisited(visited), loop)
 }
 
 // liftLoopEdge lifts one arm of an if/else split found while lifting
@@ -1039,7 +1165,7 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.addrRegs {
 		addrRegs[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, budget: l.budget}
+	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, budget: l.budget, dataReader: l.dataReader}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1236,6 +1362,11 @@ type lifter struct {
 	// bounded-time result beats hanging indefinitely on a real,
 	// large -O0 function.
 	budget *int
+
+	// dataReader reads bytes from the original binary by virtual
+	// address. Non-nil when switch-statement detection wants to read
+	// jump-table entries from rodata.
+	dataReader func(uint64, int) ([]byte, bool)
 }
 
 // cmpOperands is the lhs/rhs of a lifted "cmp" instruction, in the
@@ -1311,6 +1442,59 @@ var knownArity = map[string]int{
 	"memcpy":                    3,
 	"memset":                    3,
 	"memmove":                   3,
+}
+
+var knownResultNames = map[string]string{
+	"malloc":         "ptr",
+	"calloc":         "ptr",
+	"realloc":        "ptr",
+	"operator new":   "ptr",
+	"operator new[]": "ptr",
+	"strdup":         "s",
+	"strndup":        "s",
+	"strlen":         "len",
+	"wcslen":         "len",
+	"open":           "fd",
+	"fopen":          "fp",
+	"fdopen":         "fp",
+	"socket":         "sock",
+	"getenv":         "env",
+	"atoi":           "n",
+	"atol":           "n",
+	"strtol":         "n",
+	"strtoul":        "n",
+	"read":           "n",
+	"write":          "n",
+	"recv":           "n",
+	"send":           "n",
+	"memcpy":         "ptr",
+	"memmove":        "ptr",
+	"memset":         "ptr",
+	"time":           "t",
+	"access":         "rc",
+	"puts":           "n",
+	"printf":         "n",
+	"pthread_create": "rc",
+	"to_string":      "str",
+}
+
+// suggestedVarName returns a readable name hint for a value that comes
+// from a well-known libc/C++ runtime function, or "" when no heuristic
+// applies. Used to improve local variable names like "local_16" to
+// "ptr_16" when the assigned value is a malloc()/operator new/etc.
+func suggestedVarName(e ir.Expr) string {
+	switch c := e.(type) {
+	case *ir.StaticMethodCall:
+		base := methodNameOnly(c.Method)
+		if n, ok := knownResultNames[base]; ok {
+			return n
+		}
+	case *ir.MethodCall:
+		if n, ok := knownResultNames[c.Name]; ok {
+			return n
+		}
+	}
+	return ""
 }
 
 // paramNameForReg returns the declared parameter name for a register if
@@ -1594,6 +1778,9 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 				return nil
 			}
 			name = fmt.Sprintf("local_%d", disp)
+			if hint := suggestedVarName(srcVal); hint != "" {
+				name = fmt.Sprintf("%s_%d", hint, disp)
+			}
 			l.stack[disp] = name
 		}
 		l.consume(srcVal)

@@ -61,7 +61,7 @@ func main() {
 		return p.ReadCString(addr)
 	}
 
-	stmts := arm64lift.LiftFunction(insns, params, resolver, strResolver)
+	stmts := arm64lift.LiftFunctionWithData(insns, params, resolver, strResolver, p.DataReader(), true)
 	fmt.Printf("// %s\n", symName)
 	arm64lift.RenderStmts(os.Stdout, stmts, 1)
 }

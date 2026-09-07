@@ -48,6 +48,21 @@ func RenderStmts(w io.Writer, stmts []ir.Stmt, depth int) {
 				RenderStmts(w, v.Body.Statements, depth+1)
 			}
 			fmt.Fprintf(w, "%s} while (%s);\n", indent, v.Cond)
+		case *ir.SwitchStmt:
+			fmt.Fprintf(w, "%sswitch (%s) {\n", indent, v.Target)
+			for _, c := range v.Cases {
+				for _, val := range c.Values {
+					fmt.Fprintf(w, "%s    case %s:\n", indent, val)
+				}
+				if c.Body != nil {
+					RenderStmts(w, c.Body.Statements, depth+2)
+				}
+			}
+			if v.Default != nil && len(v.Default.Statements) > 0 {
+				fmt.Fprintf(w, "%s    default:\n", indent)
+				RenderStmts(w, v.Default.Statements, depth+2)
+			}
+			fmt.Fprintf(w, "%s}\n", indent)
 		default:
 			fmt.Fprintf(w, "%s%s\n", indent, s)
 		}

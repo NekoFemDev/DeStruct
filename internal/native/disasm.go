@@ -34,11 +34,11 @@ type Disassembler struct {
 
 // Instruction represents a disassembled instruction
 type Instruction struct {
-	Address uint64
-	Size    uint32
+	Address  uint64
+	Size     uint32
 	Mnemonic string
-	OpStr   string
-	Bytes   []byte
+	OpStr    string
+	Bytes    []byte
 }
 
 // OperandType identifies what kind of value an Operand holds.
@@ -67,10 +67,10 @@ type MemOperand struct {
 // Imm, Mem, or FP is meaningful, per Type.
 type Operand struct {
 	Type OperandType
-	Reg  string  // register name, e.g. "w0", "x1", "sp" (Type == OperandReg)
-	Imm  int64   // immediate value (Type == OperandImm)
+	Reg  string     // register name, e.g. "w0", "x1", "sp" (Type == OperandReg)
+	Imm  int64      // immediate value (Type == OperandImm)
 	Mem  MemOperand // memory operand (Type == OperandMem)
-	FP   float64 // floating-point immediate (Type == OperandFP)
+	FP   float64    // floating-point immediate (Type == OperandFP)
 }
 
 // DetailedInstruction is an Instruction plus its structured operands -
@@ -134,10 +134,10 @@ func (d *Disassembler) Disassemble(code []byte, address uint64, count int) ([]In
 		inst := (*C.cs_insn)(unsafe.Pointer(uintptr(unsafe.Pointer(insn)) + uintptr(i)*unsafe.Sizeof(*insn)))
 		result[i] = Instruction{
 			Address:  uint64(inst.address),
-			Size:    uint32(inst.size),
+			Size:     uint32(inst.size),
 			Mnemonic: C.GoString(&inst.mnemonic[0]),
-			OpStr:   C.GoString(&inst.op_str[0]),
-			Bytes:   C.GoBytes(unsafe.Pointer(&inst.bytes[0]), C.int(inst.size)),
+			OpStr:    C.GoString(&inst.op_str[0]),
+			Bytes:    C.GoBytes(unsafe.Pointer(&inst.bytes[0]), C.int(inst.size)),
 		}
 	}
 
@@ -255,15 +255,31 @@ const (
 
 // Mode constants
 const (
-	ModeARM   = int(C.CS_MODE_ARM)
-	ModeTHUMB = int(C.CS_MODE_THUMB)
-	ModeARM64 = int(C.CS_MODE_ARM)
-	Mode32    = int(C.CS_MODE_32)
-	Mode64    = int(C.CS_MODE_64)
+	ModeARM           = int(C.CS_MODE_ARM)
+	ModeTHUMB         = int(C.CS_MODE_THUMB)
+	ModeARM64         = int(C.CS_MODE_ARM)
+	Mode32            = int(C.CS_MODE_32)
+	Mode64            = int(C.CS_MODE_64)
 	ModeLITTLE_ENDIAN = int(C.CS_MODE_LITTLE_ENDIAN)
 )
 
-// Helper functions for common architectures
+// NewDisassemblerForMachine returns a Capstone disassembler for the
+// ELF machine type. It covers the architectures DeStruct's ELF parser
+// already recognizes (ARM, AArch64, x86, x86-64).
+func NewDisassemblerForMachine(machine uint16) (*Disassembler, error) {
+	switch machine {
+	case EM_AARCH64:
+		return NewARM64Disassembler()
+	case EM_ARM:
+		return NewARMDisassembler()
+	case EM_386:
+		return NewX86_32Disassembler()
+	case EM_X86_64:
+		return NewX86_64Disassembler()
+	default:
+		return nil, fmt.Errorf("unsupported machine type: %d", machine)
+	}
+}
 
 // NewARM64Disassembler creates a disassembler for ARM64
 func NewARM64Disassembler() (*Disassembler, error) {

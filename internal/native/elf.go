@@ -731,6 +731,14 @@ func (p *ELFParser) ResolvePLT() (map[uint64]string, error) {
 	// Disassemble .plt itself and recognize each stub's own GOT
 	// reference, mapping the stub's start address to the same name its
 	// GOT slot resolved to above.
+	//
+	// This ARM64-specific pattern recognition is only run on AArch64
+	// binaries; for other architectures we fall back to the GOT map
+	// alone, which still gives useful names for imported functions.
+	if p.Header.Machine != EM_AARCH64 {
+		return gotToName, nil
+	}
+
 	var pltSec *SectionHeader
 	for i := range p.Sections {
 		if p.getSectionName(p.Sections[i]) == ".plt" {
@@ -887,6 +895,36 @@ func (p *ELFParser) ResolveGOT() (map[uint64]string, error) {
 	}
 
 	return result, nil
+}
+
+// DataReader returns a function that reads up to n bytes from a virtual
+// address inside a PROGBITS section. This is the low-level accessor the
+// ARM64 lifter uses to read jump-table entries from the binary's rodata
+// when it recognizes a switch idiom.
+func (p *ELFParser) DataReader() func(addr uint64, n int) ([]byte, bool) {
+	return func(addr uint64, n int) ([]byte, bool) {
+		for _, s := range p.Sections {
+			if s.Type != SHT_PROGBITS || s.Size == 0 {
+				continue
+			}
+			if addr < s.Addr || addr >= s.Addr+s.Size {
+				continue
+			}
+			off := s.Offset + (addr - s.Addr)
+			end := off + uint64(n)
+			if end > s.Offset+s.Size {
+				end = s.Offset + s.Size
+			}
+			if end > uint64(len(p.Data)) {
+				end = uint64(len(p.Data))
+			}
+			if end <= off {
+				return nil, false
+			}
+			return p.Data[off:end], true
+		}
+		return nil, false
+	}
 }
 
 // SymbolResolver returns a single address->name lookup combining this

@@ -35,6 +35,14 @@ go.work.sum
 # - see COMMANDS.md; also removed by `make clean`)
 output/
 
+# Transient enhancement-test output directories created by test scripts
+enhanced_output_*/
+test_output_*/
+test_error_output/
+
+# Keep the internal/output package used by the Flutter/libapp.so analyzer.
+!internal/flutter/unflutter-0.5.9/internal/output/
+
 # Compiled top-level binaries (build products of `make build` / a
 # manual `go build -o <name> ./cmd/...` at the repo root) - not the
 # cmd/*/main.go sources themselves, which are tracked.
@@ -46,8 +54,8 @@ output/
 # by the test suite and for manual decompiler validation against known
 # source - tracked despite the generic binary-artifact rules above
 # (*.so, ...), which would otherwise silently exclude them.
-!test/
-!test/**
+test/
+test/**
 
 # ...except a reference source tree's own local CMake build output
 # under test/ (compiler-ABI probes, CMakeCache.txt with absolute local
