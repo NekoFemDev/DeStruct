@@ -1,8 +1,8 @@
 package native
 
 /*
-#cgo CFLAGS: -I/data/data/com.termux/files/usr/include
-#cgo LDFLAGS: -L/data/data/com.termux/files/usr/lib -lcapstone
+#cgo CFLAGS: -I${SRCDIR}/../../third_party/capstone/../../capstone-6.0.0-Alpha10/include -DCAPSTONE_AARCH64_COMPAT_HEADER
+#cgo LDFLAGS: -L${SRCDIR}/../../third_party/capstone/build -lcapstone
 #include <capstone/capstone.h>
 #include <stdlib.h>
 #include <string.h>
