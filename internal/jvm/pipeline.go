@@ -398,6 +398,20 @@ func decompileClassFile(cf *ClassFile) (*ir.Program, error) {
 		classDecl.Methods = append(classDecl.Methods, &methodDecl)
 	}
 
+	postprocessClass(classDecl)
+
+	// Filter out synthetic lambda$ methods - their bodies are already
+	// inlined at each call site as LambdaExpr nodes, so emitting them
+	// as standalone methods just clutters the output.
+	var methods []*ir.Method
+	for _, m := range classDecl.Methods {
+		if strings.HasPrefix(m.Name, "lambda$") {
+			continue
+		}
+		methods = append(methods, m)
+	}
+	classDecl.Methods = methods
+
 	program := &ir.Program{
 		Classes: []*ir.Class{classDecl},
 	}

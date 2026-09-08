@@ -20,13 +20,19 @@ type Options struct {
 
 type Generator struct {
 	opts Options
+	// innerClasses buffers inner classes keyed by their outer class name.
+	// When GenerateClass encounters a class whose name contains '$' (e.g.
+	// "ModuleScreens$ESPSettings"), it stores the class here instead of
+	// writing a separate file. When the outer class ("ModuleScreens") is
+	// processed, all its buffered inner classes are rendered inside it.
+	innerClasses map[string][]*ir.Class
 }
 
 func NewGenerator(opts Options) *Generator {
 	if opts.OutputDir == "" {
 		opts.OutputDir = "output"
 	}
-	return &Generator{opts: opts}
+	return &Generator{opts: opts, innerClasses: make(map[string][]*ir.Class)}
 }
 
 func (g *Generator) Generate(prog *ir.Program) error {
@@ -48,14 +54,33 @@ func (g *Generator) Generate(prog *ir.Program) error {
 // one class at a time (e.g. a streaming .jar pipeline that never holds more
 // than one class's IR in memory at once) can write each .java file as soon
 // as that class is ready, instead of accumulating a full *ir.Program first.
+//
+// Inner classes (those whose name contains '$') are buffered and merged
+// into their outer class's .java file when the outer class is generated.
+// Anonymous/local classes (e.g. Outer$1, Outer$1Name) are kept as
+// separate files since they can't be meaningfully nested.
 func (g *Generator) GenerateClass(class *ir.Class) error {
 	if err := os.MkdirAll(g.opts.OutputDir, 0o755); err != nil {
 		return fmt.Errorf("creating output dir: %w", err)
 	}
-	if err := g.generateClass(class); err != nil {
-		return fmt.Errorf("generating class %s: %w", class.Name, err)
+
+	// Check if this is an inner class (name contains '$')
+	if idx := strings.Index(class.Name, "$"); idx >= 0 {
+		outerName := class.Name[:idx]
+		suffix := class.Name[idx+1:]
+
+		// Anonymous/local classes (e.g. Outer$1, Outer$1Name) stay separate
+		if len(suffix) > 0 && suffix[0] >= '0' && suffix[0] <= '9' {
+			return g.generateClass(class)
+		}
+
+		// Named inner class: buffer it for the outer class
+		g.innerClasses[outerName] = append(g.innerClasses[outerName], class)
+		return nil
 	}
-	return nil
+
+	// Top-level class: generate it with any buffered inner classes
+	return g.generateClass(class)
 }
 
 func (g *Generator) generateClass(class *ir.Class) error {
@@ -164,6 +189,9 @@ func (g *Generator) generateClass(class *ir.Class) error {
 		"nonEmpty": func(s string) bool {
 			return s != ""
 		},
+		"renderNestedClass": func(c *ir.Class) string {
+			return renderNestedClass(c, g)
+		},
 	}).Parse(javaTemplate)
 	if err != nil {
 		return err
@@ -171,11 +199,13 @@ func (g *Generator) generateClass(class *ir.Class) error {
 
 	type classData struct {
 		*ir.Class
-		Imports []string
+		Imports       []string
+		NestedClasses []*ir.Class
 	}
 	data := &classData{
-		Class:   class,
-		Imports: imports,
+		Class:         class,
+		Imports:       imports,
+		NestedClasses: g.innerClasses[class.Name],
 	}
 
 	f, err := os.Create(filename)
@@ -716,6 +746,209 @@ func collectImports(class *ir.Class) []string {
 	return imports
 }
 
+// renderNestedClass renders an inner class as a nested class declaration
+// inside its outer class. The output is indented one level deeper.
+// The class name is stripped of the outer class prefix (e.g.
+// "ModuleScreens$ESPSettings" becomes "ESPSettings").
+func renderNestedClass(class *ir.Class, g *Generator) string {
+	var b strings.Builder
+
+	indent := "\t"
+
+	// Extract simple name (strip outer class prefix)
+	simpleName := class.Name
+	if idx := strings.Index(simpleName, "$"); idx >= 0 {
+		simpleName = simpleName[idx+1:]
+	}
+
+	// Access modifiers
+	if class.Access.IsPublic() {
+		b.WriteString(indent + "public ")
+	}
+	if class.Access.IsPrivate() {
+		b.WriteString(indent + "private ")
+	}
+	if class.Access.IsProtected() {
+		b.WriteString(indent + "protected ")
+	}
+	if class.Access.IsStatic() {
+		b.WriteString(indent + "static ")
+	}
+	if class.Access.IsAbstract() {
+		b.WriteString(indent + "abstract ")
+	}
+	// Enums are implicitly final, don't emit "final" for them
+	isEnum := class.Access.IsEnum()
+	if class.Access.IsFinal() && !isEnum {
+		b.WriteString(indent + "final ")
+	}
+
+	// Class kind
+	kind := "class"
+	if class.Access.IsInterface() {
+		kind = "interface"
+	} else if isEnum {
+		kind = "enum"
+	}
+	b.WriteString(kind + " " + simpleName)
+
+	// Type parameters
+	if len(class.TypeParams) > 0 {
+		b.WriteString("<")
+		for i, tp := range class.TypeParams {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(tp.Name)
+			if len(tp.Bounds) > 0 {
+				b.WriteString(" extends ")
+				for j, bound := range tp.Bounds {
+					if j > 0 {
+						b.WriteString(" & ")
+					}
+					b.WriteString(typeName(bound))
+				}
+			}
+		}
+		b.WriteString(">")
+	}
+
+	// Super class
+	if class.SuperClass != "" {
+		b.WriteString(" extends " + classNameToJava(class.SuperClass))
+	}
+
+	// Interfaces
+	if len(class.Interfaces) > 0 {
+		if class.Access.IsInterface() {
+			b.WriteString(" extends ")
+		} else {
+			b.WriteString(" implements ")
+		}
+		for i, iface := range class.Interfaces {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(classNameToJava(iface))
+		}
+	}
+
+	b.WriteString(" {\n")
+
+	// Fields
+	for _, field := range class.Fields {
+		b.WriteString(indent + "\t")
+		if field.Access.IsPublic() {
+			b.WriteString("public ")
+		} else if field.Access.IsPrivate() {
+			b.WriteString("private ")
+		} else if field.Access.IsProtected() {
+			b.WriteString("protected ")
+		}
+		if field.Access.IsStatic() {
+			b.WriteString("static ")
+		}
+		if field.Access.IsFinal() {
+			b.WriteString("final ")
+		}
+		if field.Access.IsVolatile() {
+			b.WriteString("volatile ")
+		}
+		if field.Access.IsTransient() {
+			b.WriteString("transient ")
+		}
+		b.WriteString(typeName(field.Type) + " " + field.Name + ";\n")
+	}
+
+	// Methods
+	for _, method := range class.Methods {
+		b.WriteString("\n")
+		b.WriteString(indent + "\t")
+		if method.Access.IsPublic() {
+			b.WriteString("public ")
+		} else if method.Access.IsPrivate() {
+			b.WriteString("private ")
+		} else if method.Access.IsProtected() {
+			b.WriteString("protected ")
+		}
+		if method.Access.IsStatic() {
+			b.WriteString("static ")
+		}
+		if method.Access.IsAbstract() {
+			b.WriteString("abstract ")
+		}
+		if method.Access.IsFinal() {
+			b.WriteString("final ")
+		}
+
+		if method.Name == "<init>" {
+			// Constructor
+			b.WriteString(simpleName + "(")
+			b.WriteString(renderParams(method.Params))
+			b.WriteString(") {\n")
+			if method.Body != nil {
+				// Render constructor body (skip super/this calls handled by template)
+				for _, stmt := range method.Body.Statements {
+					b.WriteString(renderStmt(stmt, 3) + "\n")
+				}
+			}
+			b.WriteString(indent + "\t}\n")
+		} else if method.Name == "<clinit>" {
+			// Static initializer
+			b.WriteString(indent + "\tstatic {\n")
+			if method.Body != nil {
+				for _, stmt := range method.Body.Statements {
+					if !isReturnVoid(stmt) {
+						b.WriteString(renderStmt(stmt, 3) + "\n")
+					}
+				}
+			}
+			b.WriteString(indent + "\t}\n")
+		} else if method.Access.IsNative() || method.Access.IsAbstract() {
+			b.WriteString(typeName(method.ReturnType) + " " + method.Name + "(")
+			b.WriteString(renderParams(method.Params))
+			b.WriteString(");\n")
+		} else {
+			b.WriteString(typeName(method.ReturnType) + " " + method.Name + "(")
+			b.WriteString(renderParams(method.Params))
+			b.WriteString(") {\n")
+			if method.Body != nil {
+				for _, stmt := range method.Body.Statements {
+					if !isReturnVoid(stmt) {
+						b.WriteString(renderStmt(stmt, 3) + "\n")
+					}
+				}
+			}
+			b.WriteString(indent + "\t}\n")
+		}
+	}
+
+	// Render nested inner classes of this inner class (recursive)
+	for _, nested := range g.innerClasses[class.Name] {
+		b.WriteString("\n")
+		b.WriteString(renderNestedClass(nested, g))
+		b.WriteString("\n")
+	}
+
+	b.WriteString(indent + "}\n")
+	return b.String()
+}
+
+func renderParams(params []*ir.Param) string {
+	var parts []string
+	for _, p := range params {
+		parts = append(parts, typeName(p.Type)+" "+p.Name)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func isReturnVoid(s ir.Stmt) bool {
+	if r, ok := s.(*ir.ReturnStmt); ok {
+		return r.Value == nil
+	}
+	return false
+}
+
 const javaTemplate = `{{- if .Package}}package {{.Package}};
 
 {{end}}{{- if .Imports}}
@@ -752,5 +985,8 @@ const javaTemplate = `{{- if .Package}}package {{.Package}};
 	}
 {{- end}}
 {{- end}}
+{{- range .NestedClasses}}
+
+{{renderNestedClass .}}{{- end}}
 }
 `

@@ -303,6 +303,18 @@ func needsParens(childOp, parentOp string, isLeft bool) int {
 }
 
 func (e *UnaryExpr) String() string {
+	// Add parentheses around expressions that would be misinterpreted
+	// without them due to operator precedence, e.g. !(x instanceof Y)
+	// should not be !x instanceof Y.
+	if be, ok := e.Expr.(*BinaryExpr); ok {
+		if e.Op == "!" {
+			// instanceof and comparison operators need parens after !
+			switch be.Op {
+			case "instanceof", "==", "!=", "<", ">", "<=", ">=":
+				return fmt.Sprintf("%s(%s)", e.Op, e.Expr)
+			}
+		}
+	}
 	return fmt.Sprintf("%s%s", e.Op, e.Expr)
 }
 
