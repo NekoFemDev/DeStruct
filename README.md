@@ -14,7 +14,6 @@ Multi-format decompiler: JVM `.class`/`.jar` → Java, Hermes `.hbc` → JS, ARM
 ## Install
 
 ```bash
-# Requires libcapstone-dev
 git clone https://github.com/NekoFemDev/DeStruct.git
 cd DeStruct
 make build   # → ./destruct
