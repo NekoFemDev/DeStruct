@@ -63,5 +63,8 @@ test/**
 # their own right.
 test/il2cpp_memory_dumper_main/build/
 
+# Bundled Capstone (downloaded source, not tracked in git)
+capstone-6.0.0-Alpha10/
+
 # Bundled Capstone build artifacts
 third_party/capstone/build/
