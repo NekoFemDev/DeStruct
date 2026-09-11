@@ -23,10 +23,59 @@ const (
 	EM_X86_64    = 62
 	SHT_PROGBITS = 1
 	SHT_SYMTAB   = 2
-	SHT_DYNSYM   = 11
+	SHT_STRTAB   = 3
 	SHT_RELA     = 4
+	SHT_HASH     = 5
+	SHT_DYNAMIC  = 6
+	SHT_DYNSYM   = 11
+	SHT_GNU_HASH = 0x6ffffff6
 	STT_FUNC     = 2
+
+	// Section flags (sh_flags)
+	SHF_WRITE     = 0x1
+	SHF_ALLOC     = 0x2
+	SHF_EXECINSTR = 0x4
+
+	// Program header types (p_type)
+	PT_LOAD         = 1
+	PT_DYNAMIC      = 2
+	PT_GNU_EH_FRAME = 0x6474e550
+
+	// Program header flags (p_flags)
+	PF_X = 0x1
+	PF_W = 0x2
+	PF_R = 0x4
+
+	// Dynamic array tags (d_tag)
+	DT_NULL     = 0
+	DT_PLTRELSZ = 2
+	DT_PLTGOT   = 3
+	DT_HASH     = 4
+	DT_STRTAB   = 5
+	DT_SYMTAB   = 6
+	DT_RELA     = 7
+	DT_RELASZ   = 8
+	DT_RELAENT  = 9
+	DT_STRSZ    = 10
+	DT_SYMENT   = 11
+	DT_JMPREL   = 23
+	DT_GNU_HASH = 0x6ffffef5
 )
+
+// ProgramHeader is one entry of the ELF program header table. Only the
+// fields this parser needs are kept - see parseProgramSections' own doc
+// comment for why program headers matter even when section headers don't
+// exist.
+type ProgramHeader struct {
+	Type   uint32
+	Flags  uint32
+	Offset uint64
+	Vaddr  uint64
+	Paddr  uint64
+	FileSz uint64
+	MemSz  uint64
+	Align  uint64
+}
 
 // ELF file structures
 type ELFHeader struct {
@@ -62,6 +111,12 @@ type SectionHeader struct {
 	Info      uint32
 	AddrAlign uint64
 	EntSize   uint64
+	// SynthName is a name for a section synthesized from a program
+	// header/dynamic entry (see parseProgramSections) - such a section
+	// has no backing entry in a section-name string table at all, so
+	// this is checked first by getSectionName. Empty for every section
+	// read from a real section header.
+	SynthName string
 }
 
 type SymbolEntry struct {
@@ -92,6 +147,12 @@ type ELFParser struct {
 	// (there's no fixed/well-known index for it the way section names
 	// always live at Header.ShStrNdx).
 	SymStrTabNdx uint16
+	// FromSegments is true when the file had no usable section header
+	// table and p.Sections was synthesized from the program headers
+	// instead (see parseProgramSections). Kept as an explicit flag
+	// because callers like ReadCString need to know the usual section
+	// granularity (separate .text/.rodata) isn't available.
+	FromSegments bool
 }
 
 // NewELFParser creates a new ELF parser
@@ -119,6 +180,20 @@ func NewELFParser(path string) (*ELFParser, error) {
 
 	if err := p.parseSections(); err != nil {
 		return nil, err
+	}
+
+	if len(p.Sections) == 0 {
+		// e_shoff/e_shnum can legitimately be zeroed by a packer,
+		// protector, or an aggressive strip even though the program
+		// headers - which the kernel loader and dynamic linker actually
+		// need - are all still present and complete. Rebuild an
+		// equivalent section view from PT_LOAD/PT_DYNAMIC/
+		// PT_GNU_EH_FRAME so every later stage (symbol parsing,
+		// .eh_frame_hdr function discovery, code-section extraction,
+		// string/GOT resolution) keeps working.
+		if err := p.parseProgramSections(); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := p.parseSymbols(); err != nil {
@@ -259,6 +334,392 @@ func (p *ELFParser) parseSections() error {
 	}
 
 	return nil
+}
+
+// parseProgramHeaders reads the ELF program header table. Program
+// headers map the file onto memory for the kernel's loader and carry
+// the dynamic linking metadata (PT_DYNAMIC, PT_GNU_EH_FRAME), so unlike
+// section headers they must survive in any runnable binary.
+func (p *ELFParser) parseProgramHeaders() ([]ProgramHeader, error) {
+	if p.Header.PhOff == 0 || p.Header.PhNum == 0 {
+		return nil, nil
+	}
+
+	var readUint32 func([]byte) uint32
+	var readUint64 func([]byte) uint64
+	if p.IsEndian {
+		readUint32 = binary.LittleEndian.Uint32
+		readUint64 = binary.LittleEndian.Uint64
+	} else {
+		readUint32 = binary.BigEndian.Uint32
+		readUint64 = binary.BigEndian.Uint64
+	}
+
+	entSize := uint64(p.Header.PhEntSize)
+	if entSize == 0 {
+		if p.Header.Class == ELFCLASS64 {
+			entSize = 56
+		} else {
+			entSize = 32
+		}
+	}
+	minSize := uint64(56)
+	if p.Header.Class != ELFCLASS64 {
+		minSize = 32
+	}
+	if entSize < minSize {
+		entSize = minSize
+	}
+
+	phdrs := make([]ProgramHeader, 0, p.Header.PhNum)
+	offset := p.Header.PhOff
+	for i := 0; i < int(p.Header.PhNum); i++ {
+		if offset+entSize > uint64(len(p.Data)) {
+			break
+		}
+		data := p.Data[offset:]
+
+		ph := ProgramHeader{}
+		if p.Header.Class == ELFCLASS64 {
+			ph.Type = readUint32(data[0:4])
+			ph.Flags = readUint32(data[4:8])
+			ph.Offset = readUint64(data[8:16])
+			ph.Vaddr = readUint64(data[16:24])
+			ph.Paddr = readUint64(data[24:32])
+			ph.FileSz = readUint64(data[32:40])
+			ph.MemSz = readUint64(data[40:48])
+			ph.Align = readUint64(data[48:56])
+		} else {
+			ph.Type = readUint32(data[0:4])
+			ph.Offset = uint64(readUint32(data[4:8]))
+			ph.Vaddr = uint64(readUint32(data[8:12]))
+			ph.Paddr = uint64(readUint32(data[12:16]))
+			ph.FileSz = uint64(readUint32(data[16:20]))
+			ph.MemSz = uint64(readUint32(data[20:24]))
+			ph.Flags = readUint32(data[24:28])
+			ph.Align = uint64(readUint32(data[28:32]))
+		}
+
+		phdrs = append(phdrs, ph)
+		offset += entSize
+	}
+
+	return phdrs, nil
+}
+
+// parseProgramSections synthesizes a section view for a binary whose
+// section header table is missing or empty (e_shoff/e_shnum zeroed by a
+// packer, protector, or full strip). The program headers are still
+// required for the file to run at all, so they carry everything the
+// rest of this package needs:
+//
+//   - PT_LOAD segments become pseudo PROGBITS sections with their
+//     real permissions, so GetCodeSections/ReadCString/DataReader and
+//     readFunctionCode still find code and data by address.
+//   - PT_GNU_EH_FRAME becomes ".eh_frame_hdr", so DiscoverFunctions'
+//     unwind-table fallback still recovers function boundaries for a
+//     fully stripped binary.
+//   - PT_DYNAMIC's entries (DT_SYMTAB/DT_STRTAB/DT_RELA/DT_JMPREL...)
+//     become ".dynsym"/".dynstr"/".rela.dyn"/".rela.plt" pseudo
+//     sections, so symbol names, imports, and GOT references still
+//     resolve.
+//
+// The only thing genuinely lost is the finer .text/.rodata split that
+// real section headers normally provide; FromSegments marks that so
+// ReadCString can widen its search (see its own doc comment).
+func (p *ELFParser) parseProgramSections() error {
+	phdrs, err := p.parseProgramHeaders()
+	if err != nil {
+		return err
+	}
+	if len(phdrs) == 0 {
+		return nil
+	}
+
+	vaddrToOffset := func(vaddr uint64) (uint64, bool) {
+		for _, ph := range phdrs {
+			if ph.Type != PT_LOAD || ph.FileSz == 0 {
+				continue
+			}
+			if vaddr >= ph.Vaddr && vaddr < ph.Vaddr+ph.FileSz {
+				return ph.Offset + (vaddr - ph.Vaddr), true
+			}
+		}
+		return 0, false
+	}
+
+	var dynPh *ProgramHeader
+	for i := range phdrs {
+		ph := &phdrs[i]
+		switch ph.Type {
+		case PT_LOAD:
+			flags := uint64(0)
+			if ph.Flags&PF_R != 0 {
+				flags |= SHF_ALLOC
+			}
+			if ph.Flags&PF_W != 0 {
+				flags |= SHF_WRITE
+			}
+			if ph.Flags&PF_X != 0 {
+				flags |= SHF_EXECINSTR
+			}
+			name := ".rodata"
+			switch {
+			case ph.Flags&PF_X != 0:
+				name = ".text"
+			case ph.Flags&PF_W != 0:
+				name = ".data"
+			}
+			p.Sections = append(p.Sections, SectionHeader{
+				SynthName: name,
+				Type:      SHT_PROGBITS,
+				Flags:     flags,
+				Addr:      ph.Vaddr,
+				Offset:    ph.Offset,
+				Size:      ph.FileSz,
+				AddrAlign: ph.Align,
+			})
+		case PT_GNU_EH_FRAME:
+			p.Sections = append(p.Sections, SectionHeader{
+				SynthName: ".eh_frame_hdr",
+				Type:      SHT_PROGBITS,
+				Flags:     SHF_ALLOC,
+				Addr:      ph.Vaddr,
+				Offset:    ph.Offset,
+				Size:      ph.FileSz,
+				AddrAlign: ph.Align,
+			})
+		case PT_DYNAMIC:
+			dynPh = ph
+		}
+	}
+	p.FromSegments = true
+
+	if dynPh == nil || dynPh.FileSz == 0 {
+		return nil
+	}
+	dynOff := dynPh.Offset
+	if dynOff == 0 {
+		var ok bool
+		dynOff, ok = vaddrToOffset(dynPh.Vaddr)
+		if !ok {
+			return nil
+		}
+	}
+	dyn := p.parseDynamicEntries(dynOff, dynPh.FileSz)
+
+	addSection := func(name string, typ uint32, addr, size, entSize uint64) int {
+		off, _ := vaddrToOffset(addr)
+		p.Sections = append(p.Sections, SectionHeader{
+			SynthName: name,
+			Type:      typ,
+			Flags:     SHF_ALLOC,
+			Addr:      addr,
+			Offset:    off,
+			Size:      size,
+			EntSize:   entSize,
+		})
+		return len(p.Sections) - 1
+	}
+
+	syment := dyn[DT_SYMENT]
+	if syment == 0 {
+		syment = 24
+		if p.Header.Class != ELFCLASS64 {
+			syment = 16
+		}
+	}
+
+	dynstrIdx := -1
+	if strtab, ok := dyn[DT_STRTAB]; ok {
+		dynstrIdx = addSection(".dynstr", SHT_STRTAB, strtab, dyn[DT_STRSZ], 0)
+	}
+
+	dynsymIdx := -1
+	if symtab, ok := dyn[DT_SYMTAB]; ok && dynstrIdx >= 0 {
+		count := p.dynamicSymbolCount(dyn, syment, vaddrToOffset)
+		dynsymIdx = addSection(".dynsym", SHT_DYNSYM, symtab, count*syment, syment)
+		p.Sections[dynsymIdx].Link = uint32(dynstrIdx)
+	}
+
+	relaEnt := dyn[DT_RELAENT]
+	if relaEnt == 0 {
+		relaEnt = 24
+		if p.Header.Class != ELFCLASS64 {
+			relaEnt = 12
+		}
+	}
+	if rela, ok := dyn[DT_RELA]; ok && dyn[DT_RELASZ] > 0 {
+		idx := addSection(".rela.dyn", SHT_RELA, rela, dyn[DT_RELASZ], relaEnt)
+		if dynsymIdx >= 0 {
+			p.Sections[idx].Link = uint32(dynsymIdx)
+		}
+	}
+	if jmprel, ok := dyn[DT_JMPREL]; ok && dyn[DT_PLTRELSZ] > 0 {
+		idx := addSection(".rela.plt", SHT_RELA, jmprel, dyn[DT_PLTRELSZ], relaEnt)
+		if dynsymIdx >= 0 {
+			p.Sections[idx].Link = uint32(dynsymIdx)
+		}
+	}
+
+	return nil
+}
+
+// parseDynamicEntries reads a PT_DYNAMIC table into tag->value form.
+// A DT_NULL entry terminates the array (per the ELF spec), though some
+// linkers also zero-pad afterwards, which the size bound alone would
+// otherwise misread as more DT_NULL entries - harmless since the map
+// only ever gets looked up by specific tags.
+func (p *ELFParser) parseDynamicEntries(off, size uint64) map[int64]uint64 {
+	entries := make(map[int64]uint64)
+	if off >= uint64(len(p.Data)) {
+		return entries
+	}
+
+	entSize := uint64(16)
+	if p.Header.Class != ELFCLASS64 {
+		entSize = 8
+	}
+	end := off + size
+	if end > uint64(len(p.Data)) {
+		end = uint64(len(p.Data))
+	}
+
+	for pos := off; pos+entSize <= end; pos += entSize {
+		var tag int64
+		var val uint64
+		if p.IsEndian {
+			if p.Header.Class == ELFCLASS64 {
+				tag = int64(binary.LittleEndian.Uint64(p.Data[pos : pos+8]))
+				val = binary.LittleEndian.Uint64(p.Data[pos+8 : pos+16])
+			} else {
+				tag = int64(int32(binary.LittleEndian.Uint32(p.Data[pos : pos+4])))
+				val = uint64(binary.LittleEndian.Uint32(p.Data[pos+4 : pos+8]))
+			}
+		} else {
+			if p.Header.Class == ELFCLASS64 {
+				tag = int64(binary.BigEndian.Uint64(p.Data[pos : pos+8]))
+				val = binary.BigEndian.Uint64(p.Data[pos+8 : pos+16])
+			} else {
+				tag = int64(int32(binary.BigEndian.Uint32(p.Data[pos : pos+4])))
+				val = uint64(binary.BigEndian.Uint32(p.Data[pos+4 : pos+8]))
+			}
+		}
+		if tag == DT_NULL {
+			break
+		}
+		entries[tag] = val
+	}
+
+	return entries
+}
+
+// dynamicSymbolCount returns the number of entries in the dynamic
+// symbol table, which (unlike a section header's sh_size) isn't spelled
+// out directly in the dynamic array. DT_HASH stores it outright as
+// nchain; DT_GNU_HASH requires walking buckets/chains (and, for a
+// binary that exports nothing, its bucket array can be all zeros, in
+// which case the pre-hash symbol count DT_GNU_HASH also stores is the
+// answer); if neither is present, fall back to the distance between
+// DT_SYMTAB and DT_STRTAB, which adjacent-table linkers make exact.
+func (p *ELFParser) dynamicSymbolCount(dyn map[int64]uint64, syment uint64, vaddrToOffset func(uint64) (uint64, bool)) uint64 {
+	if hashAddr, ok := dyn[DT_HASH]; ok {
+		if off, ok := vaddrToOffset(hashAddr); ok && off+8 <= uint64(len(p.Data)) {
+			read32 := binary.LittleEndian.Uint32
+			if !p.IsEndian {
+				read32 = binary.BigEndian.Uint32
+			}
+			nchain := read32(p.Data[off+4 : off+8])
+			if nchain > 0 {
+				return uint64(nchain)
+			}
+		}
+	}
+
+	if ghAddr, ok := dyn[DT_GNU_HASH]; ok {
+		if off, ok := vaddrToOffset(ghAddr); ok {
+			if count, ok := p.gnuHashSymbolCount(off); ok && count > 0 {
+				return count
+			}
+		}
+	}
+
+	if symtab, ok := dyn[DT_SYMTAB]; ok && syment > 0 {
+		if strtab, ok := dyn[DT_STRTAB]; ok && strtab > symtab {
+			if count := (strtab - symtab) / syment; count > 0 {
+				return count
+			}
+		}
+	}
+
+	return 0
+}
+
+// gnuHashSymbolCount derives the total dynamic symbol count from a GNU
+// hash table at file offset off. Layout (ELF64 word sizes): nbuckets,
+// symoffset, bloom_size, bloom_shift, bloom_size*8 bytes of bloom
+// filter, nbuckets 32-bit buckets, then one 32-bit chain per hashed
+// symbol. Every bucket is a symbol index; the chain word belonging to a
+// bucket's last symbol has its low bit set, so walking the chains of
+// the highest bucket index gives the symbol table's end.
+func (p *ELFParser) gnuHashSymbolCount(off uint64) (uint64, bool) {
+	data := p.Data
+	if off+16 > uint64(len(data)) {
+		return 0, false
+	}
+
+	read32 := binary.LittleEndian.Uint32
+	if !p.IsEndian {
+		read32 = binary.BigEndian.Uint32
+	}
+
+	nbuckets := read32(data[off : off+4])
+	symoffset := read32(data[off+4 : off+8])
+	bloomSize := read32(data[off+8 : off+12])
+
+	wordSize := uint64(8)
+	if p.Header.Class != ELFCLASS64 {
+		wordSize = 4
+	}
+	bucketsOff := off + 16 + uint64(bloomSize)*wordSize
+	if bucketsOff > uint64(len(data)) || uint64(nbuckets) > (uint64(len(data))-bucketsOff)/4 {
+		return 0, false
+	}
+
+	maxSym := uint32(0)
+	for i := uint32(0); i < nbuckets; i++ {
+		b := read32(data[bucketsOff+uint64(i)*4 : bucketsOff+uint64(i)*4+4])
+		if b > maxSym {
+			maxSym = b
+		}
+	}
+	if maxSym == 0 {
+		// No symbol is reachable through the hash table at all. That's
+		// legitimate for a binary exporting nothing (an executable): the
+		// dynamic linker finds its imports by index through the
+		// relocation tables, not by name, so the hash can be empty. Every
+		// symbol before symoffset still exists, symoffset being where the
+		// (empty) hashed region starts.
+		return uint64(symoffset), true
+	}
+
+	chainsOff := bucketsOff + uint64(nbuckets)*4
+	idx := uint64(maxSym)
+	for {
+		if idx < uint64(symoffset) {
+			return 0, false
+		}
+		pos := chainsOff + (idx-uint64(symoffset))*4
+		if pos+4 > uint64(len(data)) {
+			return 0, false
+		}
+		word := read32(data[pos : pos+4])
+		idx++
+		if word&1 != 0 {
+			break
+		}
+	}
+	return idx, true
 }
 
 func (p *ELFParser) parseSymbols() error {
@@ -406,37 +867,67 @@ const maxCStringLen = 4096
 // printable text (most likely: vaddr points at binary data - a
 // pointer, a vtable, a length-prefixed non-C-string - not a plain C
 // string).
+//
+// For a sectionless binary (FromSegments) there is no separate .rodata
+// to find, so the executable range is searched too - see the fallback
+// loop's own comment.
 func (p *ELFParser) ReadCString(vaddr uint64) (string, bool) {
 	for _, s := range p.Sections {
-		if s.Type != SHT_PROGBITS || s.Flags&0x4 != 0 {
+		if s.Type != SHT_PROGBITS || s.Flags&SHF_EXECINSTR != 0 {
 			continue
 		}
-		if vaddr < s.Addr || vaddr >= s.Addr+s.Size {
-			continue
+		if str, ok := p.readCStringInSection(s, vaddr); ok {
+			return str, true
 		}
-		fileOff := s.Offset + (vaddr - s.Addr)
-		if fileOff >= uint64(len(p.Data)) {
-			return "", false
+	}
+	if p.FromSegments {
+		// No section headers means no separate .text/.rodata view: the
+		// whole RX segment is one executable PROGBITS section, so a real
+		// string literal can only be found by looking inside it. The
+		// printable-text check is what rejects instruction bytes here
+		// (a random run of instructions decoding as printable ASCII up
+		// to a NUL is vanishingly unlikely, and this path only exists
+		// when the alternative is recovering no strings at all).
+		for _, s := range p.Sections {
+			if s.Type != SHT_PROGBITS || s.Flags&SHF_EXECINSTR == 0 {
+				continue
+			}
+			if str, ok := p.readCStringInSection(s, vaddr); ok {
+				return str, true
+			}
 		}
-		limit := s.Offset + s.Size
-		if fileOff+maxCStringLen < limit {
-			limit = fileOff + maxCStringLen
-		}
-		if limit > uint64(len(p.Data)) {
-			limit = uint64(len(p.Data))
-		}
-		data := p.Data[fileOff:limit]
-		nul := bytes.IndexByte(data, 0)
-		if nul < 0 {
-			return "", false
-		}
-		raw := data[:nul]
-		if !isPrintableCString(raw) {
-			return "", false
-		}
-		return string(raw), true
 	}
 	return "", false
+}
+
+// readCStringInSection resolves vaddr inside s and applies the
+// printable-text/NUL-termination checks; shared by ReadCString's
+// normal and sectionless paths.
+func (p *ELFParser) readCStringInSection(s SectionHeader, vaddr uint64) (string, bool) {
+	if vaddr < s.Addr || vaddr >= s.Addr+s.Size {
+		return "", false
+	}
+	fileOff := s.Offset + (vaddr - s.Addr)
+	if fileOff >= uint64(len(p.Data)) {
+		return "", false
+	}
+	limit := s.Offset + s.Size
+	if fileOff+maxCStringLen < limit {
+		limit = fileOff + maxCStringLen
+	}
+	if limit > uint64(len(p.Data)) {
+		limit = uint64(len(p.Data))
+	}
+	data := p.Data[fileOff:limit]
+	nul := bytes.IndexByte(data, 0)
+	if nul < 0 {
+		return "", false
+	}
+	raw := data[:nul]
+	if !isPrintableCString(raw) {
+		return "", false
+	}
+	return string(raw), true
 }
 
 // isPrintableCString reports whether b looks like genuine printable
@@ -489,6 +980,9 @@ func (p *ELFParser) GetCodeSections() []CodeSection {
 
 // getSectionName returns the name of a section
 func (p *ELFParser) getSectionName(sec SectionHeader) string {
+	if sec.SynthName != "" {
+		return sec.SynthName
+	}
 	if int(p.Header.ShStrNdx) >= len(p.Sections) {
 		return ""
 	}
@@ -625,9 +1119,22 @@ func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
 	entSize := dynsymSec.EntSize
 	if entSize == 0 {
 		entSize = 24
+		if p.Header.Class != ELFCLASS64 {
+			entSize = 16
+		}
 	}
 	count := dynsymSec.Size / entSize
 	syms := make([]SymbolEntry, 0, count)
+
+	var readUint32 func([]byte) uint32
+	var readUint64 func([]byte) uint64
+	if p.IsEndian {
+		readUint32 = binary.LittleEndian.Uint32
+		readUint64 = binary.LittleEndian.Uint64
+	} else {
+		readUint32 = binary.BigEndian.Uint32
+		readUint64 = binary.BigEndian.Uint64
+	}
 
 	offset := dynsymSec.Offset
 	for i := uint64(0); i < count; i++ {
@@ -635,13 +1142,21 @@ func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
 			break
 		}
 		data := p.Data[offset:]
-		sym := SymbolEntry{
-			Name:  binary.LittleEndian.Uint32(data[0:4]),
-			Info:  data[4],
-			Other: data[5],
-			Shndx: binary.LittleEndian.Uint16(data[6:8]),
-			Value: binary.LittleEndian.Uint64(data[8:16]),
-			Size:  binary.LittleEndian.Uint64(data[16:24]),
+		sym := SymbolEntry{}
+		if p.Header.Class == ELFCLASS64 {
+			sym.Name = readUint32(data[0:4])
+			sym.Info = data[4]
+			sym.Other = data[5]
+			sym.Shndx = binary.LittleEndian.Uint16(data[6:8])
+			sym.Value = readUint64(data[8:16])
+			sym.Size = readUint64(data[16:24])
+		} else {
+			sym.Name = readUint32(data[0:4])
+			sym.Value = uint64(readUint32(data[4:8]))
+			sym.Size = uint64(readUint32(data[8:12]))
+			sym.Info = data[12]
+			sym.Other = data[13]
+			sym.Shndx = binary.LittleEndian.Uint16(data[14:16])
 		}
 		syms = append(syms, sym)
 		offset += entSize
@@ -655,10 +1170,24 @@ func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
 func (p *ELFParser) parseRelaSection(sec SectionHeader) []RelaEntry {
 	entSize := sec.EntSize
 	if entSize == 0 {
-		entSize = 24
+		if p.Header.Class == ELFCLASS64 {
+			entSize = 24
+		} else {
+			entSize = 12
+		}
 	}
 	count := sec.Size / entSize
 	entries := make([]RelaEntry, 0, count)
+
+	var readUint32 func([]byte) uint32
+	var readUint64 func([]byte) uint64
+	if p.IsEndian {
+		readUint32 = binary.LittleEndian.Uint32
+		readUint64 = binary.LittleEndian.Uint64
+	} else {
+		readUint32 = binary.BigEndian.Uint32
+		readUint64 = binary.BigEndian.Uint64
+	}
 
 	offset := sec.Offset
 	for i := uint64(0); i < count; i++ {
@@ -666,11 +1195,19 @@ func (p *ELFParser) parseRelaSection(sec SectionHeader) []RelaEntry {
 			break
 		}
 		data := p.Data[offset:]
-		entries = append(entries, RelaEntry{
-			Offset: binary.LittleEndian.Uint64(data[0:8]),
-			Info:   binary.LittleEndian.Uint64(data[8:16]),
-			Addend: int64(binary.LittleEndian.Uint64(data[16:24])),
-		})
+		if p.Header.Class == ELFCLASS64 {
+			entries = append(entries, RelaEntry{
+				Offset: readUint64(data[0:8]),
+				Info:   readUint64(data[8:16]),
+				Addend: int64(readUint64(data[16:24])),
+			})
+		} else {
+			entries = append(entries, RelaEntry{
+				Offset: uint64(readUint32(data[0:4])),
+				Info:   uint64(readUint32(data[4:8])),
+				Addend: int64(int32(readUint32(data[8:12]))),
+			})
+		}
 		offset += entSize
 	}
 	return entries

@@ -15,6 +15,7 @@ import (
 
 	"github.com/destruct/destruct/internal/arm64lift"
 	"github.com/destruct/destruct/internal/csharp"
+	"github.com/destruct/destruct/internal/dex"
 	unflutter "github.com/destruct/destruct/internal/flutter/unflutter-0.5.9/cmd/unflutter"
 	"github.com/destruct/destruct/internal/ir"
 	javagen "github.com/destruct/destruct/internal/java"
@@ -29,6 +30,7 @@ const (
 	FormatFlutter
 	FormatELF
 	FormatPE
+	FormatDEX
 )
 
 type Options struct {
@@ -68,6 +70,9 @@ func (p *Pipeline) Run() error {
 
 	case FormatJVM:
 		return p.decompileAndGenerateJVM()
+
+	case FormatDEX:
+		return p.decompileAndGenerateDEX()
 
 	case FormatELF:
 		if p.opts.Decompile && p.opts.SplitFunctions {
@@ -209,6 +214,105 @@ func (p *Pipeline) decompileAndGenerateJVM() error {
 		fmt.Printf("Skipped %d classes (malformed, oversized, or failed to decompile; rerun with -v to see which)\n", skipped)
 	}
 	return nil
+}
+
+func (p *Pipeline) decompileAndGenerateDEX() error {
+	ext := filepath.Ext(p.opts.Input)
+
+	gen := javagen.NewGenerator(javagen.Options{
+		OutputDir: p.opts.Output,
+		Deobf:     p.opts.Deobf,
+		Verbose:   p.opts.Verbose,
+	})
+
+	// For DEX files, we process them directly
+	if ext == ".dex" {
+		// Count classes first
+		total, err := dex.CountDexClasses(p.opts.Input)
+		if err != nil {
+			return fmt.Errorf("counting dex classes: %w", err)
+		}
+		fmt.Printf("Found %d classes in %s\n", total, filepath.Base(p.opts.Input))
+
+		// Stream the DEX file one class at a time
+		var currentMu sync.Mutex
+		currentName := ""
+		currentStart := time.Now()
+
+		watchdogStop := make(chan struct{})
+		watchdogDone := make(chan struct{})
+		go func() {
+			defer close(watchdogDone)
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-watchdogStop:
+					return
+				case <-ticker.C:
+					currentMu.Lock()
+					name := currentName
+					elapsed := time.Since(currentStart)
+					currentMu.Unlock()
+					if elapsed > 5*time.Second && name != "" {
+						fmt.Fprintf(os.Stderr, "  [watchdog] still processing %s (%.1fs)...\n", name, elapsed.Seconds())
+					}
+				}
+			}
+		}()
+
+		err = dex.DecompileDexStreaming(p.opts.Input, func(class *ir.Class) {
+			fullName := class.Package + "." + class.Name
+			if class.Package == "" {
+				fullName = class.Name
+			}
+			currentMu.Lock()
+			currentName = fullName
+			currentStart = time.Now()
+			currentMu.Unlock()
+
+			if err := gen.GenerateClass(class); err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating class %s: %v\n", fullName, err)
+			}
+		}, func(className string, err error) {
+			fmt.Fprintf(os.Stderr, "Error decompiling %s: %v\n", className, err)
+		})
+
+		close(watchdogStop)
+		<-watchdogDone
+
+		if err != nil {
+			return fmt.Errorf("decompilation: %w", err)
+		}
+		return nil
+	}
+
+	// For APK files, extract and process all DEX files
+	if ext == ".apk" {
+		total, err := dex.CountApkDexClasses(p.opts.Input)
+		if err != nil {
+			return fmt.Errorf("counting apk dex classes: %w", err)
+		}
+		fmt.Printf("Found %d classes in %s\n", total, filepath.Base(p.opts.Input))
+
+		err = dex.DecompileApkStreaming(p.opts.Input, func(class *ir.Class) {
+			fullName := class.Package + "." + class.Name
+			if class.Package == "" {
+				fullName = class.Name
+			}
+			if err := gen.GenerateClass(class); err != nil {
+				fmt.Fprintf(os.Stderr, "Error generating class %s: %v\n", fullName, err)
+			}
+		}, func(name string, err error) {
+			fmt.Fprintf(os.Stderr, "Skipping %s: %v\n", name, err)
+		})
+		if err != nil {
+			return fmt.Errorf("decompiling apk: %w", err)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("unsupported DEX file format: %s", ext)
 }
 
 func (p *Pipeline) decompileFlutter() error {

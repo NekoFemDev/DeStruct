@@ -603,6 +603,13 @@ func collectImports(class *ir.Class) []string {
 		case *ir.CastExpr:
 			walkType(v.Type)
 			walkExpr(v.Expr)
+		case *ir.ClassType:
+			// A ClassType can appear as an expression in an
+			// "x instanceof SomeClass" BinaryExpr's right-hand side.
+			addImport(v.Name)
+			for _, a := range v.TypeArgs {
+				walkType(a)
+			}
 		case *ir.MethodCall:
 			walkExpr(v.Object)
 			for _, arg := range v.Args {

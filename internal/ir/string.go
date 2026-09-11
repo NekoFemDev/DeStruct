@@ -118,7 +118,42 @@ func (e *DoubleLit) String() string {
 }
 
 func (e *StringLit) String() string {
-	return fmt.Sprintf("\"%s\"", e.Value)
+	return javaStringLit(e.Value)
+}
+
+// javaStringLit quotes a string as a valid Java string literal, escaping
+// quotes, backslashes, common control characters, and any remaining
+// non-printable runes (which otherwise make the generated source invalid
+// UTF-8 / render as binary in editors).
+func javaStringLit(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&b, `\u%04x`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 func (e *BoolLit) String() string {
@@ -184,6 +219,9 @@ func (e *NewExpr) String() string {
 }
 
 func (e *NewArrayExpr) String() string {
+	if e.Size != nil {
+		return fmt.Sprintf("new %s[%s]", e.ElemType, e.Size)
+	}
 	return fmt.Sprintf("new %s[]", e.ElemType)
 }
 

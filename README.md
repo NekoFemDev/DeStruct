@@ -1,10 +1,11 @@
 # DeStruct
 
-Multi-format decompiler: JVM `.class`/`.jar` → Java, Hermes `.hbc` → JS, ARM64 ELF → C-like pseudocode, Flutter `libapp.so` → Dart bytecode.
+Multi-format decompiler: JVM `.class`/`.jar` → Java, Android `.dex`/`.apk` → Java, Hermes `.hbc` → JS, ARM64 ELF → C-like pseudocode, Flutter `libapp.so` → Dart bytecode.
 
 ## Features
 
 - **JVM** — Full Java decompiler with control flow recovery (if/else, while, for, switch, try/catch, generics, lambdas). Streaming `.jar` mode for large files.
+- **DEX** — Android `.dex`/`.apk` → Java. Streaming per-class output, multidex support, MUTF-8 strings, switch/fill-array-data payloads, and structured control flow recovery (if/else, while, do-while, switch).
 - **Hermes** — Disassemble and decompile React Native Hermes bytecode (`.hbc`/`.bundle`) to readable JS. Includes assembler, interactive patcher, and hex-editor workflow.
 - **ARM64 ELF** — Lift disassembled AArch64 instructions to C-like pseudocode with control flow recovery (if/else, while/do-while, struct field access, indirect calls). Cross-reference analysis, CFG simplification, per-function split output.
 - **Flutter** — Disassemble Flutter `libapp.so` (Dart AOT) to readable ARM64 assembly + binary patching support.
@@ -36,6 +37,7 @@ destruct <command> [options]
 | Command | Description |
 |---------|-------------|
 | `jvm` | Decompile `.class`/`.jar` → Java source |
+| `dex` | Decompile Android `.dex`/`.apk` → Java source |
 | `hermes` | Disassemble/decompile Hermes `.hbc` bytecode |
 | `assemble` | Assemble `.hasm` back to `.hbc` (with address recalculation) |
 | `patch` | Search/patch Hermes bytecode strings |
@@ -52,6 +54,10 @@ destruct <command> [options]
 # JVM
 destruct jvm input.jar -o output/
 destruct jvm SomeClass.class -o output/
+
+# DEX
+destruct dex classes.dex -o output/
+destruct dex app.apk -o output/
 
 # Hermes
 destruct hermes index.android.bundle -o output/ --decompile
@@ -96,6 +102,7 @@ cmd/destruct/       CLI entry point
 internal/
   pipeline/         Orchestration: format detection, streaming, enhancements
   jvm/              JVM bytecode parser, decompiler, control flow recovery
+  dex/              DEX parser, Dalvik instruction decoder, IR converter, control flow recovery
   hermes/           Hermes bytecode parser, disassembler, decompiler, assembler, REPL
   arm64lift/        ARM64 instruction lifter → IR → C-like pseudocode
   native/           ELF parser, Capstone disassembler, PLT/GOT resolution

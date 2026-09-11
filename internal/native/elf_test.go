@@ -1,6 +1,7 @@
 package native
 
 import (
+	"os"
 	"testing"
 )
 
@@ -89,5 +90,72 @@ func TestParseSymbols_FallsBackToDynsym(t *testing.T) {
 	}
 	if defined == 0 {
 		t.Fatalf("expected parser.Symbols (populated from .dynsym, since there's no .symtab) to contain real, defined FUNC entries with non-zero size, got 0 among %d total symbols", len(parser.Symbols))
+	}
+}
+
+// TestParseSectionlessELF covers the program-header fallback: a binary
+// deliberately stripped of its entire section header table (e_shoff =
+// e_shnum = 0, a packer/protector trick, not ordinary strip) still has
+// complete program headers, and everything the decompiler needs -
+// PT_LOAD code/data ranges, PT_DYNAMIC's symbol and relocation tables,
+// PT_GNU_EH_FRAME's unwind-header table - can be recovered from them.
+// Skips when the 64MB fixture isn't present (it's untracked local test
+// data, not part of the repo).
+func TestParseSectionlessELF(t *testing.T) {
+	const fixture = "../../susfs"
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("fixture %s not present", fixture)
+	}
+
+	parser, err := NewELFParser(fixture)
+	if err != nil {
+		t.Fatalf("Error: %v", err)
+	}
+	if parser.Header.ShOff != 0 || parser.Header.ShNum != 0 {
+		t.Fatalf("fixture assumption broken: expected zeroed section header table")
+	}
+	if !parser.FromSegments {
+		t.Fatalf("expected FromSegments=true for a binary with no section headers")
+	}
+
+	hasEHFrameHdr := false
+	for _, s := range parser.Sections {
+		if parser.getSectionName(s) == ".eh_frame_hdr" {
+			hasEHFrameHdr = true
+		}
+	}
+	if !hasEHFrameHdr {
+		t.Fatalf("expected a synthesized .eh_frame_hdr section from PT_GNU_EH_FRAME")
+	}
+
+	if len(parser.GetCodeSections()) == 0 {
+		t.Fatalf("expected a synthesized executable code section from PT_LOAD")
+	}
+
+	// .dynsym's symbol count isn't stored in a section header here, so
+	// it has to come from DT_GNU_HASH (whose bucket array may legally be
+	// empty for a binary that exports nothing, leaving the pre-hash
+	// symoffset as the true count).
+	if len(parser.Symbols) == 0 {
+		t.Fatalf("expected symbols recovered from DT_SYMTAB/DT_GNU_HASH")
+	}
+	foundImport := false
+	for _, sym := range parser.Symbols {
+		if parser.GetSymbolName(sym) == "dlsym" {
+			foundImport = true
+		}
+	}
+	if !foundImport {
+		t.Errorf("expected the imported symbol \"dlsym\" in a synthesized .dynsym")
+	}
+
+	// Function boundaries must come from the unwind table since there
+	// are no defined function symbols at all.
+	fns, err := parser.DiscoverFunctions()
+	if err != nil {
+		t.Fatalf("DiscoverFunctions: %v", err)
+	}
+	if len(fns) == 0 {
+		t.Fatalf("expected functions discovered from .eh_frame_hdr")
 	}
 }

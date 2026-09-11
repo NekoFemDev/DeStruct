@@ -23,6 +23,8 @@ func main() {
 	switch cmd {
 	case "jvm":
 		handleJVM(os.Args[2:])
+	case "dex":
+		handleDex(os.Args[2:])
 	case "hermes":
 		handleHermes(os.Args[2:])
 	case "assemble":
@@ -54,6 +56,7 @@ Usage: destruct <command> [options]
 
 Commands:
   jvm       Decompile JVM .class/.jar files to Java source code
+  dex       Decompile Android .dex/.apk files to Java source code
   hermes    Disassemble/decompile Hermes .hbc bytecode to JS
   assemble  Assemble .hasm back to .hbc bytecode (with address recalculation)
   patch     Search/patch Hermes .hbc bytecode
@@ -114,6 +117,8 @@ Quick patch workflow:
 
 Examples:
   destruct jvm input.jar -o output/
+  destruct dex classes.dex -o output/
+  destruct dex app.apk -o output/
   destruct elf libnative.so -o output/ --decompile  # AArch64 pseudocode, one file
   destruct hermes index.android.bundle -o output/ --decompile
   destruct hermes index.android.bundle -o output/ -p  # Simplified format
@@ -145,6 +150,40 @@ func handleJVM(args []string) {
 		Input:   input,
 		Output:  opts.output,
 		Format:  pipeline.FormatJVM,
+		Verbose: opts.verbose,
+		Deobf:   opts.deobfuscate,
+		Project: opts.project,
+	})
+
+	if err := p.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
+}
+
+func handleDex(args []string) {
+	opts, input := parseFlags(args)
+	if opts.printOptions {
+		printOptionsJSON("dex", opts)
+		return
+	}
+	if input == "" {
+		fmt.Fprintln(os.Stderr, "Error: input file required")
+		os.Exit(1)
+	}
+
+	ext := strings.ToLower(filepath.Ext(input))
+	if ext != ".dex" && ext != ".apk" {
+		fmt.Fprintf(os.Stderr, "Error: unsupported DEX file format: %s (expected .dex or .apk)\n", ext)
+		os.Exit(1)
+	}
+
+	p := pipeline.New(pipeline.Options{
+		Input:   input,
+		Output:  opts.output,
+		Format:  pipeline.FormatDEX,
 		Verbose: opts.verbose,
 		Deobf:   opts.deobfuscate,
 		Project: opts.project,

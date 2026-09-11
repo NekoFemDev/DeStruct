@@ -84,6 +84,16 @@ const (
 	AccAbstract     AccessFlags = 0x0400
 	AccInterface    AccessFlags = 0x0200
 	AccEnum         AccessFlags = 0x4000
+	// The remaining class-file/DEX flag bits. Several share a bit
+	// position with the field-only flags above because the JVM/Dalvik
+	// reuse the same bit differently depending on whether it's a field
+	// or a method (e.g. 0x0040 is ACC_VOLATILE on a field but
+	// ACC_BRIDGE on a method).
+	AccBridge     AccessFlags = 0x0040
+	AccVarargs    AccessFlags = 0x0080
+	AccStrict     AccessFlags = 0x0800
+	AccSynthetic  AccessFlags = 0x1000
+	AccAnnotation AccessFlags = 0x2000
 )
 
 func (f AccessFlags) Has(flag AccessFlags) bool {

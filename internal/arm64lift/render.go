@@ -15,6 +15,12 @@ import (
 // renders via its own ir.Stmt String() method instead, since none of
 // them have anything nested worth recursing into.
 //
+// Each statement first goes through hoistSharedExprs (see its own doc
+// comment): a statement whose expressions form a shared DAG would
+// otherwise render exponentially large, since every String() method
+// expands a shared node once per reference. Any temps that produces are
+// printed immediately before the statement, at the same indent level.
+//
 // The single shared renderer for every consumer of this package's own
 // output - cmd/lifttest (one function at a time) and the pipeline's
 // whole-binary decompile (internal/pipeline) - so both stay in sync
@@ -23,6 +29,10 @@ import (
 func RenderStmts(w io.Writer, stmts []ir.Stmt, depth int) {
 	indent := strings.Repeat("    ", depth)
 	for _, s := range stmts {
+		prelude, s := hoistSharedExprs(s)
+		for _, p := range prelude {
+			fmt.Fprintf(w, "%s%s\n", indent, p)
+		}
 		switch v := s.(type) {
 		case *ir.IfStmt:
 			fmt.Fprintf(w, "%sif (%s) {\n", indent, v.Cond)
