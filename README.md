@@ -9,6 +9,7 @@ Multi-format decompiler: JVM `.class`/`.jar` → Java, Android `.dex`/`.apk` →
 - **Hermes** — Disassemble and decompile React Native Hermes bytecode (`.hbc`/`.bundle`) to readable JS. Includes assembler, interactive patcher, and hex-editor workflow.
 - **ARM64 ELF** — Lift disassembled AArch64 instructions to C-like pseudocode with control flow recovery (if/else, while/do-while, struct field access, indirect calls). Cross-reference analysis, CFG simplification, per-function split output.
 - **Flutter** — Disassemble Flutter `libapp.so` (Dart AOT) to readable ARM64 assembly + binary patching support.
+- **IL2CPP** — Dump Unity `global-metadata.dat` + `libil2cpp.so` to `dump.cs` (images, types, fields, properties, methods with RVA/Offset/VA/Slot, default values, attributes).
 - **PE** — Disassemble Windows PE binaries (basic).
 - **ELF disassembly** — Capstone-based disassembler for ARM64, ARM32, x86, x86-64.
 
@@ -44,6 +45,7 @@ destruct <command> [options]
 | `interactive` | Interactive radare2-style REPL for `.hbc` patching |
 | `flutter` | Disassemble Flutter `libapp.so` to Dart bytecode |
 | `elf` | Disassemble ELF binaries (ARM64/ARM32/x86/x64) |
+| `il2cpp` | Dump Unity IL2CPP metadata (`global-metadata.dat` + `libil2cpp.so`) to `dump.cs` |
 | `pe` | Disassemble PE binaries |
 | `version` | Show version |
 | `help` | Show usage |
@@ -71,6 +73,9 @@ destruct elf libnative.so -o output/ --decompile --simplify-cfg
 
 # Flutter
 destruct flutter libapp.so -o output/
+
+# IL2CPP
+destruct il2cpp libil2cpp.so global-metadata.dat -o output/
 ```
 
 ### Key Flags
@@ -110,6 +115,7 @@ internal/
   csharp/           C# source generator from IR
   ir/               Shared intermediate representation (AST nodes)
   flutter/          Flutter/Dart AOT disassembler (unflutter)
+  il2cpp/           Unity IL2CPP dumper (global-metadata.dat + libil2cpp.so → dump.cs)
 pkg/destruct/       Public Go API
 ```
 

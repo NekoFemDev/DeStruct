@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/destruct/destruct/internal/hermes"
+	"github.com/destruct/destruct/internal/il2cpp"
 	"github.com/destruct/destruct/internal/pipeline"
 )
 
@@ -37,6 +38,8 @@ func main() {
 		handleFlutter(os.Args[2:])
 	case "elf":
 		handleELF(os.Args[2:])
+	case "il2cpp":
+		handleIL2CPP(os.Args[2:])
 	case "pe":
 		handlePE(os.Args[2:])
 	case "version":
@@ -62,6 +65,7 @@ Commands:
   patch     Search/patch Hermes .hbc bytecode
   flutter   Disassemble Flutter libapp.so to readable Dart bytecode
   elf       Disassemble ELF binaries to readable assembly (--decompile: AArch64-only pseudocode)
+  il2cpp    Dump Unity IL2CPP metadata (global-metadata.dat + libil2cpp.so) to dump.cs
   pe        Disassemble PE binaries to readable assembly
   version   Show version
   help      Show this help
@@ -126,6 +130,7 @@ Examples:
   destruct assemble output/file.hbc.hasm -i file.hbc -o patched.hbc  # Simplified format
   destruct patch file.hbc -t "isPro"
   destruct flutter libapp.so -o output/ --decompile
+  destruct il2cpp libil2cpp.so global-metadata.dat -o output/
   destruct elf libnative.so -o output/`)
 }
 
@@ -608,6 +613,104 @@ func handleELF(args []string) {
 	}
 
 	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
+}
+
+// handleIL2CPP implements `destruct il2cpp`, which dumps both a Unity
+// global-metadata.dat and the matching libil2cpp.so into dump.cs.
+//
+// Usage: destruct il2cpp <libil2cpp.so> <global-metadata.dat> [-o output/]
+// The two positional arguments may be given in either order; they are
+// detected from their magic numbers.
+func handleIL2CPP(args []string) {
+	output := "output"
+	verbose := false
+	printOptions := false
+	var positionals []string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-o", "--output":
+			if i+1 < len(args) {
+				i++
+				output = args[i]
+			}
+		case "-v", "--verbose":
+			verbose = true
+		case "--print-options":
+			printOptions = true
+		default:
+			if !strings.HasPrefix(args[i], "-") {
+				positionals = append(positionals, args[i])
+			}
+		}
+	}
+
+	if printOptions {
+		cfg := map[string]interface{}{
+			"command": "il2cpp",
+			"output":  output,
+			"verbose": verbose,
+		}
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println(string(data))
+		return
+	}
+
+	if len(positionals) < 2 {
+		fmt.Fprintln(os.Stderr, "Error: both libil2cpp.so and global-metadata.dat are required")
+		fmt.Fprintln(os.Stderr, "Usage: destruct il2cpp <libil2cpp.so> <global-metadata.dat> [-o output/]")
+		os.Exit(1)
+	}
+	lib, meta := positionals[0], positionals[1]
+	if looksLikeMetadata(lib) && looksLikeELF(meta) {
+		lib, meta = meta, lib
+	}
+
+	result, err := il2cpp.Run(il2cpp.Options{
+		LibPath:      lib,
+		MetadataPath: meta,
+		OutputDir:    output,
+		Verbose:      verbose,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("IL2CPP dump complete. Metadata v%.1f, IL2CPP %.1f\n", result.MetadataVersion, result.IL2CPPVersion)
+	fmt.Printf("Images: %d, TypeDefs: %d, Methods: %d\n", result.ImageCount, result.TypeDefCount, result.MethodCount)
+	fmt.Printf("CodeRegistration: 0x%X, MetadataRegistration: 0x%X\n", result.CodeRegistration, result.MetadataRegistration)
+	fmt.Printf("Output: %s/dump.cs\n", output)
+}
+
+func looksLikeMetadata(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var magic [4]byte
+	if _, err := f.Read(magic[:]); err != nil {
+		return false
+	}
+	return magic[0] == 0xAF && magic[1] == 0x1B && magic[2] == 0xB1 && magic[3] == 0xFA
+}
+
+func looksLikeELF(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var magic [4]byte
+	if _, err := f.Read(magic[:]); err != nil {
+		return false
+	}
+	return string(magic[:]) == "\x7fELF"
 }
 
 func handlePE(args []string) {

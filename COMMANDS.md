@@ -165,6 +165,44 @@ destruct elf libnative.so -o output/ --decompile
 
 ---
 
+## `destruct il2cpp` — дамп Unity IL2CPP (`global-metadata.dat` + `libil2cpp.so`) → `dump.cs`
+
+```
+destruct il2cpp libil2cpp.so global-metadata.dat -o output/
+destruct il2cpp global-metadata.dat libil2cpp.so -o output/   # порядок аргументов не важен
+destruct il2cpp libil2cpp.so global-metadata.dat -v            # диагностика поиска регистраций
+```
+
+Читает пару «библиотека IL2CPP + метаданные Unity» напрямую из файлов (без запуска
+приложения и без root) и генерирует `dump.cs` в формате Il2CppDumper: список образов,
+все типы/поля/свойства/методы с RVA/Offset/VA, Slot для виртуальных методов, значения
+default value и кастомные атрибуты.
+
+Что происходит внутри:
+1. Парсится `global-metadata.dat` (поддерживаются версии метаданных 16–31, включая
+   сжатые custom-attribute блобы v29+).
+2. В `libil2cpp.so` находятся `Il2CppCodeRegistration` и `Il2CppMetadataRegistration`
+   (эвристический поиск по ссылкам на `mscorlib.dll`, fallback на символы
+   `g_CodeRegistration`/`g_MetadataRegistration`) с учётом вариантов структур для
+   соседних версий IL2CPP.
+3. Применяются динамические релокации (AArch64/x86-64/ARM/x86), разворачиваются
+   codeGen-модули, типы, field offsets и generic-инстансы.
+4. Пишется `dump.cs`.
+
+Флаги:
+- `-o, --output` — директория для `dump.cs` (по умолчанию `output/`).
+- `-v, --verbose` — печатать версию метаданных, адреса регистраций и т.д.
+- `--print-options` — распечатать конфигурацию и выйти.
+
+Обе позиционные аргумента опциональны по порядку: `.so` и `global-metadata.dat`
+распознаются по магическим числам, так что перепутать их нельзя.
+
+Ограничения: вывод рассчитан на файловый дамп (RVA == VA адреса в образе);
+`dump.cs` пишется без восстановления тел методов — для дизассемблирования кода
+используй `destruct elf` по тем же RVA.
+
+---
+
 ## `destruct pe` — дизассемблирование PE-бинарников (Windows `.exe`/`.dll`)
 
 ```
