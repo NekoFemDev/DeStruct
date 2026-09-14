@@ -20,6 +20,7 @@ import (
 	"github.com/destruct/destruct/internal/ir"
 	javagen "github.com/destruct/destruct/internal/java"
 	"github.com/destruct/destruct/internal/jvm"
+	"github.com/destruct/destruct/internal/llvm"
 	"github.com/destruct/destruct/internal/native"
 )
 
@@ -46,6 +47,7 @@ type Options struct {
 	SplitFunctions  bool
 	CrossReferences bool
 	SimplifyCFG     bool
+	EmitLLVM        bool
 }
 
 type Pipeline struct {
@@ -504,6 +506,23 @@ func (p *Pipeline) decompileELFArm64() error {
 
 	baseName := filepath.Base(p.opts.Input)
 
+	// LLVM IR mode writes every lifted function again, one LLVM define
+	// per function, into a single .ll module file next to the main
+	// output (combined regardless of split mode, since lifted functions
+	// call each other by name and belong in one module).
+	var llMod *llvm.Module
+	if p.opts.EmitLLVM {
+		llPath := filepath.Join(p.opts.Output, baseName+".decompiled.ll")
+		llFile, err := os.Create(llPath)
+		if err != nil {
+			return fmt.Errorf("create LLVM output file: %w", err)
+		}
+		defer llFile.Close()
+		llMod = llvm.NewModule(llFile)
+		llMod.EmitHeader(baseName, p.opts.Input)
+		defer llMod.Finish()
+	}
+
 	// Split-function mode writes every function to its own file inside
 	// <basename>_decompiled/ plus a functions.json index. The classic mode
 	// keeps the whole binary in a single .decompiled.c file.
@@ -565,7 +584,7 @@ func (p *Pipeline) decompileELFArm64() error {
 		}
 
 		if p.opts.SplitFunctions {
-			meta := p.writeSplitFunction(splitDir, c, insns, resolver, strResolver, dataReader, xrefs[c.addr])
+			meta := p.writeSplitFunction(splitDir, c, insns, resolver, strResolver, dataReader, xrefs[c.addr], llMod)
 			if meta.Success {
 				if meta.Empty {
 					empty++
@@ -594,6 +613,19 @@ func (p *Pipeline) decompileELFArm64() error {
 					empty++
 				} else {
 					ok++
+				}
+				if p.opts.EmitLLVM && llMod != nil {
+					func() {
+						defer func() {
+							// The emitter only formats already-lifted IR,
+							// but a malformed node must never kill the
+							// whole run - report inline like a lift panic.
+							if r := recover(); r != nil {
+								fmt.Fprintf(os.Stderr, "warning: LLVM export of %s failed: %v\n", c.name, r)
+							}
+						}()
+						llMod.EmitFunction(arm64lift.Demangle(c.name), stmts)
+					}()
 				}
 				fmt.Fprintf(f, "// %s\n", arm64lift.Demangle(c.name))
 				writeXrefComments(f, xrefs[c.addr])
@@ -625,6 +657,9 @@ func (p *Pipeline) decompileELFArm64() error {
 			}
 		}
 		fmt.Printf("Decompiled %d functions (%d empty, %d failed) to %s/\n", ok, empty, failed, splitDir)
+		if p.opts.EmitLLVM {
+			fmt.Printf("LLVM IR: %s\n", filepath.Join(p.opts.Output, baseName+".decompiled.ll"))
+		}
 	} else {
 		if p.opts.CrossReferences {
 			xrefsPath := filepath.Join(p.opts.Output, baseName+".xrefs.json")
@@ -633,6 +668,9 @@ func (p *Pipeline) decompileELFArm64() error {
 			}
 		}
 		fmt.Printf("Decompiled %d functions (%d empty, %d failed) to %s\n", ok, empty, failed, filepath.Join(p.opts.Output, baseName+".decompiled.c"))
+		if p.opts.EmitLLVM {
+			fmt.Printf("LLVM IR: %s\n", filepath.Join(p.opts.Output, baseName+".decompiled.ll"))
+		}
 	}
 	return nil
 }
@@ -690,6 +728,7 @@ func sanitizeFunctionName(name string) string {
 }
 
 // writeSplitFunction writes one function to its own .c file inside splitDir.
+// llMod is the combined LLVM module stream, or nil when --emit-llvm is off.
 func (p *Pipeline) writeSplitFunction(
 	splitDir string,
 	c funcCandidate,
@@ -698,6 +737,7 @@ func (p *Pipeline) writeSplitFunction(
 	strResolver arm64lift.StringResolver,
 	dataReader func(uint64, int) ([]byte, bool),
 	fx *functionXrefs,
+	llMod *llvm.Module,
 ) splitFuncResult {
 	filePath := filepath.Join(splitDir, functionFileName(c))
 	outF, err := os.Create(filePath)
@@ -718,6 +758,16 @@ func (p *Pipeline) writeSplitFunction(
 		stmts := arm64lift.LiftFunctionWithData(insns, nil, resolver, strResolver, dataReader, p.opts.SimplifyCFG)
 		result.Empty = len(stmts) == 0
 		result.Success = true
+		if p.opts.EmitLLVM && llMod != nil {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Fprintf(os.Stderr, "warning: LLVM export of %s failed: %v\n", c.name, r)
+					}
+				}()
+				llMod.EmitFunction(arm64lift.Demangle(c.name), stmts)
+			}()
+		}
 		fmt.Fprintf(outF, "// %s\n", arm64lift.Demangle(c.name))
 		writeXrefComments(outF, fx)
 		arm64lift.RenderStmts(outF, stmts, 0)

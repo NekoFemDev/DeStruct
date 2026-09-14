@@ -70,6 +70,7 @@ destruct elf libnative.so -o output/ --decompile
 destruct elf libnative.so -o output/ --decompile --split-functions
 destruct elf libnative.so -o output/ --decompile --cross-references
 destruct elf libnative.so -o output/ --decompile --simplify-cfg
+destruct elf libnative.so -o output/ --decompile --emit-llvm
 
 # Flutter
 destruct flutter libapp.so -o output/
@@ -88,6 +89,7 @@ destruct il2cpp libil2cpp.so global-metadata.dat -o output/
 | `--split-functions` | Per-function output files + `functions.json` (ELF) |
 | `--cross-references` | XREF comments + `xrefs.json` (ELF) |
 | `--simplify-cfg` | CFG simplification / unreachable block removal (ELF, experimental) |
+| `--emit-llvm` | Export lifted IR to LLVM IR `<name>.decompiled.ll` (ELF, implies `--decompile`) |
 | `--no-enhance` | Disable enhanced comments (ELF) |
 | `--hex` | Hex-editor-friendly disassembly (Hermes) |
 | `--patch-map` | Per-operand file offset map (Hermes) |

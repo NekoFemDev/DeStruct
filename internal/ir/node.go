@@ -265,6 +265,20 @@ type (
 	}
 	BreakStmt    struct{}
 	ContinueStmt struct{}
+	// LabelStmt marks a jump target for a shared control-flow merge
+	// point that can't be nested inside either arm of the branch that
+	// reaches it: the arm's lifted statements end in a GotoStmt to this
+	// label, and the merged continuation is lifted exactly ONCE,
+	// immediately after it. Without this, every arm would have to
+	// duplicate the entire downstream continuation, which is
+	// exponential in the number of sequential if/else splits.
+	LabelStmt struct {
+		Name string
+	}
+	// GotoStmt is an explicit "goto <label>;" - see LabelStmt.
+	GotoStmt struct {
+		Label string
+	}
 )
 
 func (*AssignStmt) stmtNode()    {}
@@ -284,6 +298,8 @@ func (*ThrowStmt) stmtNode()     {}
 func (*VarDeclStmt) stmtNode()   {}
 func (*BreakStmt) stmtNode()     {}
 func (*ContinueStmt) stmtNode()  {}
+func (*LabelStmt) stmtNode()     {}
+func (*GotoStmt) stmtNode()      {}
 
 type (
 	IntLit    struct{ Value int64 }

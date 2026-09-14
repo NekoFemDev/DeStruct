@@ -1040,18 +1040,26 @@ func TestLiftFunction_DoWhileLoopWithInternalIfElse(t *testing.T) {
 		t.Fatalf("expected cond to be a \"<\" comparison, got %#v", do.Cond)
 	}
 
-	if do.Body == nil || len(do.Body.Statements) != 1 {
-		t.Fatalf("expected exactly 1 statement in the loop body (the internal if/else), got %v", do.Body)
+	if do.Body == nil || len(do.Body.Statements) != 2 {
+		t.Fatalf("expected 2 statements in the loop body (the internal if/else plus its shared merge label), got %v", do.Body)
 	}
 	ifStmt, ok := do.Body.Statements[0].(*ir.IfStmt)
 	if !ok {
-		t.Fatalf("expected the body statement to be an IfStmt, got %T: %v", do.Body.Statements[0], do.Body.Statements[0])
+		t.Fatalf("expected the first body statement to be an IfStmt, got %T: %v", do.Body.Statements[0], do.Body.Statements[0])
+	}
+	// The tail (the do-while's own condition check, 0x18) is a genuine
+	// merge point both arms reconverge on, so it is lifted exactly once
+	// after the if/else under a label, and each arm just jumps to it -
+	// see tryLiftIfElseMerge.
+	label, ok := do.Body.Statements[1].(*ir.LabelStmt)
+	if !ok {
+		t.Fatalf("expected the second body statement to be the merge LabelStmt, got %T: %v", do.Body.Statements[1], do.Body.Statements[1])
 	}
 
-	assertSingleCall := func(t *testing.T, stmts []ir.Stmt, method string) {
+	assertCallThenGoto := func(t *testing.T, stmts []ir.Stmt, method string) {
 		t.Helper()
-		if len(stmts) != 1 {
-			t.Fatalf("expected exactly 1 statement, got %v", stmts)
+		if len(stmts) != 2 {
+			t.Fatalf("expected 2 statements (call + merge goto), got %v", stmts)
 		}
 		exprStmt, ok := stmts[0].(*ir.ExprStmt)
 		if !ok {
@@ -1060,13 +1068,121 @@ func TestLiftFunction_DoWhileLoopWithInternalIfElse(t *testing.T) {
 		if call, ok := exprStmt.Expr.(*ir.StaticMethodCall); !ok || call.Method != method {
 			t.Errorf("expected a call to %q, got %#v", method, exprStmt.Expr)
 		}
+		gotoStmt, ok := stmts[1].(*ir.GotoStmt)
+		if !ok || gotoStmt.Label != label.Name {
+			t.Errorf("expected a GotoStmt to %q, got %#v", label.Name, stmts[1])
+		}
 	}
 	// Then corresponds to the branch-taken arm (cbz's target, 0x14 -
 	// "other()"), Else to the fallthrough arm (0xc - "step()") - see
 	// liftCondition's own doc comment on why the branch-taken path is
 	// always the "then" as this lifter builds it.
-	assertSingleCall(t, ifStmt.Then.Statements, "other")
-	assertSingleCall(t, ifStmt.Else.Statements, "step")
+	assertCallThenGoto(t, ifStmt.Then.Statements, "other")
+	assertCallThenGoto(t, ifStmt.Else.Statements, "step")
+}
+
+// TestLiftFunction_IfElseMergePoint lifts a hand-built instruction
+// stream equivalent to:
+//
+//	void f(int x) {
+//	    if (x) { b(); } else { a(); }
+//	    c();
+//	}
+//
+// Unlike TestLiftFunction_LoopWithNestedIf (whose arms don't share a
+// merge within the function), both arms reconverge on the "bl c" block
+// (0x14), so the lifter must lift that shared continuation exactly once
+// under a label, with each arm jumping there - instead of duplicating
+// "c()" (and, in bigger functions, the entire rest of the function)
+// into both arms. See tryLiftIfElseMerge's own doc comment.
+func TestLiftFunction_IfElseMergePoint(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// cbz w0, else(0x10)   (branch-taken = else, i.e. x == 0)
+		{Address: 0x0, Size: 4, Mnemonic: "cbz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: 0x10},
+		}},
+		// bl a(0x100)
+		{Address: 0x4, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// b merge(0x14)
+		{Address: 0x8, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x14},
+		}},
+		// else @ 0x10: bl b(0x104)
+		{Address: 0x10, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x104},
+		}},
+		// merge @ 0x14: bl c(0x108)
+		{Address: 0x14, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x108},
+		}},
+		// ret
+		{Address: 0x18, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "a", true
+		case 0x104:
+			return "b", true
+		case 0x108:
+			return "c", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, []string{"x"}, resolver, nil)
+
+	if len(stmts) != 3 {
+		t.Fatalf("expected 3 top-level statements (if/else, merge label, shared continuation), got %d: %v", len(stmts), stmts)
+	}
+	ifStmt, ok := stmts[0].(*ir.IfStmt)
+	if !ok {
+		t.Fatalf("expected the first statement to be an IfStmt, got %T: %v", stmts[0], stmts[0])
+	}
+	label, ok := stmts[1].(*ir.LabelStmt)
+	if !ok {
+		t.Fatalf("expected the second statement to be the merge LabelStmt, got %T: %v", stmts[1], stmts[1])
+	}
+
+	checked := 0
+	for _, arm := range []*ir.Block{ifStmt.Then, ifStmt.Else} {
+		if arm == nil || len(arm.Statements) != 2 {
+			t.Fatalf("expected each arm to have 2 statements (call + merge goto), got %v", arm)
+		}
+		exprStmt, ok := arm.Statements[0].(*ir.ExprStmt)
+		if !ok {
+			t.Fatalf("expected each arm to start with its call, got %T: %v", arm.Statements[0], arm.Statements[0])
+		}
+		if call, ok := exprStmt.Expr.(*ir.StaticMethodCall); ok {
+			checked++
+			if call.Method != "a" && call.Method != "b" {
+				t.Errorf("expected arm call to be a() or b(), got %q", call.Method)
+			}
+		} else {
+			t.Errorf("expected an arm call, got %#v", exprStmt.Expr)
+		}
+		gotoStmt, ok := arm.Statements[1].(*ir.GotoStmt)
+		if !ok || gotoStmt.Label != label.Name {
+			t.Errorf("expected each arm to end with a GotoStmt to %q, got %#v", label.Name, arm.Statements[1])
+		}
+	}
+	if checked != 2 {
+		t.Errorf("expected both arms to carry a call, got %d", checked)
+	}
+
+	// The shared continuation (c()) must appear exactly once, as the
+	// return value of the function's single ret.
+	ret, ok := stmts[2].(*ir.ReturnStmt)
+	if !ok {
+		t.Fatalf("expected the shared continuation to end in the function's ReturnStmt, got %T: %v", stmts[2], stmts[2])
+	}
+	if call, ok := ret.Value.(*ir.StaticMethodCall); !ok || call.Method != "c" {
+		t.Errorf("expected the return value to be the shared c() call, got %#v", ret.Value)
+	}
 }
 
 // TestLiftFunction_ParamStackReassignment lifts a hand-built
@@ -1515,6 +1631,74 @@ func TestLiftFunction_KnownArityCallDoesNotScavengeLeftoverArg(t *testing.T) {
 	}
 	if stackChkArgs != 0 {
 		t.Errorf("expected __stack_chk_fail() to be called with its real, fixed arity of 0 args (not a scavenged leftover value), got %d among %v", stackChkArgs, stmts)
+	}
+}
+
+// TestLiftFunction_StaleCallResultIsNotAnArgument lifts a hand-built
+// instruction stream equivalent to two independent zero-argument calls:
+//
+//	first();
+//	second();
+//
+// Unlike the known-arity case above, second's arity isn't in
+// knownArity, so the general "grab whatever's in x0-x7" heuristic runs.
+// Before the resultRegs fix it saw x0 still holding first()'s discarded
+// return value (finishCall stores every call's result into x0) and
+// rendered the stream as "second(first())" - carrying the previous
+// call's result over as if it were this call's own argument. AAPCS64
+// lets a callee clobber x0-x7, so a value never explicitly re-assigned
+// since the last call is never a real argument.
+func TestLiftFunction_StaleCallResultIsNotAnArgument(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// bl first()  - result lands in x0, never read by anything
+		{Address: 0x0, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// bl second() - unknown arity; x0 still holds first()'s result
+		{Address: 0x4, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x104},
+		}},
+		{Address: 0x8, Size: 4, Mnemonic: "ret"},
+	}
+
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "first", true
+		case 0x104:
+			return "second", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+
+	var firstSeen, secondSeen bool
+	secondArgs := -1
+	for _, s := range stmts {
+		var call *ir.StaticMethodCall
+		switch v := s.(type) {
+		case *ir.ExprStmt:
+			call, _ = v.Expr.(*ir.StaticMethodCall)
+		case *ir.ReturnStmt:
+			call, _ = v.Value.(*ir.StaticMethodCall)
+		}
+		if call == nil {
+			continue
+		}
+		switch call.Method {
+		case "first":
+			firstSeen = true
+		case "second":
+			secondSeen = true
+			secondArgs = len(call.Args)
+		}
+	}
+	if !firstSeen || !secondSeen {
+		t.Fatalf("expected both first() and second() in the output, got %v", stmts)
+	}
+	if secondArgs != 0 {
+		t.Errorf("expected second() to take no arguments (first()'s stale return value must not carry over), got %d among %v", secondArgs, stmts)
 	}
 }
 

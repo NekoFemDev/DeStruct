@@ -86,7 +86,9 @@ Options:
                       With --decompile (ELF), add cross-reference comments
                        (callers/callees) and emit an xrefs.json file
   --simplify-cfg      Run CFG simplification / unreachable-block removal
-                       for AArch64 ELF decompilation (experimental)
+                        for AArch64 ELF decompilation (experimental)
+  --emit-llvm           With --decompile (ELF), also export every lifted
+                        function as LLVM IR to <input>.decompiled.ll
   --no-enhance        Disable enhanced comments when using --decompile (ELF)
   --no-location-comments Disable source-location comments when using --decompile (ELF)
   --print-options     Print the parsed configuration and exit
@@ -582,6 +584,12 @@ func handleELF(args []string) {
 		opts.decompile = true
 	}
 
+	// --emit-llvm implies --decompile for ELF, since the LLVM exporter
+	// consumes the lifted IR.
+	if opts.emitLLVM {
+		opts.decompile = true
+	}
+
 	// --decompile automatically enables enhancement output; use
 	// --no-enhance / --no-location-comments to opt out.
 	enhance := opts.decompile && !opts.noEnhance
@@ -605,6 +613,7 @@ func handleELF(args []string) {
 		SplitFunctions:  opts.splitFunctions,
 		CrossReferences: opts.crossReferences,
 		SimplifyCFG:     opts.simplifyCfg,
+		EmitLLVM:        opts.emitLLVM,
 	})
 
 	if err := p.Run(); err != nil {
@@ -762,6 +771,7 @@ func cliOptionsMap(opts cliOpts) map[string]interface{} {
 		"splitFunctions":     opts.splitFunctions,
 		"crossReferences":    opts.crossReferences,
 		"simplifyCfg":        opts.simplifyCfg,
+		"emitLLVM":           opts.emitLLVM,
 	}
 }
 
@@ -796,6 +806,7 @@ type cliOpts struct {
 	splitFunctions     bool
 	crossReferences    bool
 	simplifyCfg        bool
+	emitLLVM           bool
 }
 
 func parseFlags(args []string) (cliOpts, string) {
@@ -856,6 +867,8 @@ func parseFlags(args []string) (cliOpts, string) {
 			opts.crossReferences = true
 		case "--simplify-cfg":
 			opts.simplifyCfg = true
+		case "--emit-llvm":
+			opts.emitLLVM = true
 		case "--no-project":
 			opts.project = false
 		default:

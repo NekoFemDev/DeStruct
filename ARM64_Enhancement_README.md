@@ -177,6 +177,14 @@ int add(int a, int b) {
 - [x] Comprehensive documentation
 - [x] Test and validation scripts
 
+### ✅ Phase 3 (Hard Fixes)
+- [x] **LLVM IR export** (`--emit-llvm`): every lifted function also exports to `<имя>.decompiled.ll` via `internal/llvm` — all values as `i64`, entry allocas per local (clang-`-O0` style), structured control flow lowered to explicit blocks/branches, string literals as private globals
+- [x] **Merge points** (`internal/arm64lift/merge.go`, `LabelStmt`/`GotoStmt`): a branch's shared continuation is lifted exactly once at its immediate post-dominator (plus do-while-tail joins) instead of being duplicated into every fork — output ~2.5x smaller on real binaries
+- [x] **String dispatch**: string-literal address tracking through `mov`, flat `} else if (...) {` rendering, strcmp-chain folding into `switch (x) { case "...": }`
+- [x] **Calling convention**: registers holding the previous call's return value are never scavenged as the next call's arguments (`resultRegs`)
+- [x] **dump.cs RVA lines**: interface/abstract methods keep the full `// RVA: -1 Offset: -1 Slot: N` reference format instead of losing the RVA line
+- [x] **try/catch reconstruction**: `__cxa_begin_catch` / `__cxa_end_catch` marker pairs fold into real `try { } catch (Exception e) { }` statements
+
 ### 🔄 In Progress
 - [ ] Full integration with destruct command line interface
 - [ ] Additional architecture support

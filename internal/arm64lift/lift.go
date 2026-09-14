@@ -228,6 +228,7 @@ func LiftFunction(instructions []native.DetailedInstruction, paramNames []string
 // non-nil it enables jump-table switch statement detection.
 func LiftFunctionWithData(instructions []native.DetailedInstruction, paramNames []string, resolver SymbolResolver, strResolver StringResolver, dataReader func(uint64, int) ([]byte, bool), simplify bool) []ir.Stmt {
 	budget := blockVisitBudget
+	labelSeq := 0
 	l := &lifter{
 		regs:       make(map[string]ir.Expr),
 		stack:      make(map[int32]string),
@@ -236,8 +237,10 @@ func LiftFunctionWithData(instructions []native.DetailedInstruction, paramNames 
 		strings:    strResolver,
 		addrRegs:   make(map[string]uint64),
 		consumed:   make(map[ir.Expr]bool),
+		resultRegs: make(map[string]bool),
 		budget:     &budget,
 		dataReader: dataReader,
+		labelSeq:   &labelSeq,
 	}
 	l.seedParams()
 
@@ -245,6 +248,7 @@ func LiftFunctionWithData(instructions []native.DetailedInstruction, paramNames 
 	if simplify {
 		blocks = simplifyCFG(blocks)
 	}
+	l.cfg = analyzeCFG(blocks)
 	if len(blocks) <= 1 {
 		// No branching at all - the original straight-line path handles
 		// this case exactly as before CFG support was added. This is
@@ -258,14 +262,14 @@ func LiftFunctionWithData(instructions []native.DetailedInstruction, paramNames 
 			insts = blocks[0].Instructions
 		}
 		stmts := l.run(insts)
-		return append(stmts, l.flushRemaining()...)
+		return reconstructTryCatch(append(stmts, l.flushRemaining()...))
 	}
 
 	byAddr := make(map[uint64]*BasicBlock, len(blocks))
 	for _, b := range blocks {
 		byAddr[b.StartAddr] = b
 	}
-	return l.liftBlockGraph(blocks[0], byAddr, make(map[uint64]bool), nil)
+	return reconstructTryCatch(l.liftBlockGraph(blocks[0], byAddr, make(map[uint64]bool), nil))
 }
 
 // loopCtx identifies the innermost enclosing loop a liftBlockGraph
@@ -322,6 +326,19 @@ type doWhileTailState struct {
 func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, loop *loopCtx) []ir.Stmt {
 	if b == nil {
 		return nil
+	}
+	// A stop address is this arm's shared continuation, lifted once by
+	// the caller after the if/else instead of here: jump to its label.
+	// Checked before everything else (including the already-visited
+	// check below, which would otherwise silently swallow the jump) so
+	// the continuation is never lifted a second time - see
+	// tryLiftIfElseMerge's own doc comment.
+	if label, ok := l.stops[b.StartAddr]; ok {
+		if l.mergeUsed != nil {
+			*l.mergeUsed = true
+		}
+		stmts := l.flushRemaining()
+		return append(stmts, &ir.GotoStmt{Label: label})
 	}
 	if visited[b.StartAddr] {
 		// Reaching an already-visited block via the plain
@@ -435,10 +452,20 @@ func (l *lifter) liftBlockGraphDispatch(b *BasicBlock, byAddr map[uint64]*BasicB
 		// reaching head this way is simply "the body's done, naturally
 		// re-check the condition" and needs no statement at all. See
 		// its own doc comment.
+		//
+		// Before splitting the ordinary way (each arm independently
+		// lifting the full continuation), try the merge-point form: if
+		// the CFG says both arms must eventually reach one shared
+		// block, each arm stops there with a GotoStmt and the
+		// continuation is lifted exactly once after the if/else - the
+		// difference between linear and exponential output.
+		if merged, ok := l.tryLiftIfElseMerge(b, cond, thenAddr, elseAddr, byAddr, visited, loop); ok {
+			return append(stmts, merged...)
+		}
 		stmts = append(stmts, &ir.IfStmt{
 			Cond: cond,
-			Then: &ir.Block{Statements: l.liftLoopEdge(thenAddr, byAddr, visited, loop)},
-			Else: &ir.Block{Statements: l.liftLoopEdge(elseAddr, byAddr, visited, loop)},
+			Then: &ir.Block{Statements: l.liftLoopEdge(thenAddr, byAddr, visited, loop, l.stops, l.mergeUsed)},
+			Else: &ir.Block{Statements: l.liftLoopEdge(elseAddr, byAddr, visited, loop, l.stops, l.mergeUsed)},
 		})
 		return stmts
 	}
@@ -474,6 +501,17 @@ func (l *lifter) liftBlockGraphDispatch(b *BasicBlock, byAddr map[uint64]*BasicB
 			return append(stmts, &ir.BreakStmt{})
 		}
 		if loop != nil && b.Succs[0] == loop.headAddr {
+			// A merge stop placed on the do-while tail must win over the
+			// ordinary "fall into the tail" handling below: the tail's
+			// instructions are lifted exactly once at the label instead,
+			// and this path just jumps there.
+			if label, ok := l.stops[b.Succs[0]]; ok {
+				if l.mergeUsed != nil {
+					*l.mergeUsed = true
+				}
+				stmts = append(stmts, l.flushRemaining()...)
+				return append(stmts, &ir.GotoStmt{Label: label})
+			}
 			if loop.doWhileTail != nil {
 				// Unlike a while-shape loop's head (see below), a
 				// do-while's tail hasn't been lifted yet at this point -
@@ -622,7 +660,13 @@ func (l *lifter) liftSwitchCase(target uint64, byAddr map[uint64]*BasicBlock, vi
 // needs its own fork: both branches may independently reach a shared
 // merge block, and each needs to lift it with its OWN register
 // state).
-func (l *lifter) liftLoopEdge(addr uint64, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, loop *loopCtx) []ir.Stmt {
+func (l *lifter) liftLoopEdge(addr uint64, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, loop *loopCtx, stops map[uint64]string, mergeUsed *bool) []ir.Stmt {
+	if label, ok := stops[addr]; ok {
+		if mergeUsed != nil {
+			*mergeUsed = true
+		}
+		return []ir.Stmt{&ir.GotoStmt{Label: label}}
+	}
 	if loop != nil {
 		if addr == loop.headAddr {
 			if loop.doWhileTail != nil {
@@ -645,7 +689,137 @@ func (l *lifter) liftLoopEdge(addr uint64, byAddr map[uint64]*BasicBlock, visite
 		return nil
 	}
 	forked := l.fork()
+	forked.stops = stops
+	forked.mergeUsed = mergeUsed
 	return forked.liftBlockGraph(block, byAddr, cloneVisited(visited), loop)
+}
+
+// tryLiftIfElseMerge lifts a conditional split whose two arms both
+// eventually reconverge at a single shared block - the immediate
+// post-dominator of the branch block, per the function's cfgAnalysis -
+// as:
+//
+//	if (cond) { ...; goto L; } else { ...; goto L; }
+//	L:;
+//	<shared continuation, lifted exactly once>
+//
+// instead of the historical fallback, where each arm's own fork lifted
+// the ENTIRE downstream graph itself (correct, but exponential in the
+// number of sequential (even non-nested!) conditionals, and the reason
+// a 400-line function's output could reach tens of megabytes).
+//
+// The shared continuation is lifted here in the PARENT lifter, from the
+// register state as it was before the split. That loses any
+// branch-specific register values the old per-fork duplication used to
+// carry into the continuation, but without real phi-node/dataflow
+// support there was never a sound way to merge two divergent per-arm
+// states anyway; a single deterministic state is the honest
+// approximation, and the explicit label/goto preserves the actual
+// control flow exactly.
+//
+// Conservatively falls back (ok=false) whenever the shape isn't a clean
+// one: no known ipdom, an ipdom that isn't a genuine multi-predecessor
+// merge, an ipdom that is one of the branch's own direct successors or
+// an enclosing loop's head/exit (loop/break/continue handling owns
+// those), or neither arm actually reaching the merge. Every fallback
+// keeps the old behavior, never a wrong guess.
+func (l *lifter) tryLiftIfElseMerge(b *BasicBlock, cond ir.Expr, thenAddr, elseAddr uint64, byAddr map[uint64]*BasicBlock, visited map[uint64]bool, loop *loopCtx) ([]ir.Stmt, bool) {
+	if l.cfg == nil {
+		return nil, false
+	}
+	merge := l.cfg.ipdom[b.StartAddr]
+	if merge == 0 || l.cfg.preds[merge] < 2 {
+		// Standard post-dominance found no shared continuation - the
+		// classic reason is one arm returning early, which leaves the
+		// function exit as the only block all paths share. Fall back to
+		// the looser, terminating-path-ignoring merge set before giving
+		// up (see cfgAnalysis.partialIPDom's own doc comment).
+		if alt := l.cfg.partialIPDom[b.StartAddr]; alt != 0 {
+			merge = alt
+		}
+	}
+	// Last resort for a split inside a do-while body whose arms both
+	// eventually reach the loop's own tail (the condition check at the
+	// end of the body): the tail is the natural shared continuation of
+	// an if/else chain of option tests, even when a control-flow cycle
+	// makes both post-dominator analyses above give up on it. Both arms
+	// having a path to the tail is exactly the shape "each iteration
+	// ends at the same condition check" the loop structure already
+	// implies; arms that terminate instead simply never reach the
+	// label, which is harmless.
+	if (merge == 0 || l.cfg.preds[merge] < 2) && loop != nil && loop.doWhileTail != nil {
+		if l.reachesAddr(thenAddr, loop.headAddr, byAddr, nil) &&
+			l.reachesAddr(elseAddr, loop.headAddr, byAddr, nil) {
+			merge = loop.headAddr
+		}
+	}
+	if merge == 0 || l.cfg.preds[merge] < 2 {
+		return nil, false
+	}
+	if merge == thenAddr || merge == elseAddr {
+		return nil, false
+	}
+	// If the merge is already owned by an ENCLOSING split's own stop
+	// (same address), that outer label is where this continuation
+	// belongs: nesting a new label+goto pair here would emit
+	// "L:; goto L;" - an infinite loop in the generated source. Let the
+	// ordinary if/else path run instead, whose arms inherit the outer
+	// stop through liftLoopEdge's stops argument.
+	if _, owned := l.stops[merge]; owned {
+		return nil, false
+	}
+	// A do-while's "headAddr" IS its tail (the condition check at the
+	// END of the body - see loopCtx.doWhileTail): a split inside the
+	// body whose shared continuation is that tail is exactly the
+	// common case (every arm of a chain of conditions rejoins at the
+	// loop's increment/condition). It is a valid merge point here, and
+	// the continuation after the label must go through
+	// liftDoWhileTail so the loop's own condition still gets captured.
+	// For every other enclosing loop address (a while-shape head, or
+	// any loop's exit) break/continue handling owns the block instead.
+	isTail := loop != nil && loop.doWhileTail != nil && merge == loop.headAddr
+	if !isTail && loop != nil && (merge == loop.headAddr || merge == loop.exitAddr) {
+		return nil, false
+	}
+	mergeBlk, ok := byAddr[merge]
+	if !ok {
+		return nil, false
+	}
+
+	label := fmt.Sprintf("L_%x_%d", merge, l.nextLabel())
+	used := false
+	// Inherit any enclosing stops (see liftBlockGraph's own stop check)
+	// and add this split's own merge - an arm that hits an enclosing
+	// stop must still jump there rather than walk past it.
+	stop := make(map[uint64]string, len(l.stops)+1)
+	for addr, lbl := range l.stops {
+		stop[addr] = lbl
+	}
+	stop[merge] = label
+	thenStmts := l.liftLoopEdge(thenAddr, byAddr, visited, loop, stop, &used)
+	elseStmts := l.liftLoopEdge(elseAddr, byAddr, visited, loop, stop, &used)
+	if !used {
+		// Neither arm reaches the merge at all (both end in
+		// returns/unresolved tail calls): there is no shared
+		// continuation to lift, and the ordinary if/else handles the
+		// arms identically. The forked arm lifters above are discarded
+		// untouched - fork() only copies state, so l itself is
+		// unaffected (apart from the shared budget).
+		return nil, false
+	}
+
+	stmts := []ir.Stmt{&ir.IfStmt{
+		Cond: cond,
+		Then: &ir.Block{Statements: thenStmts},
+		Else: &ir.Block{Statements: elseStmts},
+	}}
+	stmts = append(stmts, &ir.LabelStmt{Name: label})
+	if isTail {
+		stmts = append(stmts, l.liftDoWhileTail(loop, byAddr)...)
+		return stmts, true
+	}
+	stmts = append(stmts, l.liftBlockGraph(mergeBlk, byAddr, visited, loop)...)
+	return stmts, true
 }
 
 // liftDoWhileTail lifts a do-while loop's own tail block (loop.headAddr,
@@ -1161,11 +1335,15 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.consumed {
 		consumed[k] = v
 	}
+	resultRegs := make(map[string]bool, len(l.resultRegs))
+	for k, v := range l.resultRegs {
+		resultRegs[k] = v
+	}
 	addrRegs := make(map[string]uint64, len(l.addrRegs))
 	for k, v := range l.addrRegs {
 		addrRegs[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, budget: l.budget, dataReader: l.dataReader}
+	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1347,6 +1525,18 @@ type lifter struct {
 	// for" and exempt from being flushed again.
 	consumed map[ir.Expr]bool
 
+	// resultRegs marks the argument registers currently holding a call
+	// result placed there IMPLICITLY by finishCall rather than by an
+	// explicit instruction since. AAPCS64 says a callee is free to
+	// clobber x0-x7, so a value still sitting there from a previous
+	// call was never assigned by this call's own argument setup - it
+	// must never be scavenged as this call's argument (see
+	// collectCallArgsN). Any explicit write to the register (setReg)
+	// or clobber clears the mark, so a genuinely reloaded/moved value
+	// is still collected normally; only the untouched leftovers are
+	// excluded.
+	resultRegs map[string]bool
+
 	// budget bounds the total number of liftBlockGraph calls across
 	// THIS lifter and every one it's ever been forked from (a pointer,
 	// so fork() shares the same underlying counter rather than copying
@@ -1367,6 +1557,39 @@ type lifter struct {
 	// address. Non-nil when switch-statement detection wants to read
 	// jump-table entries from rodata.
 	dataReader func(uint64, int) ([]byte, bool)
+
+	// cfg holds this function's merge-point facts (predecessor counts
+	// and immediate post-dominators) - see cfgAnalysis' own doc comment.
+	// nil on the straight-line path, where no branch graph exists.
+	cfg *cfgAnalysis
+
+	// stops, when non-nil, maps a block address to the label a path
+	// reaching that block must jump to instead of lifting it: set while
+	// lifting one arm of a split whose shared continuation is lifted
+	// exactly once at the merge point after the if/else - see
+	// tryLiftIfElseMerge and liftBlockGraph's own stop check.
+	stops map[uint64]string
+
+	// mergeUsed is shared (by pointer) across every fork lifting the
+	// arms of the same split; whichever path first reaches one of
+	// stops sets it true, which is how the caller knows the merge label
+	// is actually referenced and the continuation must be lifted.
+	mergeUsed *bool
+
+	// labelSeq numbers merge labels within one function's lift. It is
+	// shared by pointer across forks (like budget): the same merge
+	// address can legitimately be lifted independently by two different
+	// arm forks, and each emission needs its own label name or the
+	// rendered C/LLVM would contain duplicate labels inside one
+	// function.
+	labelSeq *int
+}
+
+// nextLabel returns the next merge-label serial number for this
+// function's lift (see lifter.labelSeq).
+func (l *lifter) nextLabel() int {
+	*l.labelSeq++
+	return *l.labelSeq
 }
 
 // cmpOperands is the lhs/rhs of a lifted "cmp" instruction, in the
@@ -2034,6 +2257,21 @@ func (l *lifter) liftMov(inst native.DetailedInstruction) []ir.Stmt {
 	dst, src := inst.Operands[0], inst.Operands[1]
 	switch src.Type {
 	case native.OperandReg:
+		// A register-to-register move of a known address must carry the
+		// addrRegs entry along with the value: the standard -O0 idiom
+		// for reaching a string literal is "adrp xN, #page; add xN,
+		// xN, #off" followed by moving xN into an argument register
+		// right before the call ("mov x1, x28; bl strcmp"), and
+		// without this the string resolution in collectCallArgsN would
+		// see only the raw computed address arithmetic
+		// ("12288 + 3349") instead of the "--pid" it points at.
+		// setReg deletes any stale addrRegs entry first (its clobber
+		// step), so the entry is re-installed after it returns.
+		if addr, ok := l.addrRegs[src.Reg]; ok {
+			stmts := l.setReg(dst.Reg, l.regValue(src.Reg))
+			l.addrRegs[dst.Reg] = addr
+			return stmts
+		}
 		return l.setReg(dst.Reg, l.regValue(src.Reg))
 	case native.OperandImm:
 		return l.setReg(dst.Reg, &ir.IntLit{Value: src.Imm})
@@ -2081,6 +2319,18 @@ func (l *lifter) collectCallArgsN(n int) []ir.Expr {
 		}
 		v, ok := l.regs[reg]
 		if !ok {
+			break
+		}
+		// A value still sitting in an argument register implicitly from
+		// a PREVIOUS call's own return (see resultRegs' doc comment) was
+		// never explicitly assigned as part of THIS call's argument
+		// setup - AAPCS64 lets any callee clobber x0-x7, and real -O0
+		// code always writes every argument register it actually passes
+		// before the call. Carrying such a stale result over as if it
+		// were an argument is exactly the bug this guard exists to
+		// prevent (e.g. "bl a; bl b" rendering as "b(a())" when the
+		// source was two independent zero-argument calls).
+		if l.resultRegs[reg] {
 			break
 		}
 		// If this register currently holds a known address (from
@@ -2193,6 +2443,12 @@ func (l *lifter) finishCall(call ir.Expr) []ir.Stmt {
 	l.calls = append(l.calls, call)
 	stmts = append(stmts, l.setReg("w0", call)...)
 	stmts = append(stmts, l.setReg("x0", call)...)
+	// Mark the return-value registers as implicitly holding this call's
+	// result, so the NEXT call's argument collection never mistakes them
+	// for its own explicitly-set arguments - see resultRegs' own doc
+	// comment.
+	l.resultRegs["w0"] = true
+	l.resultRegs["x0"] = true
 	return stmts
 }
 
@@ -2442,6 +2698,7 @@ func (l *lifter) clobberReg(reg string) []ir.Stmt {
 		l.consumed[old] = true
 	}
 	delete(l.regs, reg)
+	delete(l.resultRegs, reg)
 	// Whatever reg is about to hold next, it isn't the address this
 	// entry recorded any more - a caller that DOES know the new value
 	// is (or extends) a known address, e.g. liftAddr or liftAdd's
@@ -2474,8 +2731,10 @@ func (l *lifter) clobberReg(reg string) []ir.Stmt {
 func (l *lifter) setReg(reg string, val ir.Expr) []ir.Stmt {
 	stmts := l.clobberReg(reg)
 	l.regs[reg] = val
+	delete(l.resultRegs, reg)
 	if xReg, ok := wRegToX(reg); ok {
 		l.regs[xReg] = val
+		delete(l.resultRegs, xReg)
 	}
 	return stmts
 }

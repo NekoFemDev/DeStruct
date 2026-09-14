@@ -21,28 +21,20 @@
 - [x] Add .dynsym fallback for stripped binaries (improve function candidate discovery)
 - [x] Add switch statement detection in arm64lift
 - [x] Improve variable naming in decompiled output
-
-## Phase 3: Hard Fixes (Future)
 - [x] Add `--split-functions` flag for ELF decompilation to output per-function files + `functions.json`
 - [x] Add cross-reference analysis in decompiled output
 - [x] Add full CFG simplification and unreachable block removal
-- [ ] Add machine learning-guided comment placement
-- [ ] Add export to LLVM IR format
-- [ ] Add ARM64 SME (Scalable Matrix Extension) support
-- [ ] Add RISC-V architecture support
 
-## Files to Create/Modify
-- `internal/pipeline/pipeline_enhancements.go` - [DONE] Comment enhancement
-- `internal/pipeline/pipeline.go` - [DONE] Add EnhanceComments option, .dynsym size fallback, split-function output
-- `cmd/destruct/main.go` - [DONE] Add CLI flags
-- `internal/flutter/unflutter-0.5.9/internal/output/output.go` - [DONE] Flutter output module
-- `internal/arm64lift/lift.go` - [DONE] Variable naming hints + jump-table switch detection
-- `internal/arm64lift/render.go` - [DONE] Switch statement rendering
-- `internal/arm64lift/cfg_simplify.go` - [DONE] CFG simplification / unreachable-block removal
-- `internal/native/elf.go` - [DONE] Multi-arch PLT fallback, DataReader for jump tables
-- `internal/native/disasm.go` - [DONE] NewDisassemblerForMachine helper
-- `test_enhancements.sh` - [DONE] Test script
-- `test_pipeline_enhancements.sh` - [DONE] Test suite
+## Phase 3: Hard Fixes (Completed)
+- [x] Add **LLVM IR export** - Export enhanced decompilation output to LLVM IR format (`--emit-llvm`, `internal/llvm`, per-function defines + string globals)
+- [x] Merge-точки в liftBlockGraph (LabelStmt/GotoStmt) — shared continuation lifted once via immediate post-dominators + do-while-tail joins (output ~2.5x smaller on real binaries)
+- [x] String dispatch через strcmp — address tracking through `mov`, `else if` rendering, strcmp-chain folding into `switch (x) { case "...": }`
+- [x] Calling convention: args must not carry over from the previous call (`resultRegs` tracking in the lifter)
+- [x] Fix `else if` в dump.cs In the renderer — restore the RVA for interface methods (always emit `// RVA:` line, `-1` when abstract/unresolved)
+- [x] Try/catch reconstruction для C++ exceptions (`__cxa_begin_catch`/`__cxa_end_catch` marker split into real TryStmt)
+
+## Phase 4: Experement Fixes (Future)
+- [ ] Add **RISC-V support** - Add similar enhancements for RISC-V architecture (No targets on mobile arm64)
 
 ## Testing
 - [x] Run `go build -o destruct ./cmd/destruct`
@@ -52,5 +44,5 @@
 - [x] Run `./test_pipeline_enhancements.sh`
 
 ## Documentation
-- [x] ARM64_Enhancement_README.md - [DONE]
-- [x] Update COMMANDS.md with new flags
+- [x] ARM64_Enhancement_README.md - Phase 3 section added
+- [x] Update COMMANDS.md with new flags (`--emit-llvm`)

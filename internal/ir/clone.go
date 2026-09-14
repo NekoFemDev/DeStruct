@@ -90,6 +90,10 @@ func CloneStmt(s Stmt) Stmt {
 		return &BreakStmt{}
 	case *ContinueStmt:
 		return &ContinueStmt{}
+	case *LabelStmt:
+		return &LabelStmt{Name: v.Name}
+	case *GotoStmt:
+		return &GotoStmt{Label: v.Label}
 	default:
 		// Unknown Stmt implementation (e.g. added outside this package):
 		// return as-is rather than panicking. This only risks reintroducing

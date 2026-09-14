@@ -306,19 +306,9 @@ func (e *Executor) dumpMethods(w *bufio.Writer, imageIndex int, imageName string
 		}
 		methodPointer := e.IL2CPP.GetMethodPointer(imageName, methodDef)
 		slot := methodDef.u16("slot")
-		if !isAbstract && methodPointer > 0 {
-			fixedPointer := e.IL2CPP.GetRVA(methodPointer)
-			fileOff, _ := e.IL2CPP.mapVATR(methodPointer)
-			fmt.Fprintf(w, "\t// RVA: 0x%X Offset: 0x%X VA: 0x%X", fixedPointer, fileOff, methodPointer)
-			if slot != 0xFFFF {
-				fmt.Fprintf(w, " Slot: %d", slot)
-			}
-			w.WriteString("\n")
-		} else if slot != 0xFFFF {
-			fmt.Fprintf(w, "\t// Slot: %d\n", slot)
-		} else if !isAbstract {
-			w.WriteString("\t//\n")
-		}
+		fixedPointer := e.IL2CPP.GetRVA(methodPointer)
+		fileOff, _ := e.IL2CPP.mapVATR(methodPointer)
+		w.WriteString(formatMethodLocation(isAbstract, methodPointer, fixedPointer, fileOff, slot, slot != 0xFFFF))
 		w.WriteString("\t")
 		w.WriteString(e.getModifiers(methodDef))
 		methodReturnType := e.typeAt(int(methodDef.i32("returnType")))
@@ -356,6 +346,30 @@ func (e *Executor) dumpMethods(w *bufio.Writer, imageIndex int, imageName string
 			w.WriteString(") { }\n")
 		}
 	}
+}
+
+// formatMethodLocation builds the tab-indented location comment line
+// that precedes every method declaration, mirroring the reference
+// dumper's own output exactly: the RVA/Offset/VA fields are ALWAYS
+// emitted (shown as -1 when isAbstract or no native pointer was
+// resolved - e.g. an ordinary interface method), and a vtable slot,
+// when present, is appended to that same line. The else-if chain this
+// replaces dropped the RVA line entirely whenever a slot existed,
+// leaving interface methods with just "// Slot: N" and making it
+// impossible to tell a method with no native body from one whose
+// pointer simply couldn't be resolved.
+func formatMethodLocation(isAbstract bool, methodPointer, rva, fileOff uint64, slot uint16, haveSlot bool) string {
+	var b strings.Builder
+	if !isAbstract && methodPointer > 0 {
+		fmt.Fprintf(&b, "\t// RVA: 0x%X Offset: 0x%X VA: 0x%X", rva, fileOff, methodPointer)
+	} else {
+		b.WriteString("\t// RVA: -1 Offset: -1")
+	}
+	if haveSlot {
+		fmt.Fprintf(&b, " Slot: %d", slot)
+	}
+	b.WriteByte('\n')
+	return b.String()
 }
 
 func isEnumTD(td record) bool { return (td.u32("bitfield")>>1)&1 == 1 }

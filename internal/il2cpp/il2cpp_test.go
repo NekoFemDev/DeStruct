@@ -81,6 +81,61 @@ func TestEscapeString(t *testing.T) {
 	}
 }
 
+// TestFormatMethodLocation locks in the reference dumper's location
+// comment format: interface/abstract methods (and any method whose
+// native pointer wasn't resolved) must still get a full RVA line, with
+// -1 placeholders rather than the line being dropped, and a vtable slot
+// must be appended to that same line.
+func TestFormatMethodLocation(t *testing.T) {
+	cases := []struct {
+		name          string
+		isAbstract    bool
+		methodPointer uint64
+		rva, fileOff  uint64
+		slot          uint16
+		haveSlot      bool
+		want          string
+	}{
+		{
+			name:          "concrete method with RVA and slot",
+			isAbstract:    false,
+			methodPointer: 0x23DB3C0,
+			rva:           0x23DB3C0,
+			fileOff:       0x23D73C0,
+			slot:          3,
+			haveSlot:      true,
+			want:          "\t// RVA: 0x23DB3C0 Offset: 0x23D73C0 VA: 0x23DB3C0 Slot: 3\n",
+		},
+		{
+			name:          "concrete method with RVA, no slot",
+			isAbstract:    false,
+			methodPointer: 0x1000,
+			rva:           0x1000,
+			fileOff:       0x400,
+			want:          "\t// RVA: 0x1000 Offset: 0x400 VA: 0x1000\n",
+		},
+		{
+			name:       "interface method keeps RVA -1 line and slot",
+			isAbstract: true,
+			slot:       0,
+			haveSlot:   true,
+			want:       "\t// RVA: -1 Offset: -1 Slot: 0\n",
+		},
+		{
+			name:       "unresolved pointer keeps RVA -1 line",
+			isAbstract: false,
+			want:       "\t// RVA: -1 Offset: -1\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := formatMethodLocation(tc.isAbstract, tc.methodPointer, tc.rva, tc.fileOff, tc.slot, tc.haveSlot); got != tc.want {
+				t.Errorf("formatMethodLocation() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRenderDefaultValue(t *testing.T) {
 	cases := []struct {
 		in   any

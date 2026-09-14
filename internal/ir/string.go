@@ -101,6 +101,17 @@ func (s *ContinueStmt) String() string {
 	return "continue;"
 }
 
+// LabelStmt renders as a C label followed by an empty statement
+// ("label:;"), since a bare "label:" at the end of a block would be
+// syntactically dangling.
+func (s *LabelStmt) String() string {
+	return s.Name + ":;"
+}
+
+func (s *GotoStmt) String() string {
+	return fmt.Sprintf("goto %s;", s.Label)
+}
+
 func (e *IntLit) String() string {
 	return fmt.Sprintf("%d", e.Value)
 }

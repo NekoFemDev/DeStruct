@@ -139,6 +139,7 @@ destruct elf libnative.so -o output/ --decompile --no-location-comments # без
 destruct elf libnative.so -o output/ --decompile --split-functions   # отдельный .c файл на функцию + functions.json
 destruct elf libnative.so -o output/ --decompile --cross-references  # XREF-комментарии + xrefs.json
 destruct elf libnative.so -o output/ --decompile --simplify-cfg      # упрощение CFG + удаление недостижимых блоков
+destruct elf libnative.so -o output/ --decompile --emit-llvm           # дополнительно экспортировать lifted IR в LLVM IR (<имя>.decompiled.ll)
 ```
 
 Даёт читаемый ассемблерный листинг всех code-секций с аннотацией символами (если есть `.symtab`).
@@ -150,6 +151,8 @@ destruct elf libnative.so -o output/ --decompile --simplify-cfg      # упро�
 **`--cross-references`** / **`-x`** (только AArch64 + `--decompile`): добавляет в начало каждой функции комментарии `// XREF from:` / `// XREF to:` со списком вызывающих и вызываемых функций, а также генерирует `xrefs.json` (рядом с `.decompiled.c` или внутри `_decompiled/` при `--split-functions`). Работает через анализ прямых вызовов `bl #imm` во всех функциях.
 
 **`--simplify-cfg`** (только AArch64 + `--decompile`, экспериментальный): перед подъёмом в IR запускает проход упрощения CFG — удаляет недостижимые базовые блоки и склеивает линейные цепочки (единственный предшественник + единственный преемник). Обратные рёбра циклов не трогает, чтобы не сломать распознавание `while`/`if`. Может улучшить выход, но в сложных случаях взаимодействует с эвристическим лифтером непредсказуемо, поэтому пока opt-in.
+
+**`--emit-llvm`** (только AArch64; подразумевает `--decompile`): помимо `.decompiled.c` пишет `<имя>.decompiled.ll` — каждую поднятую функцию как LLVM IR (`internal/llvm`): все значения моделируются как `i64`, локалы — аллоками в `entry` с load/store (как у clang `-O0`), структурный control flow понижается до явных базовых блоков и ветвлений (`if`/`while`/`switch`, метки слияния `L_<addr>_<n>:` + `goto` транслируются в метки/переходы LLVM один в один). Строковые литералы выносятся в приватные глобалы. Формат рассчитан на дальнейший разбор через `llvm-as`/`opt` или дизассемблеры, а не на верифицированную компиляцию — точной типовой системы в поднятом IR нет.
 
 С `--decompile` автоматически включаются улучшенные комментарии (`--enhance`) и location-комментарии (`--location-comments`). Чтобы их отключить, используй `--no-enhance` / `--no-location-comments`.
 
@@ -239,6 +242,7 @@ destruct help       # полный usage-текст (встроен в бина�
 | `--split-functions`, `-sf` | записать каждую функцию в отдельный `.c`-файл и сгенерировать `functions.json` (только с `--decompile` для ELF AArch64) |
 | `--cross-references`, `-x` | добавить `// XREF:` комментарии и сгенерировать `xrefs.json` (только с `--decompile` для ELF AArch64) |
 | `--simplify-cfg` | запустить упрощение CFG / удаление недостижимых блоков (только с `--decompile` для ELF AArch64, экспериментально) |
+| `--emit-llvm` | экспортировать lifted IR в LLVM IR `<имя>.decompiled.ll` (только AArch64, подразумевает `--decompile`) |
 | `--no-project` | не создавать структуру проекта |
 
 ---
