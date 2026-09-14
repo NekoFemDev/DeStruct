@@ -33,7 +33,11 @@ func TestELFParse(t *testing.T) {
 }
 
 func TestResolveGOT(t *testing.T) {
-	parser, err := NewELFParser("../../test/il2cpp_memory_dumper_main/build/il2cpp_memory_dumper")
+	// The fixture is the NDK-built aarch64 binary checked in at
+	// test/il2cpp_memory_dumper (the il2cpp_memory_dumper_main sources
+	// next to it are only its build recipe; their build/ output isn't
+	// committed, which is what this path used to point at).
+	parser, err := NewELFParser("../../test/il2cpp_memory_dumper")
 	if err != nil {
 		t.Fatalf("Error: %v", err)
 	}
