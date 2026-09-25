@@ -134,3 +134,63 @@ func TestEnhancementPreservesRenderedLines(t *testing.T) {
 		t.Fatalf("enhancement invented locations or changed rendered output: %q", got)
 	}
 }
+
+// TestNormalizedExt verifies that extension dispatch is case-insensitive at
+// the pipeline boundary, so .JAR/.Apk/.SO behave like their lowercase forms.
+func TestNormalizedExt(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"app.JAR", ".jar"},
+		{"app.Apk", ".apk"},
+		{"lib.SO", ".so"},
+		{"lib.ELF", ".elf"},
+		{"classes.DEX", ".dex"},
+		{"noext", ""},
+	} {
+		p := &Pipeline{opts: Options{Input: tc.in}}
+		if got := p.ext(); got != tc.want {
+			t.Errorf("ext(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestValidateInputSignature covers the cheap boundary-level magic checks:
+// zip containers (JAR/APK) and ELF shared objects are verified before any
+// parser runs, while formats without a cheap magic check pass through.
+func TestValidateInputSignature(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, data []byte) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	valid := map[string]string{
+		"ok.jar":    string([]byte{'P', 'K', 0x03, 0x04, 'r', 'e', 's', 't'}),
+		"OK.JAR":    string([]byte{'P', 'K', 0x03, 0x04, 'r', 'e', 's', 't'}),
+		"ok.apk":    string([]byte{'P', 'K', 0x03, 0x04, 'r', 'e', 's', 't'}),
+		"ok.so":     string(append([]byte{0x7f, 'E', 'L', 'F'}, make([]byte, 4)...)),
+		"ok.elf":    string(append([]byte{0x7f, 'E', 'L', 'F'}, make([]byte, 4)...)),
+		"plain.dex": "dex\n035",
+	}
+	for name, data := range valid {
+		p := &Pipeline{opts: Options{Input: write(name, []byte(data))}}
+		if err := p.validateInputSignature(); err != nil {
+			t.Errorf("%s rejected: %v", name, err)
+		}
+	}
+
+	invalid := map[string]string{
+		"bad.jar":   "not a zip",
+		"bad.so":    "MZ\x90\x00",
+		"tiny.apk":  "PK",
+		"empty.jar": "",
+	}
+	for name, data := range invalid {
+		p := &Pipeline{opts: Options{Input: write(name, []byte(data))}}
+		if err := p.validateInputSignature(); err == nil {
+			t.Errorf("expected signature failure for %s", name)
+		}
+	}
+}

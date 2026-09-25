@@ -3,6 +3,7 @@ package destruct
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 
 	"github.com/destruct/destruct/internal/csharp"
 	"github.com/destruct/destruct/internal/ir"
@@ -19,7 +20,7 @@ type Options struct {
 }
 
 func Decompile(opts Options) error {
-	ext := filepath.Ext(opts.Input)
+	ext := strings.ToLower(filepath.Ext(opts.Input))
 
 	var format pipeline.Format
 	switch ext {
@@ -46,7 +47,7 @@ func Decompile(opts Options) error {
 }
 
 func DecompileJVM(filename string, outputDir string) (*ir.Program, error) {
-	ext := filepath.Ext(filename)
+	ext := strings.ToLower(filepath.Ext(filename))
 
 	if ext == ".jar" {
 		return jvm.DecompileJAR(filename)

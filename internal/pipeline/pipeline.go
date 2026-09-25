@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,6 +56,12 @@ type Pipeline struct {
 	opts Options
 }
 
+// Magic numbers for the cheap boundary-level signature checks below.
+var (
+	zipMagic = []byte{'P', 'K', 0x03, 0x04} // JAR/APK are zip containers
+	elfMagic = []byte{0x7f, 'E', 'L', 'F'}  // shared objects are ELF
+)
+
 func New(opts Options) *Pipeline {
 	if opts.Output == "" {
 		opts.Output = "output"
@@ -62,7 +69,55 @@ func New(opts Options) *Pipeline {
 	return &Pipeline{opts: opts}
 }
 
+// ext returns the input path's extension, lowercased, so that .JAR, .Jar
+// and .jar all dispatch identically. Every format check in this file goes
+// through it rather than calling filepath.Ext directly.
+func (p *Pipeline) ext() string {
+	return strings.ToLower(filepath.Ext(p.opts.Input))
+}
+
+// validateInputSignature is a cheap sanity check that the input actually
+// looks like the container its extension claims. A .jar that isn't a zip,
+// or a .so that isn't an ELF, otherwise fails deep inside a parser with a
+// confusing message; catching the magic here gives a clear error and avoids
+// creating an output directory for input that can never be processed.
+// Formats without a cheap magic check (.class, .dex, raw ELF, PE) fall
+// through to their own parsers.
+func (p *Pipeline) validateInputSignature() error {
+	var magic []byte
+	switch p.ext() {
+	case ".jar", ".apk":
+		magic = zipMagic
+	case ".so", ".elf":
+		magic = elfMagic
+	default:
+		return nil
+	}
+
+	f, err := os.Open(p.opts.Input)
+	if err != nil {
+		return fmt.Errorf("opening input: %w", err)
+	}
+	defer f.Close()
+
+	var header [4]byte
+	if _, err := io.ReadFull(f, header[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return fmt.Errorf("input %s is too small to be a valid %s file", p.opts.Input, strings.TrimPrefix(p.ext(), "."))
+		}
+		return fmt.Errorf("reading input header: %w", err)
+	}
+	if !bytes.HasPrefix(header[:], magic) {
+		return fmt.Errorf("input %s does not look like a valid %s file (bad signature)", p.opts.Input, strings.TrimPrefix(p.ext(), "."))
+	}
+	return nil
+}
+
 func (p *Pipeline) Run() error {
+	if err := p.validateInputSignature(); err != nil {
+		return err
+	}
+
 	if err := os.MkdirAll(p.opts.Output, 0o755); err != nil {
 		return fmt.Errorf("creating output directory: %w", err)
 	}
@@ -105,7 +160,7 @@ func (p *Pipeline) Run() error {
 }
 
 func (p *Pipeline) decompileAndGenerateJVM() error {
-	ext := filepath.Ext(p.opts.Input)
+	ext := p.ext()
 
 	gen := javagen.NewGenerator(javagen.Options{
 		OutputDir: p.opts.Output,
@@ -220,7 +275,7 @@ func (p *Pipeline) decompileAndGenerateJVM() error {
 }
 
 func (p *Pipeline) decompileAndGenerateDEX() error {
-	ext := filepath.Ext(p.opts.Input)
+	ext := p.ext()
 
 	gen := javagen.NewGenerator(javagen.Options{
 		OutputDir: p.opts.Output,
@@ -320,7 +375,7 @@ func (p *Pipeline) decompileAndGenerateDEX() error {
 
 func (p *Pipeline) decompileFlutter() error {
 	input := p.opts.Input
-	ext := strings.ToLower(filepath.Ext(input))
+	ext := p.ext()
 
 	// If input is APK, extract libapp.so first.
 	if ext == ".apk" {
@@ -443,7 +498,7 @@ func (p *Pipeline) extractLibapp(apkPath string) (string, error) {
 
 func (p *Pipeline) decompileELFOrPE() (*ir.Program, error) {
 	// For now, use native disassembler for ELF files
-	ext := strings.ToLower(filepath.Ext(p.opts.Input))
+	ext := p.ext()
 
 	if ext == ".so" || ext == ".elf" || ext == "" {
 		return nil, p.disassembleELF()

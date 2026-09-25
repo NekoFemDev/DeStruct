@@ -49,7 +49,7 @@
 - [x] Make output writes atomic across `internal/pipeline/pipeline.go`, `internal/java/generator.go`, `internal/csharp/generator.go`, and `internal/il2cpp/dump.go`: write to a temporary file, sync/close it, then rename it into place.
 - [x] Fix temporary-file ownership in `internal/pipeline/pipeline.go:extractLibapp`. Return cleanup ownership or delete the extracted `/tmp/libapp-*.so` after processing so repeated runs do not leak files.
 - [x] Replace direct `os.Exit` calls in command handlers with `func run(args []string) error`; keep process termination only in `main`. This will improve CLI testing and library reuse.
-- [ ] Normalize file extensions at the pipeline boundary and validate file signatures where possible. `.JAR`, `.APK`, and similarly cased inputs should behave consistently.
+- [x] Normalize file extensions at the pipeline boundary and validate file signatures where possible. `.JAR`, `.APK`, and similarly cased inputs should behave consistently.
 - [ ] Replace unsafe Capstone structure pointer arithmetic in `internal/native/disasm.go` with a small, version-stable C helper API. Add lifecycle checks for nil/repeated `Close` and document thread-safety.
 - [ ] Add `context.Context` cancellation to long-running JAR/APK, ELF, Flutter, Hermes, and IL2CPP operations so Ctrl-C and API timeouts stop work cleanly.
 
