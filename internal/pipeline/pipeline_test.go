@@ -1,6 +1,11 @@
 package pipeline
 
 import (
+	"archive/zip"
+	"bytes"
+	"encoding/binary"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/destruct/destruct/internal/native"
@@ -52,5 +57,43 @@ func TestWithDiscoveredFunctions(t *testing.T) {
 	}
 	if _, ok := resolver(0x999); ok {
 		t.Errorf("expected an address that's neither a real symbol nor a discovered function to remain unresolved")
+	}
+}
+
+func TestExtractLibappArchiveLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "oversize.apk")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := zip.NewWriter(f)
+	entry, err := w.Create("lib/arm64-v8a/libapp.so")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	central := bytes.LastIndex(data, []byte("PK\x01\x02"))
+	if central < 0 {
+		t.Fatal("missing zip central directory")
+	}
+	binary.LittleEndian.PutUint32(data[central+24:], 0xffffffff)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(Options{Input: path})
+	if _, err := p.extractLibapp(path); err == nil {
+		t.Fatal("extract accepted oversized entry")
 	}
 }

@@ -4,9 +4,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"fmt"
-	"io"
 	"strings"
 
+	"github.com/destruct/destruct/internal/archivelimits"
 	"github.com/destruct/destruct/internal/ir"
 )
 
@@ -107,14 +107,14 @@ func DecompileJAR(path string) (*ir.Program, error) {
 // against a corrupt or adversarial zip entry (e.g. a bogus/huge uncompressed
 // size, or a decompression-bomb-style entry) rather than a limit expected to
 // ever be hit in practice.
-const maxClassFileSize = 256 * 1024 * 1024 // 256 MiB
+const maxClassFileSize = archivelimits.MaxEntrySize
 
 // CountClassEntries returns how many .class entries (outside META-INF) a
 // .jar contains, without reading or parsing any of them. This is cheap -
 // zip.OpenReader already has the central directory in memory - and lets
 // callers show "N / total" progress before streaming begins.
 func CountClassEntries(path string) (int, error) {
-	r, err := zip.OpenReader(path)
+	r, err := archivelimits.Open(path)
 	if err != nil {
 		return 0, err
 	}
@@ -124,6 +124,9 @@ func CountClassEntries(path string) (int, error) {
 	for _, f := range r.File {
 		if strings.HasSuffix(f.Name, ".class") && !strings.Contains(f.Name, "META-INF") {
 			n++
+			if n > archivelimits.MaxClasses {
+				return 0, fmt.Errorf("jar exceeds %d-class limit", archivelimits.MaxClasses)
+			}
 		}
 	}
 	return n, nil
@@ -184,17 +187,23 @@ func (r SkipReason) String() string {
 // aborting the whole run - a single class that fails to generate should
 // not cost the rest of a large .jar.
 func DecompileJARStreaming(path string, onClass func(cf *ClassFile, prog *ir.Program) error, onSkip func(entryName string, reason SkipReason, err error)) error {
-	r, err := zip.OpenReader(path)
+	r, err := archivelimits.Open(path)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
+	classes := 0
+	var budget archivelimits.ReadBudget
 	for _, f := range r.File {
 		if !strings.HasSuffix(f.Name, ".class") || strings.Contains(f.Name, "META-INF") {
 			continue
 		}
-		decompileJAREntryStreaming(f, onClass, onSkip)
+		classes++
+		if classes > archivelimits.MaxClasses {
+			return fmt.Errorf("jar exceeds %d-class limit", archivelimits.MaxClasses)
+		}
+		decompileJAREntryStreaming(f, &budget, onClass, onSkip)
 	}
 
 	return nil
@@ -210,7 +219,7 @@ func DecompileJARStreaming(path string, onClass func(cf *ClassFile, prog *ir.Pro
 // onClass, so that one malformed or unusually-shaped class (a common thing
 // in obfuscated/hostile real-world jars) can never take down decompilation
 // of the rest of the archive.
-func decompileJAREntryStreaming(f *zip.File, onClass func(cf *ClassFile, prog *ir.Program) error, onSkip func(entryName string, reason SkipReason, err error)) {
+func decompileJAREntryStreaming(f *zip.File, budget *archivelimits.ReadBudget, onClass func(cf *ClassFile, prog *ir.Program) error, onSkip func(entryName string, reason SkipReason, err error)) {
 	skip := func(reason SkipReason, err error) {
 		if onSkip != nil {
 			onSkip(f.Name, reason, err)
@@ -227,20 +236,17 @@ func decompileJAREntryStreaming(f *zip.File, onClass func(cf *ClassFile, prog *i
 		skip(SkipReasonTooLarge, nil)
 		return
 	}
-
-	rc, err := f.Open()
-	if err != nil {
-		skip(SkipReasonOpenFailed, err)
+	if budget.Total > archivelimits.MaxTotalSize || f.UncompressedSize64 > archivelimits.MaxTotalSize-budget.Total {
+		skip(SkipReasonTooLarge, fmt.Errorf("jar exceeds uncompressed size limit"))
 		return
 	}
-	defer rc.Close()
 
-	data, err := io.ReadAll(io.LimitReader(rc, maxClassFileSize+1))
+	data, err := budget.ReadEntry(f)
 	if err != nil {
 		skip(SkipReasonReadFailed, err)
 		return
 	}
-	if len(data) > maxClassFileSize {
+	if uint64(len(data)) > maxClassFileSize {
 		skip(SkipReasonTooLarge, nil)
 		return
 	}
@@ -264,23 +270,24 @@ func decompileJAREntryStreaming(f *zip.File, onClass func(cf *ClassFile, prog *i
 }
 
 func ReadJAR(path string) ([]*ClassFile, error) {
-	r, err := zip.OpenReader(path)
+	r, err := archivelimits.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
 
 	var classes []*ClassFile
+	classCount := 0
+	var budget archivelimits.ReadBudget
 	for _, f := range r.File {
 		if strings.HasSuffix(f.Name, ".class") && !strings.Contains(f.Name, "META-INF") {
-			rc, err := f.Open()
-			if err != nil {
-				continue
+			classCount++
+			if classCount > archivelimits.MaxClasses {
+				return nil, fmt.Errorf("jar exceeds %d-class limit", archivelimits.MaxClasses)
 			}
-			data, err := io.ReadAll(rc)
-			rc.Close()
+			data, err := budget.ReadEntry(f)
 			if err != nil {
-				continue
+				return nil, fmt.Errorf("reading jar entry %q: %w", f.Name, err)
 			}
 
 			cf, err := ParseClassFileFromBytes(data)

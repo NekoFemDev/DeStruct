@@ -1,7 +1,6 @@
 package pipeline
 
 import (
-	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/destruct/destruct/internal/archivelimits"
 	"github.com/destruct/destruct/internal/arm64lift"
 	"github.com/destruct/destruct/internal/csharp"
 	"github.com/destruct/destruct/internal/dex"
@@ -453,14 +453,17 @@ func (p *Pipeline) disassembleELF() error {
 
 	// Create output file
 	outPath := filepath.Join(p.opts.Output, filepath.Base(p.opts.Input)+".asm")
-	f, err := os.Create(outPath)
+	f, err := atomicfile.Create(outPath, 0o644)
 	if err != nil {
 		return fmt.Errorf("create output file: %w", err)
 	}
-	defer f.Close()
+	defer f.Abort()
 
 	if err := native.DisassembleELFFile(p.opts.Input, f); err != nil {
 		return fmt.Errorf("disassemble ELF: %w", err)
+	}
+	if err := f.Commit(); err != nil {
+		return fmt.Errorf("write output file: %w", err)
 	}
 
 	fmt.Printf("Disassembly: %s\n", outPath)

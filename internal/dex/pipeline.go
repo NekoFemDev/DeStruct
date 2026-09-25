@@ -1,12 +1,11 @@
 package dex
 
 import (
-	"archive/zip"
 	"fmt"
-	"io"
 	"path/filepath"
 	"strings"
 
+	"github.com/destruct/destruct/internal/archivelimits"
 	"github.com/destruct/destruct/internal/ir"
 )
 
@@ -324,31 +323,25 @@ func DecompileDexStreaming(path string, onClass func(*ir.Class), onSkip func(str
 // onClass once per class. Duplicate class names (multidex overrides) are
 // skipped after the first occurrence.
 func DecompileApkStreaming(path string, onClass func(*ir.Class), onSkip func(string, error)) error {
-	r, err := zip.OpenReader(path)
+	r, err := archivelimits.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening apk: %w", err)
 	}
 	defer r.Close()
 
 	seen := make(map[string]bool)
+	var budget archivelimits.ReadBudget
+	classCount := 0
 	for _, f := range r.File {
 		if !strings.HasSuffix(f.Name, ".dex") {
 			continue
 		}
-		rc, err := f.Open()
+		data, err := budget.ReadEntry(f)
 		if err != nil {
 			if onSkip != nil {
 				onSkip(f.Name, err)
 			}
-			continue
-		}
-		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			if onSkip != nil {
-				onSkip(f.Name, err)
-			}
-			continue
+			return fmt.Errorf("reading apk entry %q: %w", f.Name, err)
 		}
 		dex, err := ParseDexBytes(data)
 		if err != nil {
@@ -358,6 +351,10 @@ func DecompileApkStreaming(path string, onClass func(*ir.Class), onSkip func(str
 			continue
 		}
 		for _, classDef := range dex.Classes {
+			classCount++
+			if classCount > archivelimits.MaxClasses {
+				return fmt.Errorf("apk exceeds %d-class limit", archivelimits.MaxClasses)
+			}
 			class := classFromDef(dex, classDef)
 			if class == nil {
 				continue
@@ -386,29 +383,28 @@ func CountDexClasses(path string) (int, error) {
 // CountApkDexClasses counts the total number of classes across all DEX files
 // in an APK.
 func CountApkDexClasses(path string) (int, error) {
-	r, err := zip.OpenReader(path)
+	r, err := archivelimits.Open(path)
 	if err != nil {
 		return 0, fmt.Errorf("opening apk: %w", err)
 	}
 	defer r.Close()
 
 	total := 0
+	var budget archivelimits.ReadBudget
 	for _, f := range r.File {
 		if !strings.HasSuffix(f.Name, ".dex") {
 			continue
 		}
-		rc, err := f.Open()
+		data, err := budget.ReadEntry(f)
 		if err != nil {
-			continue
-		}
-		data, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil {
-			continue
+			return 0, fmt.Errorf("reading apk entry %q: %w", f.Name, err)
 		}
 		dex, err := ParseDexBytes(data)
 		if err != nil {
 			continue
+		}
+		if len(dex.Classes) > archivelimits.MaxClasses-total {
+			return 0, fmt.Errorf("apk exceeds %d-class limit", archivelimits.MaxClasses)
 		}
 		total += len(dex.Classes)
 	}
