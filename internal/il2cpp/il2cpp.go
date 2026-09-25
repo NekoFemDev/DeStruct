@@ -104,8 +104,14 @@ func Run(opts Options) (*Result, error) {
 	ic.MetadataRegistration = metadataRegistration
 
 	executor := NewExecutor(metadata, ic)
+	if err := executor.Err(); err != nil {
+		return nil, fmt.Errorf("initializing executor: %w", err)
+	}
 	if err := executor.DumpCS(opts.Dump); err != nil {
 		return nil, err
+	}
+	if err := executor.Err(); err != nil {
+		return nil, fmt.Errorf("dumping metadata: %w", err)
 	}
 
 	methodCount := 0

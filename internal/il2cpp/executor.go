@@ -115,27 +115,69 @@ var typeStrings = map[uint8]string{
 type Executor struct {
 	Metadata *Metadata
 	IL2CPP   *IL2CPP
+	err      error
 
 	customAttributeGenerators []uint64
 	includeAttrArgs           bool
 }
+
+// ReferenceError identifies the malformed table entry that prevented a dump.
+type ReferenceError struct {
+	Table string
+	Index int64
+	Cause string
+}
+
+func (e *ReferenceError) Error() string {
+	return fmt.Sprintf("il2cpp: %s[%d]: %s", e.Table, e.Index, e.Cause)
+}
+
+func (e *Executor) fail(table string, index int64, cause string) {
+	if e.err == nil {
+		e.err = &ReferenceError{Table: table, Index: index, Cause: cause}
+	}
+}
+
+func (e *Executor) Err() error { return e.err }
 
 func NewExecutor(m *Metadata, ic *IL2CPP) *Executor {
 	e := &Executor{Metadata: m, IL2CPP: ic}
 	if ic.Version >= 27 && ic.Version < 29 {
 		total := 0
 		for i := 0; i < m.ImageCount(); i++ {
-			total += int(m.Image(i).u32("customAttributeCount"))
+			img := m.Image(i)
+			start, count := int64(img.i32("customAttributeStart")), int64(img.u32("customAttributeCount"))
+			if count == 0 {
+				continue
+			}
+			// v27.2+ metadata may omit the old attributeTypes table.
+			// Limit indices by the metadata byte length, which is an upper
+			// bound on the number of serialized entries in any table.
+			if start < 0 || count > int64(len(m.Data)) || start > int64(len(m.Data))-count {
+				e.fail("images", int64(i), "invalid custom attribute generator range")
+				return e
+			}
+			if int(start+count) > total {
+				total = int(start + count)
+			}
 		}
 		e.customAttributeGenerators = make([]uint64, total)
 		for i := 0; i < m.ImageCount(); i++ {
 			img := m.Image(i)
 			mod := ic.CodeGenModules[m.ImageName(i)]
-			if mod == nil || img.u32("customAttributeCount") == 0 {
+			if img.u32("customAttributeCount") == 0 {
+				continue
+			}
+			if mod == nil {
 				continue
 			}
 			ptrs := ic.readU64s(mod.CustomAttributeCacheGenerator, int64(img.u32("customAttributeCount")))
-			copy(e.customAttributeGenerators[int(img.i32("customAttributeStart")):], ptrs)
+			if len(ptrs) != int(img.u32("customAttributeCount")) {
+				e.fail("images", int64(i), "custom attribute generator table truncated")
+				return e
+			}
+			start := int(img.i32("customAttributeStart"))
+			copy(e.customAttributeGenerators[start:start+int(img.u32("customAttributeCount"))], ptrs)
 		}
 	} else if ic.Version < 27 {
 		e.customAttributeGenerators = ic.CustomAttributeGenerators
@@ -145,35 +187,57 @@ func NewExecutor(m *Metadata, ic *IL2CPP) *Executor {
 
 func (e *Executor) typeAt(index int) *Il2CppType {
 	if index < 0 || index >= len(e.IL2CPP.Types) {
-		panic(fmt.Sprintf("il2cpp: type index %d out of range", index))
+		e.fail("types", int64(index), "index out of range")
+		return nil
 	}
 	t := e.IL2CPP.Types[index]
 	if t == nil {
-		panic(fmt.Sprintf("il2cpp: nil type at index %d", index))
+		e.fail("types", int64(index), "nil type")
 	}
 	return t
 }
 
 // GetTypeName renders an Il2CppType as a C# type name.
 func (e *Executor) GetTypeName(t *Il2CppType, addNamespace, isNested bool) string {
+	if e.err != nil {
+		return "<?>"
+	}
+	if e.Metadata == nil || e.IL2CPP == nil {
+		e.fail("executor", -1, "missing metadata or binary")
+		return "<?>"
+	}
+	if t == nil {
+		e.fail("types", -1, "nil type reference")
+		return "<?>"
+	}
 	switch t.TypeEnum {
 	case typeArray:
 		at := e.readArrayType(t.DataPoint)
+		if e.err != nil {
+			return "<?>"
+		}
 		elementType := e.IL2CPP.GetIl2CppType(at.etype)
 		if elementType == nil {
-			panic("il2cpp: array element type not found")
+			e.fail("arrayTypes", int64(t.DataPoint), "element type not found")
+			return "<?>"
+		}
+		if at.rank == 0 {
+			e.fail("arrayTypes", int64(t.DataPoint), "zero rank")
+			return "<?>"
 		}
 		return fmt.Sprintf("%s[%s]", e.GetTypeName(elementType, addNamespace, false), strings.Repeat(",", int(at.rank)-1))
 	case typeSZArray:
 		elementType := e.IL2CPP.GetIl2CppType(t.DataPoint)
 		if elementType == nil {
-			panic("il2cpp: szarray element type not found")
+			e.fail("types", int64(t.DataPoint), "array element type not found")
+			return "<?>"
 		}
 		return e.GetTypeName(elementType, addNamespace, false) + "[]"
 	case typePtr:
 		oriType := e.IL2CPP.GetIl2CppType(t.DataPoint)
 		if oriType == nil {
-			panic("il2cpp: pointer element type not found")
+			e.fail("types", int64(t.DataPoint), "pointer element type not found")
+			return "<?>"
 		}
 		return e.GetTypeName(oriType, addNamespace, false) + "*"
 	case typeVar:
@@ -189,12 +253,21 @@ func (e *Executor) GetTypeName(t *Il2CppType, addNamespace, isNested bool) strin
 		var genericClass *genericClass
 		if t.TypeEnum == typeGenericInst {
 			genericClass = e.readGenericClass(t.DataPoint)
+			if genericClass == nil {
+				return "<?>"
+			}
 			typeDef = e.GetGenericClassTypeDefinition(genericClass)
 		} else {
 			typeDef = e.GetTypeDefinitionFromIl2CppType(t)
 		}
+		if e.err != nil {
+			return "<?>"
+		}
 		if d := tdDeclaring(typeDef); d != -1 {
 			dt := e.typeAt(d)
+			if dt == nil {
+				return "<?>"
+			}
 			switch dt.TypeEnum {
 			case typeGenericInst:
 				// Nested inside an instantiated generic outer type: the
@@ -224,6 +297,9 @@ func (e *Executor) GetTypeName(t *Il2CppType, addNamespace, isNested bool) strin
 							break
 						}
 						pt := e.typeAt(pd)
+						if pt == nil {
+							return "<?>"
+						}
 						if pt.TypeEnum == typeGenericInst {
 							return e.GetTypeName(pt, addNamespace, false)
 						}
@@ -263,15 +339,20 @@ func (e *Executor) GetTypeName(t *Il2CppType, addNamespace, isNested bool) strin
 			inst := e.GenericInstAt(genericClass.contextClassInst)
 			str += e.GetGenericInstParams(inst)
 		} else if gci := tdGenericContainer(typeDef); gci >= 0 {
-			gc := e.Metadata.GenericContainer(int(gci))
-			str += e.GetGenericContainerParams(gc)
+			if int(gci) >= len(e.Metadata.genericConts) {
+				e.fail("genericContainers", int64(gci), "index out of range")
+			} else {
+				gc := e.Metadata.GenericContainer(int(gci))
+				str += e.GetGenericContainerParams(gc)
+			}
 		}
 		return str
 	default:
 		if s, ok := typeStrings[t.TypeEnum]; ok {
 			return s
 		}
-		panic(fmt.Sprintf("il2cpp: unknown type enum 0x%X", t.TypeEnum))
+		e.fail("types", int64(t.TypeEnum), "unknown type enum")
+		return "<?>"
 	}
 }
 
@@ -283,7 +364,8 @@ type arrayType struct {
 func (e *Executor) readArrayType(addr uint64) arrayType {
 	b, ok := e.IL2CPP.readRecord(addr, &layoutArrayType)
 	if !ok {
-		panic("il2cpp: cannot map Il2CppArrayType")
+		e.fail("arrayTypes", int64(addr), "cannot map Il2CppArrayType")
+		return arrayType{}
 	}
 	return arrayType{etype: leU64(b, 0), rank: b[8]}
 }
@@ -304,7 +386,8 @@ type genericClass struct {
 func (e *Executor) readGenericClass(addr uint64) *genericClass {
 	b, ok := e.IL2CPP.readRecord(addr, &layoutGenericClass)
 	if !ok {
-		panic("il2cpp: cannot map Il2CppGenericClass")
+		e.fail("genericClasses", int64(addr), "cannot map Il2CppGenericClass")
+		return nil
 	}
 	r := record{b: b, l: &layoutGenericClass, ver: e.IL2CPP.Version}
 	ctxOff := layoutGenericClass.offset(e.IL2CPP.Version, "context")
@@ -322,7 +405,8 @@ func (e *Executor) readGenericClass(addr uint64) *genericClass {
 
 func (e *Executor) typeDefAt(index int) record {
 	if index < 0 || index >= len(e.Metadata.typeDefs) {
-		panic(fmt.Sprintf("il2cpp: type definition index %d out of range", index))
+		e.fail("typeDefs", int64(index), "index out of range")
+		return record{l: &layoutTypeDefinition, ver: e.Metadata.Version}
 	}
 	return e.Metadata.typeDefs[index]
 }
@@ -343,6 +427,9 @@ func tdGenericContainer(td record) int32 {
 
 // GetTypeDefName renders a type definition's own name.
 func (e *Executor) GetTypeDefName(td record, addNamespace, genericParameter bool) string {
+	if e.err != nil {
+		return "<?>"
+	}
 	prefix := ""
 	if d := tdDeclaring(td); d != -1 {
 		prefix = e.GetTypeName(e.typeAt(d), addNamespace, true) + "."
@@ -358,8 +445,12 @@ func (e *Executor) GetTypeDefName(td record, addNamespace, genericParameter bool
 			typeName = typeName[:idx]
 		}
 		if genericParameter {
-			gc := e.Metadata.GenericContainer(int(gci))
-			typeName += e.GetGenericContainerParams(gc)
+			if int(gci) >= len(e.Metadata.genericConts) {
+				e.fail("genericContainers", int64(gci), "index out of range")
+			} else {
+				gc := e.Metadata.GenericContainer(int(gci))
+				typeName += e.GetGenericContainerParams(gc)
+			}
 		}
 	}
 	return prefix + typeName
@@ -367,9 +458,18 @@ func (e *Executor) GetTypeDefName(td record, addNamespace, genericParameter bool
 
 func (e *Executor) GetGenericInstParams(inst *il2CppGenericInst) string {
 	if inst == nil {
+		e.fail("genericInsts", -1, "missing generic instantiation")
+		return "<?>"
+	}
+	if e.IL2CPP == nil || e.IL2CPP.ELF == nil || inst.TypeArgc < 0 || uint64(inst.TypeArgc) > uint64(len(e.IL2CPP.ELF.data))/8 {
+		e.fail("genericInsts", inst.TypeArgc, "argument count out of bounds")
 		return "<?>"
 	}
 	pointers := e.IL2CPP.readU64s(inst.TypeArgv, inst.TypeArgc)
+	if len(pointers) != int(inst.TypeArgc) {
+		e.fail("genericInsts", inst.TypeArgc, "argument pointer table truncated")
+		return "<?>"
+	}
 	names := make([]string, 0, len(pointers))
 	for _, p := range pointers {
 		t := e.IL2CPP.GetIl2CppType(p)
@@ -383,8 +483,16 @@ func (e *Executor) GetGenericInstParams(inst *il2CppGenericInst) string {
 }
 
 func (e *Executor) GetGenericContainerParams(gc record) string {
+	if gc.l == nil {
+		e.fail("genericContainers", -1, "missing generic container")
+		return "<?>"
+	}
 	n := int(gc.i32("type_argc"))
 	start := int(gc.i32("genericParameterStart"))
+	if n < 0 || start < 0 || start > len(e.Metadata.genericParams) || n > len(e.Metadata.genericParams)-start {
+		e.fail("genericParams", int64(start), "invalid generic parameter range")
+		return "<?>"
+	}
 	names := make([]string, 0, n)
 	for i := 0; i < n; i++ {
 		idx := start + i
@@ -399,14 +507,30 @@ func (e *Executor) GetGenericContainerParams(gc record) string {
 
 // GetMethodSpecName renders a generic method instantiation.
 func (e *Executor) GetMethodSpecName(spec Il2CppMethodSpec, addNamespace bool) (string, string) {
+	if spec.MethodDefinitionIndex < 0 || int64(spec.MethodDefinitionIndex) >= int64(len(e.Metadata.methodDefs)) {
+		e.fail("methodDefs", int64(spec.MethodDefinitionIndex), "index out of range")
+		return "<?>", "<?>"
+	}
 	methodDef := e.Metadata.MethodDef(int(spec.MethodDefinitionIndex))
+	if d := methodDef.i32("declaringType"); d < 0 || int(d) >= len(e.Metadata.typeDefs) {
+		e.fail("typeDefs", int64(d), "method declaring type out of range")
+		return "<?>", "<?>"
+	}
 	typeDef := e.typeDefAt(int(methodDef.i32("declaringType")))
 	typeName := e.GetTypeDefName(typeDef, addNamespace, false)
-	if spec.ClassIndexIndex != -1 && int(spec.ClassIndexIndex) < len(e.IL2CPP.GenericInsts) {
+	if (spec.ClassIndexIndex >= 0 && int64(spec.ClassIndexIndex) >= int64(len(e.IL2CPP.GenericInsts))) || spec.ClassIndexIndex < -1 {
+		e.fail("genericInsts", int64(spec.ClassIndexIndex), "class instantiation index out of range")
+		return "<?>", "<?>"
+	}
+	if spec.ClassIndexIndex >= 0 {
 		typeName += e.GetGenericInstParams(e.IL2CPP.GenericInsts[spec.ClassIndexIndex])
 	}
 	methodName := e.Metadata.GetStringFromIndex(methodDef.u32("nameIndex"))
-	if spec.MethodIndexIndex != -1 && int(spec.MethodIndexIndex) < len(e.IL2CPP.GenericInsts) {
+	if (spec.MethodIndexIndex >= 0 && int64(spec.MethodIndexIndex) >= int64(len(e.IL2CPP.GenericInsts))) || spec.MethodIndexIndex < -1 {
+		e.fail("genericInsts", int64(spec.MethodIndexIndex), "method instantiation index out of range")
+		return "<?>", "<?>"
+	}
+	if spec.MethodIndexIndex >= 0 {
 		methodName += e.GetGenericInstParams(e.IL2CPP.GenericInsts[spec.MethodIndexIndex])
 	}
 	return typeName, methodName
@@ -426,24 +550,42 @@ func (e *Executor) GenericInstAt(addr uint64) *il2CppGenericInst {
 }
 
 func (e *Executor) GetGenericClassTypeDefinition(gc *genericClass) record {
+	if gc == nil {
+		e.fail("genericClasses", -1, "nil generic class")
+		return record{l: &layoutTypeDefinition, ver: e.Metadata.Version}
+	}
 	if e.IL2CPP.Version >= 27 {
 		t := e.IL2CPP.GetIl2CppType(gc.typ)
 		if t == nil {
-			panic("il2cpp: generic class type not found")
+			e.fail("genericClasses", int64(gc.typ), "type not found")
+			return record{l: &layoutTypeDefinition, ver: e.Metadata.Version}
 		}
 		return e.GetTypeDefinitionFromIl2CppType(t)
 	}
-	if gc.typeDefIndex == 4294967295 || gc.typeDefIndex == -1 {
-		panic("il2cpp: generic class has no type definition")
+	if gc.typeDefIndex == 4294967295 || gc.typeDefIndex < 0 || gc.typeDefIndex >= int64(len(e.Metadata.typeDefs)) {
+		e.fail("typeDefs", gc.typeDefIndex, "generic class type definition out of range")
+		return record{l: &layoutTypeDefinition, ver: e.Metadata.Version}
 	}
 	return e.typeDefAt(int(gc.typeDefIndex))
 }
 
 func (e *Executor) GetTypeDefinitionFromIl2CppType(t *Il2CppType) record {
+	if t == nil {
+		e.fail("types", -1, "nil type reference")
+		return record{l: &layoutTypeDefinition, ver: e.Metadata.Version}
+	}
+	if t.DataPoint >= uint64(len(e.Metadata.typeDefs)) {
+		e.fail("typeDefs", int64(t.DataPoint), "index out of range")
+		return record{l: &layoutTypeDefinition, ver: e.Metadata.Version}
+	}
 	return e.typeDefAt(int(t.DataPoint))
 }
 
 func (e *Executor) GenericParameterFromType(t *Il2CppType) record {
+	if t == nil || t.DataPoint >= uint64(len(e.Metadata.genericParams)) {
+		e.fail("genericParams", -1, "index out of range")
+		return record{l: &layoutGenericParameter, ver: e.Metadata.Version}
+	}
 	return e.Metadata.GenericParameter(int(t.DataPoint))
 }
 
@@ -460,6 +602,7 @@ type blobValue struct {
 type metadataReader struct {
 	data []byte
 	pos  int
+	err  error
 	// limit bounds reads to the containing metadata section; 0 means the
 	// whole file. Default value blobs are bounded so a corrupt length
 	// can't run past the default-value data section.
@@ -474,8 +617,11 @@ func (r *metadataReader) end() int {
 }
 
 func (r *metadataReader) readByte() byte {
-	if r.pos >= r.end() {
-		panic("il2cpp: metadata reader out of bounds")
+	if r.err != nil || r.pos < 0 || r.pos >= r.end() {
+		if r.err == nil {
+			r.err = &ReferenceError{Table: "metadataBlob", Index: int64(r.pos), Cause: "read out of bounds"}
+		}
+		return 0
 	}
 	b := r.data[r.pos]
 	r.pos++
@@ -483,8 +629,11 @@ func (r *metadataReader) readByte() byte {
 }
 
 func (r *metadataReader) readBytes(n int) []byte {
-	if n < 0 || r.pos+n > r.end() {
-		panic("il2cpp: metadata reader out of bounds")
+	if r.err != nil || n < 0 || r.pos < 0 || r.pos > r.end() || n > r.end()-r.pos {
+		if r.err == nil {
+			r.err = &ReferenceError{Table: "metadataBlob", Index: int64(r.pos), Cause: "read out of bounds"}
+		}
+		return nil
 	}
 	b := r.data[r.pos : r.pos+n]
 	r.pos += n
@@ -493,6 +642,9 @@ func (r *metadataReader) readBytes(n int) []byte {
 
 func (r *metadataReader) compressedUInt32() uint32 {
 	read := r.readByte()
+	if r.err != nil {
+		return 0
+	}
 	switch {
 	case read&0x80 == 0:
 		return uint32(read)
@@ -508,13 +660,17 @@ func (r *metadataReader) compressedUInt32() uint32 {
 		return val
 	case read == 0xF0:
 		b := r.readBytes(4)
+		if r.err != nil {
+			return 0
+		}
 		return leU32(b, 0)
 	case read == 0xFE:
 		return ^uint32(0) - 1
 	case read == 0xFF:
 		return ^uint32(0)
 	default:
-		panic("il2cpp: invalid compressed integer")
+		r.err = &ReferenceError{Table: "metadataBlob", Index: int64(r.pos - 1), Cause: "invalid compressed integer"}
+		return 0
 	}
 }
 
@@ -537,18 +693,35 @@ func (r *metadataReader) compressedInt32() int32 {
 // style explicitly.
 func (e *Executor) TryGetDefaultValue(typeIndex int, dataIndex int32) (out any, ok bool) {
 	defer func() {
-		if recover() != nil {
+		if r := recover(); r != nil {
+			e.fail("defaultValues", int64(dataIndex), fmt.Sprintf("decode error: %v", r))
 			out = nil
 			ok = false
 		}
 	}()
+	if dataIndex < 0 {
+		e.fail("defaultValues", int64(dataIndex), "negative data index")
+		return nil, false
+	}
 	pointer := e.Metadata.GetDefaultValueFromIndex(dataIndex)
 	defaultValueType := e.typeAt(typeIndex)
-	limit := int(e.Metadata.Header.u32("fieldAndParameterDefaultValueDataOffset")) +
-		int(e.Metadata.Header.i32("fieldAndParameterDefaultValueDataSize"))
+	if defaultValueType == nil {
+		return nil, false
+	}
+	sectionOff := uint64(e.Metadata.Header.u32("fieldAndParameterDefaultValueDataOffset"))
+	sectionSize := int64(e.Metadata.Header.i32("fieldAndParameterDefaultValueDataSize"))
+	if sectionSize < 0 || sectionOff > uint64(len(e.Metadata.Data)) || uint64(sectionSize) > uint64(len(e.Metadata.Data))-sectionOff ||
+		uint64(dataIndex) >= uint64(sectionSize) {
+		e.fail("defaultValues", int64(dataIndex), "data index outside default-value section")
+		return nil, false
+	}
+	limit := int(sectionOff + uint64(sectionSize))
 	reader := &metadataReader{data: e.Metadata.Data, pos: int(pointer), limit: limit}
-	if v, ok := e.constantValueFromBlob(defaultValueType.TypeEnum, reader, false); ok {
+	if v, ok := e.constantValueFromBlob(defaultValueType.TypeEnum, reader, false); ok && reader.err == nil {
 		return v.value, true
+	}
+	if reader.err != nil && e.err == nil {
+		e.err = reader.err
 	}
 	return pointer, false
 }
@@ -570,39 +743,74 @@ func (e *Executor) constantValueFromBlob(typ uint8, reader *metadataReader, comp
 		return v, true
 	case typeChar:
 		b := reader.readBytes(2)
+		if reader.err != nil {
+			return blobValue{}, false
+		}
 		v.value = charValue(leU16(b, 0))
 		return v, true
 	case typeU2:
-		v.value = leU16(reader.readBytes(2), 0)
+		b := reader.readBytes(2)
+		if reader.err != nil {
+			return blobValue{}, false
+		}
+		v.value = leU16(b, 0)
 		return v, true
 	case typeI2:
-		v.value = int16(leU16(reader.readBytes(2), 0))
+		b := reader.readBytes(2)
+		if reader.err != nil {
+			return blobValue{}, false
+		}
+		v.value = int16(leU16(b, 0))
 		return v, true
 	case typeU4:
 		if compressed {
 			v.value = reader.compressedUInt32()
 		} else {
-			v.value = leU32(reader.readBytes(4), 0)
+			b := reader.readBytes(4)
+			if reader.err != nil {
+				return blobValue{}, false
+			}
+			v.value = leU32(b, 0)
 		}
 		return v, true
 	case typeI4:
 		if compressed {
 			v.value = reader.compressedInt32()
 		} else {
-			v.value = leI32(reader.readBytes(4), 0)
+			b := reader.readBytes(4)
+			if reader.err != nil {
+				return blobValue{}, false
+			}
+			v.value = leI32(b, 0)
 		}
 		return v, true
 	case typeU8:
-		v.value = leU64(reader.readBytes(8), 0)
+		b := reader.readBytes(8)
+		if reader.err != nil {
+			return blobValue{}, false
+		}
+		v.value = leU64(b, 0)
 		return v, true
 	case typeI8:
-		v.value = leI64(reader.readBytes(8), 0)
+		b := reader.readBytes(8)
+		if reader.err != nil {
+			return blobValue{}, false
+		}
+		v.value = leI64(b, 0)
 		return v, true
 	case typeR4:
-		v.value = float32frombits(leU32(reader.readBytes(4), 0))
+		b := reader.readBytes(4)
+		if reader.err != nil {
+			return blobValue{}, false
+		}
+		v.value = float32frombits(leU32(b, 0))
 		return v, true
 	case typeR8:
-		v.value = float64frombits(leU64(reader.readBytes(8), 0))
+		b := reader.readBytes(8)
+		if reader.err != nil {
+			return blobValue{}, false
+		}
+		v.value = float64frombits(leU64(b, 0))
 		return v, true
 	case typeString:
 		if compressed {
@@ -613,7 +821,11 @@ func (e *Executor) constantValueFromBlob(typ uint8, reader *metadataReader, comp
 				v.value = string(reader.readBytes(int(length)))
 			}
 		} else {
-			length := leI32(reader.readBytes(4), 0)
+			b := reader.readBytes(4)
+			if reader.err != nil {
+				return blobValue{}, false
+			}
+			length := leI32(b, 0)
 			if length < 0 {
 				v.value = nil
 			} else {
@@ -626,6 +838,10 @@ func (e *Executor) constantValueFromBlob(typ uint8, reader *metadataReader, comp
 		if arrayLen == -1 {
 			v.value = nil
 			return v, true
+		}
+		if arrayLen < 0 || reader.pos < 0 || reader.pos > reader.end() || int64(arrayLen) > int64(reader.end()-reader.pos) {
+			e.fail("customAttributes", int64(reader.pos), "array length out of bounds")
+			return blobValue{}, false
 		}
 		elementType, _ := e.readEncodedTypeEnum(reader)
 		different := reader.readByte()
@@ -657,11 +873,24 @@ func (e *Executor) constantValueFromBlob(typ uint8, reader *metadataReader, comp
 func (e *Executor) readEncodedTypeEnum(reader *metadataReader) (uint8, *Il2CppType) {
 	var enumType *Il2CppType
 	typ := reader.readByte()
+	if reader.err != nil {
+		return 0, nil
+	}
 	if typ == typeEnum {
 		enumTypeIndex := reader.compressedInt32()
 		enumType = e.typeAt(int(enumTypeIndex))
+		if enumType == nil {
+			return 0, nil
+		}
 		typeDef := e.GetTypeDefinitionFromIl2CppType(enumType)
-		typ = e.typeAt(int(typeDef.i32("elementTypeIndex"))).TypeEnum
+		if e.err != nil {
+			return 0, nil
+		}
+		underlying := e.typeAt(int(typeDef.i32("elementTypeIndex")))
+		if underlying == nil {
+			return 0, nil
+		}
+		typ = underlying.TypeEnum
 	}
 	return typ, enumType
 }

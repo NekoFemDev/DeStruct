@@ -66,9 +66,19 @@ func (e *Executor) DumpCS(opts DumpOptions) error {
 		img := m.Image(imageIndex)
 		imageName := m.ImageName(imageIndex)
 		typeStart := int(img.i32("typeStart"))
-		typeEnd := typeStart + int(img.u32("typeCount"))
+		count := uint64(img.u32("typeCount"))
+		if typeStart < 0 || typeStart > len(m.typeDefs) || count > uint64(len(m.typeDefs)-typeStart) {
+			e.fail("images", int64(imageIndex), "type definition range out of bounds")
+			f.Close()
+			return e.Err()
+		}
+		typeEnd := typeStart + int(count)
 		for typeDefIndex := typeStart; typeDefIndex < typeEnd; typeDefIndex++ {
 			e.dumpType(w, imageIndex, imageName, typeDefIndex, opts)
+			if err := e.Err(); err != nil {
+				f.Close()
+				return err
+			}
 		}
 	}
 	w.WriteString("\n")
@@ -83,13 +93,12 @@ func (e *Executor) DumpCS(opts DumpOptions) error {
 	return nil
 }
 
-// dumpType writes one type definition, recovering from decoder errors the
-// same way Il2CppDumper catches per-image exceptions (here scoped to the
-// single type so one bad record doesn't drop the rest of the image).
+// dumpType writes one type definition. Any unexpected decoder panic is
+// returned as a table-indexed error instead of leaking to the CLI.
 func (e *Executor) dumpType(w *bufio.Writer, imageIndex int, imageName string, typeDefIndex int, opts DumpOptions) {
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(w, "/*il2cpp: %v*/\n}\n", r)
+			e.fail("typeDefs", int64(typeDefIndex), fmt.Sprintf("decoder error: %v", r))
 		}
 	}()
 
