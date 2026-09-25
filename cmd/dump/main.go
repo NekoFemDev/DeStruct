@@ -1,18 +1,30 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+
 	"github.com/destruct/destruct/internal/jvm"
 )
 
 func main() {
-	cf, err := jvm.ParseClassFile(os.Args[1])
-	if err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	methodName := os.Args[2]
+}
+
+func run(args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: dump <class-file> <method>")
+	}
+
+	cf, err := jvm.ParseClassFile(args[0])
+	if err != nil {
+		return err
+	}
+	methodName := args[1]
 	for i, m := range cf.Methods {
 		name := cf.GetUTF8(m.NameIndex)
 		if name == methodName {
@@ -54,4 +66,5 @@ func main() {
 			}
 		}
 	}
+	return nil
 }

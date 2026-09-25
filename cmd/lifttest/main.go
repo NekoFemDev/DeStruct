@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -9,9 +10,19 @@ import (
 )
 
 func main() {
-	elfPath := os.Args[1]
-	symName := os.Args[2]
-	params := os.Args[3:]
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: lifttest <elf> <symbol> [params...]")
+	}
+	elfPath := args[0]
+	symName := args[1]
+	params := args[2:]
 
 	p, err := native.NewELFParser(elfPath)
 	if err != nil {
@@ -26,8 +37,7 @@ func main() {
 		}
 	}
 	if target == nil {
-		fmt.Fprintf(os.Stderr, "symbol not found: %s\n", symName)
-		os.Exit(1)
+		return fmt.Errorf("symbol not found: %s", symName)
 	}
 
 	var sec *native.SectionHeader
@@ -39,8 +49,7 @@ func main() {
 		}
 	}
 	if sec == nil {
-		fmt.Fprintf(os.Stderr, "no section contains address 0x%x\n", target.Value)
-		os.Exit(1)
+		return fmt.Errorf("no section contains address 0x%x", target.Value)
 	}
 	fileOff := sec.Offset + (target.Value - sec.Addr)
 	code := p.Data[fileOff : fileOff+target.Size]
@@ -64,4 +73,5 @@ func main() {
 	stmts := arm64lift.LiftFunctionWithData(insns, params, resolver, strResolver, p.DataReader(), true)
 	fmt.Printf("// %s\n", symName)
 	arm64lift.RenderStmts(os.Stdout, stmts, 1)
+	return nil
 }

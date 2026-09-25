@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,41 +16,56 @@ import (
 const version = "0.1.0"
 
 func main() {
-	if len(os.Args) < 2 {
-		printUsage()
+	if err := run(os.Args[1:]); err != nil {
+		if !errors.Is(err, errUsage) {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
 		os.Exit(1)
 	}
+}
 
-	cmd := os.Args[1]
-	switch cmd {
+// errUsage marks a usage error whose message has already been printed by
+// printUsage; main exits non-zero without printing it again.
+var errUsage = errors.New("invalid usage")
+
+// run dispatches a single CLI invocation. Command handlers return errors
+// instead of terminating the process, which keeps them testable.
+func run(args []string) error {
+	if len(args) < 1 {
+		printUsage()
+		return errUsage
+	}
+
+	switch cmd := args[0]; cmd {
 	case "jvm":
-		handleJVM(os.Args[2:])
+		return handleJVM(args[1:])
 	case "dex":
-		handleDex(os.Args[2:])
+		return handleDex(args[1:])
 	case "hermes":
-		handleHermes(os.Args[2:])
+		return handleHermes(args[1:])
 	case "assemble":
-		handleAssemble(os.Args[2:])
+		return handleAssemble(args[1:])
 	case "patch":
-		handlePatch(os.Args[2:])
+		return handlePatch(args[1:])
 	case "interactive", "repl":
-		handleInteractive(os.Args[2:])
+		return handleInteractive(args[1:])
 	case "flutter":
-		handleFlutter(os.Args[2:])
+		return handleFlutter(args[1:])
 	case "elf":
-		handleELF(os.Args[2:])
+		return handleELF(args[1:])
 	case "il2cpp":
-		handleIL2CPP(os.Args[2:])
+		return handleIL2CPP(args[1:])
 	case "pe":
-		handlePE(os.Args[2:])
+		return handlePE(args[1:])
 	case "version":
 		fmt.Printf("DeStruct v%s\n", version)
+		return nil
 	case "help", "--help", "-h":
 		printUsage()
+		return nil
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
 		printUsage()
-		os.Exit(1)
+		return fmt.Errorf("unknown command: %s", cmd)
 	}
 }
 
@@ -136,21 +152,18 @@ Examples:
   destruct elf libnative.so -o output/`)
 }
 
-func handleJVM(args []string) {
+func handleJVM(args []string) error {
 	opts, input := parseFlags(args)
 	if opts.printOptions {
-		printOptionsJSON("jvm", opts)
-		return
+		return printOptionsJSON("jvm", opts)
 	}
 	if input == "" {
-		fmt.Fprintln(os.Stderr, "Error: input file required")
-		os.Exit(1)
+		return errors.New("input file required")
 	}
 
 	ext := strings.ToLower(filepath.Ext(input))
 	if ext != ".class" && ext != ".jar" {
-		fmt.Fprintf(os.Stderr, "Error: unsupported JVM file format: %s (expected .class or .jar)\n", ext)
-		os.Exit(1)
+		return fmt.Errorf("unsupported JVM file format: %s (expected .class or .jar)", ext)
 	}
 
 	p := pipeline.New(pipeline.Options{
@@ -163,28 +176,25 @@ func handleJVM(args []string) {
 	})
 
 	if err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
+	return nil
 }
 
-func handleDex(args []string) {
+func handleDex(args []string) error {
 	opts, input := parseFlags(args)
 	if opts.printOptions {
-		printOptionsJSON("dex", opts)
-		return
+		return printOptionsJSON("dex", opts)
 	}
 	if input == "" {
-		fmt.Fprintln(os.Stderr, "Error: input file required")
-		os.Exit(1)
+		return errors.New("input file required")
 	}
 
 	ext := strings.ToLower(filepath.Ext(input))
 	if ext != ".dex" && ext != ".apk" {
-		fmt.Fprintf(os.Stderr, "Error: unsupported DEX file format: %s (expected .dex or .apk)\n", ext)
-		os.Exit(1)
+		return fmt.Errorf("unsupported DEX file format: %s (expected .dex or .apk)", ext)
 	}
 
 	p := pipeline.New(pipeline.Options{
@@ -197,29 +207,26 @@ func handleDex(args []string) {
 	})
 
 	if err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
+	return nil
 }
 
-func handleHermes(args []string) {
+func handleHermes(args []string) error {
 	opts, input := parseFlags(args)
 	if input == "" {
-		fmt.Fprintln(os.Stderr, "Error: input .hbc file required")
-		os.Exit(1)
+		return errors.New("input .hbc file required")
 	}
 
 	if err := os.MkdirAll(opts.output, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	file, err := hermes.ParseFile(input)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing HBC: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("parsing HBC: %w", err)
 	}
 
 	fmt.Printf("Parsed Hermes bytecode v%d (%d functions, %d strings)\n",
@@ -231,8 +238,7 @@ func handleHermes(args []string) {
 		dasmPath := filepath.Join(opts.output, filepath.Base(input)+".js")
 		f, err := os.Create(dasmPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		defer f.Close()
 		d.DecompileAll(f)
@@ -243,8 +249,7 @@ func handleHermes(args []string) {
 		hasmPath := filepath.Join(opts.output, filepath.Base(input)+".hasm")
 		f, err := os.Create(hasmPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		defer f.Close()
 
@@ -284,13 +289,13 @@ func handleHermes(args []string) {
 		fmt.Printf("  ... and %d more functions (use -v for all)\n",
 			len(file.FunctionHeaders)-10)
 	}
+	return nil
 }
 
-func handleAssemble(args []string) {
+func handleAssemble(args []string) error {
 	opts, input := parseFlags(args)
 	if input == "" {
-		fmt.Fprintln(os.Stderr, "Error: input .hasm file required")
-		os.Exit(1)
+		return errors.New("input .hasm file required")
 	}
 
 	if opts.output == "output" {
@@ -305,19 +310,16 @@ func handleAssemble(args []string) {
 		// current disassembly to find and reassemble only the functions
 		// that actually changed.
 		if opts.inputFile == "" {
-			fmt.Fprintln(os.Stderr, "Error: --hermes-dec assembly requires the original .hbc/.bundle via -i/--input (the .hasm text references that file's string/function tables and cannot be assembled standalone)")
-			os.Exit(1)
+			return errors.New("--hermes-dec assembly requires the original .hbc/.bundle via -i/--input (the .hasm text references that file's string/function tables and cannot be assembled standalone)")
 		}
 		f, err := hermes.ParseFile(opts.inputFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing %s: %v\n", opts.inputFile, err)
-			os.Exit(1)
+			return fmt.Errorf("parsing %s: %w", opts.inputFile, err)
 		}
 		asm := hermes.NewHermesDecAssembler(f)
 		result, err := asm.AssembleAndPatch(input)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error assembling: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("assembling: %w", err)
 		}
 		if len(result.ChangedFunctions) == 0 {
 			fmt.Println("No changes detected; output is identical to the input .hbc")
@@ -326,19 +328,17 @@ func handleAssemble(args []string) {
 				len(result.ChangedFunctions), result.ChangedFunctions, result.SizeDelta)
 		}
 		if err := f.Write(opts.output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing output: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("writing output: %w", err)
 		}
 		fmt.Printf("Wrote %s\n", opts.output)
-		return
+		return nil
 	}
 
 	// Use smart assembler with address recalculation
 	sa := hermes.NewSmartAssembler()
 	instrs, err := sa.ParseSimple(input)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing HASM: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("parsing HASM: %w", err)
 	}
 
 	fmt.Printf("Parsed %d instructions from %s\n", len(instrs), input)
@@ -347,24 +347,22 @@ func handleAssemble(args []string) {
 	if opts.inputFile != "" {
 		// Full patching mode
 		if err := sa.PatchFile(opts.inputFile, input, opts.output); err != nil {
-			fmt.Fprintf(os.Stderr, "Error patching: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("patching: %w", err)
 		}
 		fmt.Printf("Patched %s -> %s\n", opts.inputFile, opts.output)
 	} else {
 		// Standalone assembly mode
 		bytecode, err := sa.AssembleWithRecalc(instrs)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error assembling: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("assembling: %w", err)
 		}
 
 		if err := os.WriteFile(opts.output, bytecode, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing output: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("writing output: %w", err)
 		}
 		fmt.Printf("Assembled %d bytes -> %s\n", len(bytecode), opts.output)
 	}
+	return nil
 }
 
 func min(a, b int) int {
@@ -378,31 +376,28 @@ func min(a, b int) int {
 // interactive patching session (see internal/hermes/repl.go): seek,
 // hexdump, disassemble, and write commands operating on an in-memory
 // buffer with explicit save via 'w'/'wq'.
-func handleInteractive(args []string) {
+func handleInteractive(args []string) error {
 	_, input := parseFlags(args)
 	if input == "" {
-		fmt.Fprintln(os.Stderr, "Error: input .hbc/.bundle file required")
-		os.Exit(1)
+		return errors.New("input .hbc/.bundle file required")
 	}
 
 	file, err := hermes.ParseFile(input)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing %s: %v\n", input, err)
-		os.Exit(1)
+		return fmt.Errorf("parsing %s: %w", input, err)
 	}
 
 	r := hermes.NewRepl(file, input, os.Stdout)
 	if err := r.Run(os.Stdin); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
+	return nil
 }
 
-func handlePatch(args []string) {
+func handlePatch(args []string) error {
 	opts, input := parseFlags(args)
 	if input == "" {
-		fmt.Fprintln(os.Stderr, "Error: input .hbc file required")
-		os.Exit(1)
+		return errors.New("input .hbc file required")
 	}
 
 	if opts.output == "output" {
@@ -412,8 +407,7 @@ func handlePatch(args []string) {
 	// Parse the HBC file
 	file, err := hermes.ParseFile(input)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing HBC: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("parsing HBC: %w", err)
 	}
 
 	fmt.Printf("Parsed Hermes bytecode v%d (%d functions, %d strings)\n",
@@ -434,7 +428,7 @@ func handlePatch(args []string) {
 				fmt.Printf("  Function #%d (%s) @ 0x%x\n", r.FuncIdx, r.FuncName, r.Offset)
 			}
 		}
-		return
+		return nil
 	}
 
 	// Quick patch mode: patch string to true/false/nop
@@ -443,8 +437,7 @@ func handlePatch(args []string) {
 		fmt.Printf("Quick patching %q to %s (checkOnly=%v)\n", opts.patchString, patchType, opts.checkOnly)
 		patched, err := ps.QuickPatchString(opts.patchString, patchType, opts.checkOnly)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		fmt.Printf("Patched %d occurrences\n", patched)
 
@@ -454,11 +447,10 @@ func handlePatch(args []string) {
 			outPath = strings.TrimSuffix(input, filepath.Ext(input)) + ".patched" + filepath.Ext(input)
 		}
 		if err := ps.Save(outPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("saving: %w", err)
 		}
 		fmt.Printf("Saved to: %s\n", outPath)
-		return
+		return nil
 	}
 
 	// List mode (verbose)
@@ -474,7 +466,7 @@ func handlePatch(args []string) {
 				fmt.Printf("  %08x  %-28s %s\n", pi.Offset, pi.Inst.Name, pi.Format(file))
 			}
 		}
-		return
+		return nil
 	}
 
 	// Patch mode: apply HASM file
@@ -483,8 +475,7 @@ func handlePatch(args []string) {
 		a := hermes.NewAssembler()
 		instrs, err := a.ParseHASM(opts.inputFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing HASM: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("parsing HASM: %w", err)
 		}
 
 		// Group instructions by function
@@ -525,33 +516,29 @@ func handlePatch(args []string) {
 
 	// Save patched file
 	if err := ps.Save(opts.output); err != nil {
-		fmt.Fprintf(os.Stderr, "Error saving patched file: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("saving patched file: %w", err)
 	}
 
 	fmt.Printf("Patched file saved: %s\n", opts.output)
+	return nil
 }
 
-func handleFlutter(args []string) {
+func handleFlutter(args []string) error {
 	opts, input := parseFlags(args)
 	if opts.printOptions {
-		printOptionsJSON("flutter", opts)
-		return
+		return printOptionsJSON("flutter", opts)
 	}
 	if input == "" {
-		fmt.Fprintln(os.Stderr, "Error: input file required")
-		os.Exit(1)
+		return errors.New("input file required")
 	}
 
 	ext := strings.ToLower(filepath.Ext(input))
 	if ext != ".so" && ext != ".apk" {
-		fmt.Fprintf(os.Stderr, "Error: unsupported Flutter file format: %s (expected .so or .apk)\n", ext)
-		os.Exit(1)
+		return fmt.Errorf("unsupported Flutter file format: %s (expected .so or .apk)", ext)
 	}
 
 	if _, err := os.Stat(input); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: cannot read %s: %v\n", input, err)
-		os.Exit(1)
+		return fmt.Errorf("cannot read %s: %w", input, err)
 	}
 
 	p := pipeline.New(pipeline.Options{
@@ -564,18 +551,17 @@ func handleFlutter(args []string) {
 	})
 
 	if err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
+	return nil
 }
 
-func handleELF(args []string) {
+func handleELF(args []string) error {
 	opts, input := parseFlags(args)
 	if input == "" {
-		fmt.Fprintln(os.Stderr, "Error: input file required")
-		os.Exit(1)
+		return errors.New("input file required")
 	}
 
 	// --cross-references implies --decompile for ELF, since it needs the
@@ -596,8 +582,7 @@ func handleELF(args []string) {
 	sourceLocations := opts.decompile && !opts.noLocationComments
 
 	if opts.printOptions {
-		printOptionsJSON("elf", opts)
-		return
+		return printOptionsJSON("elf", opts)
 	}
 
 	p := pipeline.New(pipeline.Options{
@@ -617,11 +602,11 @@ func handleELF(args []string) {
 	})
 
 	if err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
+	return nil
 }
 
 // handleIL2CPP implements `destruct il2cpp`, which dumps both a Unity
@@ -630,7 +615,7 @@ func handleELF(args []string) {
 // Usage: destruct il2cpp <libil2cpp.so> <global-metadata.dat> [-o output/]
 // The two positional arguments may be given in either order; they are
 // detected from their magic numbers.
-func handleIL2CPP(args []string) {
+func handleIL2CPP(args []string) error {
 	output := "output"
 	verbose := false
 	printOptions := false
@@ -662,17 +647,14 @@ func handleIL2CPP(args []string) {
 		}
 		data, err := json.MarshalIndent(cfg, "", "  ")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		fmt.Println(string(data))
-		return
+		return nil
 	}
 
 	if len(positionals) < 2 {
-		fmt.Fprintln(os.Stderr, "Error: both libil2cpp.so and global-metadata.dat are required")
-		fmt.Fprintln(os.Stderr, "Usage: destruct il2cpp <libil2cpp.so> <global-metadata.dat> [-o output/]")
-		os.Exit(1)
+		return errors.New("both libil2cpp.so and global-metadata.dat are required\nUsage: destruct il2cpp <libil2cpp.so> <global-metadata.dat> [-o output/]")
 	}
 	lib, meta := positionals[0], positionals[1]
 	if looksLikeMetadata(lib) && looksLikeELF(meta) {
@@ -686,14 +668,14 @@ func handleIL2CPP(args []string) {
 		Verbose:      verbose,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	fmt.Printf("IL2CPP dump complete. Metadata v%.1f, IL2CPP %.1f\n", result.MetadataVersion, result.IL2CPPVersion)
 	fmt.Printf("Images: %d, TypeDefs: %d, Methods: %d\n", result.ImageCount, result.TypeDefCount, result.MethodCount)
 	fmt.Printf("CodeRegistration: 0x%X, MetadataRegistration: 0x%X\n", result.CodeRegistration, result.MetadataRegistration)
 	fmt.Printf("Output: %s/dump.cs\n", output)
+	return nil
 }
 
 func looksLikeMetadata(path string) bool {
@@ -722,15 +704,13 @@ func looksLikeELF(path string) bool {
 	return string(magic[:]) == "\x7fELF"
 }
 
-func handlePE(args []string) {
+func handlePE(args []string) error {
 	opts, input := parseFlags(args)
 	if opts.printOptions {
-		printOptionsJSON("pe", opts)
-		return
+		return printOptionsJSON("pe", opts)
 	}
 	if input == "" {
-		fmt.Fprintln(os.Stderr, "Error: input file required")
-		os.Exit(1)
+		return errors.New("input file required")
 	}
 
 	p := pipeline.New(pipeline.Options{
@@ -743,11 +723,11 @@ func handlePE(args []string) {
 	})
 
 	if err := p.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
+	return nil
 }
 
 func cliOptionsMap(opts cliOpts) map[string]interface{} {
@@ -775,15 +755,15 @@ func cliOptionsMap(opts cliOpts) map[string]interface{} {
 	}
 }
 
-func printOptionsJSON(command string, opts cliOpts) {
+func printOptionsJSON(command string, opts cliOpts) error {
 	cfg := cliOptionsMap(opts)
 	cfg["command"] = command
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 	fmt.Println(string(data))
+	return nil
 }
 
 type cliOpts struct {
