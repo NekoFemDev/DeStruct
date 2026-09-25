@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/destruct/destruct/internal/native"
@@ -95,5 +96,41 @@ func TestExtractLibappArchiveLimit(t *testing.T) {
 	p := New(Options{Input: path})
 	if _, err := p.extractLibapp(path); err == nil {
 		t.Fatal("extract accepted oversized entry")
+	}
+}
+
+func TestWriteFunctionLocation(t *testing.T) {
+	var out bytes.Buffer
+	writeFunctionLocation(&out, funcCandidate{addr: 0x7f123400}, []native.DetailedInstruction{
+		{Address: 0x7f123404},
+	})
+	if got, want := out.String(), "// ELF function entry VA: 0x7f123400\n// First decoded instruction VA: 0x7f123404\n"; got != want {
+		t.Fatalf("location comments = %q, want %q", got, want)
+	}
+	out.Reset()
+	writeFunctionLocation(&out, funcCandidate{addr: 0}, nil)
+	if got := out.String(); got != "// ELF function entry VA: 0x0\n" {
+		t.Fatalf("zero-address function location = %q", got)
+	}
+}
+
+func TestEnhancementPreservesRenderedLines(t *testing.T) {
+	dir := t.TempDir()
+	input := "sample.so"
+	original := "// name\nif (x) {\n    return 1;\n}\n"
+	path := filepath.Join(dir, input+".decompiled.c")
+	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(Options{Input: input, Output: dir, SourceLocations: true})
+	if err := p.ApplyARM64DecompilationEnhancements(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path + ".enhanced")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original || strings.Contains(string(got), "0x400000") {
+		t.Fatalf("enhancement invented locations or changed rendered output: %q", got)
 	}
 }

@@ -631,6 +631,9 @@ func (p *Pipeline) decompileELFArm64() error {
 					}()
 				}
 				fmt.Fprintf(f, "// %s\n", arm64lift.Demangle(c.name))
+				if p.opts.SourceLocations {
+					writeFunctionLocation(f, c, insns)
+				}
 				writeXrefComments(f, xrefs[c.addr])
 				arm64lift.RenderStmts(f, stmts, 0)
 				fmt.Fprintln(f)
@@ -687,6 +690,16 @@ type funcCandidate struct {
 	addr uint64
 	size uint64
 	name string
+}
+
+// writeFunctionLocation reports only known ELF virtual addresses. Lifted
+// statements can combine or reorder instructions, so a rendered C line has
+// no reliable instruction address to attach to it.
+func writeFunctionLocation(w io.Writer, c funcCandidate, insns []native.DetailedInstruction) {
+	fmt.Fprintf(w, "// ELF function entry VA: 0x%x\n", c.addr)
+	if len(insns) > 0 && insns[0].Address != c.addr {
+		fmt.Fprintf(w, "// First decoded instruction VA: 0x%x\n", insns[0].Address)
+	}
 }
 
 // functionMeta describes one decompiled function for functions.json.
@@ -772,6 +785,9 @@ func (p *Pipeline) writeSplitFunction(
 			}()
 		}
 		fmt.Fprintf(outF, "// %s\n", arm64lift.Demangle(c.name))
+		if p.opts.SourceLocations {
+			writeFunctionLocation(outF, c, insns)
+		}
 		writeXrefComments(outF, fx)
 		arm64lift.RenderStmts(outF, stmts, 0)
 		fmt.Fprintln(outF)
