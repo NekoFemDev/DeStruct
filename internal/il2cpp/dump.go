@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/destruct/destruct/internal/atomicfile"
 )
 
 // DumpOptions controls dump.cs generation.
@@ -51,10 +53,11 @@ func (e *Executor) DumpCS(opts DumpOptions) error {
 		return fmt.Errorf("creating output dir: %w", err)
 	}
 	path := filepath.Join(opts.OutputDir, "dump.cs")
-	f, err := os.Create(path)
+	f, err := atomicfile.Create(path, 0o644)
 	if err != nil {
 		return fmt.Errorf("creating dump.cs: %w", err)
 	}
+	defer f.Abort()
 	w := bufio.NewWriterSize(f, 1<<20)
 
 	for i := 0; i < m.ImageCount(); i++ {
@@ -69,14 +72,12 @@ func (e *Executor) DumpCS(opts DumpOptions) error {
 		count := uint64(img.u32("typeCount"))
 		if typeStart < 0 || typeStart > len(m.typeDefs) || count > uint64(len(m.typeDefs)-typeStart) {
 			e.fail("images", int64(imageIndex), "type definition range out of bounds")
-			f.Close()
 			return e.Err()
 		}
 		typeEnd := typeStart + int(count)
 		for typeDefIndex := typeStart; typeDefIndex < typeEnd; typeDefIndex++ {
 			e.dumpType(w, imageIndex, imageName, typeDefIndex, opts)
 			if err := e.Err(); err != nil {
-				f.Close()
 				return err
 			}
 		}
@@ -84,13 +85,9 @@ func (e *Executor) DumpCS(opts DumpOptions) error {
 	w.WriteString("\n")
 
 	if err := w.Flush(); err != nil {
-		f.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return nil
+	return f.Commit()
 }
 
 // dumpType writes one type definition. Any unexpected decoder panic is

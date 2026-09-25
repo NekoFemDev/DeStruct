@@ -14,6 +14,7 @@ import (
 
 	"github.com/destruct/destruct/internal/archivelimits"
 	"github.com/destruct/destruct/internal/arm64lift"
+	"github.com/destruct/destruct/internal/atomicfile"
 	"github.com/destruct/destruct/internal/csharp"
 	"github.com/destruct/destruct/internal/dex"
 	unflutter "github.com/destruct/destruct/internal/flutter/unflutter-0.5.9/cmd/unflutter"
@@ -382,50 +383,57 @@ func combineAsmFiles(asmDir, outDir string) error {
 		return fmt.Errorf("no .txt files in %s", asmDir)
 	}
 
-	txtOut, err := os.Create(filepath.Join(outDir, "asm.txt"))
+	txtOut, err := atomicfile.Create(filepath.Join(outDir, "asm.txt"), 0o644)
 	if err != nil {
 		return err
 	}
-	defer txtOut.Close()
+	defer txtOut.Abort()
 
-	binOut, err := os.Create(filepath.Join(outDir, "asm.bin"))
+	binOut, err := atomicfile.Create(filepath.Join(outDir, "asm.bin"), 0o644)
 	if err != nil {
 		return err
 	}
-	defer binOut.Close()
+	defer binOut.Abort()
 
 	for _, f := range funcs {
 		fmt.Fprintf(txtOut, "\n; ===== %s =====\n", f.name)
 		txtOut.WriteString(f.txt)
 		binOut.Write(f.bin)
 	}
-	return nil
+	if err := txtOut.Commit(); err != nil {
+		return err
+	}
+	return binOut.Commit()
 }
 
 func (p *Pipeline) extractLibapp(apkPath string) (string, error) {
-	zr, err := zip.OpenReader(apkPath)
+	zr, err := archivelimits.Open(apkPath)
 	if err != nil {
 		return "", err
 	}
 	defer zr.Close()
 
+	var budget archivelimits.ReadBudget
 	for _, f := range zr.File {
 		if strings.HasPrefix(f.Name, "lib/arm64-v8a/") && strings.HasSuffix(f.Name, "libapp.so") {
-			rc, err := f.Open()
+			data, err := budget.ReadEntry(f)
 			if err != nil {
 				return "", err
 			}
-			defer rc.Close()
 
 			tmp, err := os.CreateTemp("", "libapp-*.so")
 			if err != nil {
 				return "", err
 			}
-			if _, err := io.Copy(tmp, rc); err != nil {
+			if _, err := tmp.Write(data); err != nil {
 				tmp.Close()
+				os.Remove(tmp.Name())
 				return "", err
 			}
-			tmp.Close()
+			if err := tmp.Close(); err != nil {
+				os.Remove(tmp.Name())
+				return "", err
+			}
 			return tmp.Name(), nil
 		}
 	}
@@ -514,23 +522,23 @@ func (p *Pipeline) decompileELFArm64() error {
 	// output (combined regardless of split mode, since lifted functions
 	// call each other by name and belong in one module).
 	var llMod *llvm.Module
+	var llFile *atomicfile.File
 	if p.opts.EmitLLVM {
 		llPath := filepath.Join(p.opts.Output, baseName+".decompiled.ll")
-		llFile, err := os.Create(llPath)
+		llFile, err = atomicfile.Create(llPath, 0o644)
 		if err != nil {
 			return fmt.Errorf("create LLVM output file: %w", err)
 		}
-		defer llFile.Close()
+		defer llFile.Abort()
 		llMod = llvm.NewModule(llFile)
 		llMod.EmitHeader(baseName, p.opts.Input)
-		defer llMod.Finish()
 	}
 
 	// Split-function mode writes every function to its own file inside
 	// <basename>_decompiled/ plus a functions.json index. The classic mode
 	// keeps the whole binary in a single .decompiled.c file.
 	var splitDir string
-	var f *os.File
+	var f *atomicfile.File
 	var metas []functionMeta
 	if p.opts.SplitFunctions {
 		splitDir = filepath.Join(p.opts.Output, baseName+"_decompiled")
@@ -539,11 +547,11 @@ func (p *Pipeline) decompileELFArm64() error {
 		}
 	} else {
 		outPath := filepath.Join(p.opts.Output, baseName+".decompiled.c")
-		f, err = os.Create(outPath)
+		f, err = atomicfile.Create(outPath, 0o644)
 		if err != nil {
 			return fmt.Errorf("create output file: %w", err)
 		}
-		defer f.Close()
+		defer f.Abort()
 	}
 
 	candidates := functionCandidatesFromSymbols(elf)
@@ -653,7 +661,7 @@ func (p *Pipeline) decompileELFArm64() error {
 		data, err := json.MarshalIndent(metas, "", "  ")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to write functions.json: %v\n", err)
-		} else if err := os.WriteFile(jsonPath, data, 0644); err != nil {
+		} else if err := atomicfile.WriteFile(jsonPath, data, 0o644); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to write functions.json: %v\n", err)
 		}
 		if p.opts.CrossReferences {
@@ -676,6 +684,19 @@ func (p *Pipeline) decompileELFArm64() error {
 		fmt.Printf("Decompiled %d functions (%d empty, %d failed) to %s\n", ok, empty, failed, filepath.Join(p.opts.Output, baseName+".decompiled.c"))
 		if p.opts.EmitLLVM {
 			fmt.Printf("LLVM IR: %s\n", filepath.Join(p.opts.Output, baseName+".decompiled.ll"))
+		}
+	}
+	if f != nil {
+		if err := f.Commit(); err != nil {
+			return fmt.Errorf("write decompiled output: %w", err)
+		}
+	}
+	if llMod != nil {
+		if err := llMod.Finish(); err != nil {
+			return fmt.Errorf("finish LLVM output: %w", err)
+		}
+		if err := llFile.Commit(); err != nil {
+			return fmt.Errorf("write LLVM output: %w", err)
 		}
 	}
 	return nil
@@ -756,12 +777,12 @@ func (p *Pipeline) writeSplitFunction(
 	llMod *llvm.Module,
 ) splitFuncResult {
 	filePath := filepath.Join(splitDir, functionFileName(c))
-	outF, err := os.Create(filePath)
+	outF, err := atomicfile.Create(filePath, 0o644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: cannot create %s: %v\n", filePath, err)
 		return splitFuncResult{Success: false}
 	}
-	defer outF.Close()
+	defer outF.Abort()
 
 	var result splitFuncResult
 	func() {
@@ -792,6 +813,11 @@ func (p *Pipeline) writeSplitFunction(
 		arm64lift.RenderStmts(outF, stmts, 0)
 		fmt.Fprintln(outF)
 	}()
+
+	if err := outF.Commit(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot write %s: %v\n", filePath, err)
+		return splitFuncResult{Success: false}
+	}
 
 	return result
 }

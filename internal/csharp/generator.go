@@ -7,6 +7,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/destruct/destruct/internal/atomicfile"
 	"github.com/destruct/destruct/internal/ir"
 )
 
@@ -108,7 +109,7 @@ func (g *Generator) generateClass(class *ir.Class) error {
 			}
 			return strings.Join(mods, " ")
 		},
-		"formatType": formatType,
+		"formatType":   formatType,
 		"formatParams": formatParams,
 		"join": func(elems []string) string {
 			return strings.Join(elems, ", ")
@@ -131,11 +132,11 @@ func (g *Generator) generateClass(class *ir.Class) error {
 		return err
 	}
 
-	f, err := os.Create(filename)
+	f, err := atomicfile.Create(filename, 0o644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer f.Abort()
 
 	data := struct {
 		Package string
@@ -145,7 +146,10 @@ func (g *Generator) generateClass(class *ir.Class) error {
 		Class:   class,
 	}
 
-	return tmpl.Execute(f, data)
+	if err := tmpl.Execute(f, data); err != nil {
+		return err
+	}
+	return f.Commit()
 }
 
 func (g *Generator) generateProject(prog *ir.Program) error {
@@ -155,13 +159,16 @@ func (g *Generator) generateProject(prog *ir.Program) error {
 	}
 
 	filename := filepath.Join(g.opts.OutputDir, "DecompiledProject.csproj")
-	f, err := os.Create(filename)
+	f, err := atomicfile.Create(filename, 0o644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer f.Abort()
 
-	return tmpl.Execute(f, nil)
+	if err := tmpl.Execute(f, nil); err != nil {
+		return err
+	}
+	return f.Commit()
 }
 
 func formatType(t ir.Type) string {

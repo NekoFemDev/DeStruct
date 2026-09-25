@@ -9,6 +9,7 @@ import (
 	"text/template"
 	"unicode"
 
+	"github.com/destruct/destruct/internal/atomicfile"
 	"github.com/destruct/destruct/internal/ir"
 )
 
@@ -208,13 +209,16 @@ func (g *Generator) generateClass(class *ir.Class) error {
 		NestedClasses: g.innerClasses[class.Name],
 	}
 
-	f, err := os.Create(filename)
+	f, err := atomicfile.Create(filename, 0o644)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer f.Abort()
 
-	return tmpl.Execute(f, data)
+	if err := tmpl.Execute(f, data); err != nil {
+		return err
+	}
+	return f.Commit()
 }
 
 func accessStr(f ir.AccessFlags) string {
