@@ -1,9 +1,66 @@
 package native
 
 import (
+	"encoding/binary"
 	"os"
 	"testing"
 )
+
+func TestMalformedELFHeaderTables(t *testing.T) {
+	base := make([]byte, 64)
+	copy(base, ELF_MAGIC)
+	base[4], base[5] = ELFCLASS64, ELFDATA2LSB
+	binary.LittleEndian.PutUint16(base[18:], EM_AARCH64)
+	for _, tc := range []struct {
+		name string
+		edit func([]byte)
+	}{
+		{"class", func(b []byte) { b[4] = 99 }},
+		{"endianness", func(b []byte) { b[5] = 99 }},
+		{"section table overflow", func(b []byte) {
+			binary.LittleEndian.PutUint64(b[40:], ^uint64(0)-7)
+			binary.LittleEndian.PutUint16(b[58:], 64)
+			binary.LittleEndian.PutUint16(b[60:], 2)
+		}},
+		{"undersized section record", func(b []byte) {
+			binary.LittleEndian.PutUint64(b[40:], 64)
+			binary.LittleEndian.PutUint16(b[58:], 8)
+			binary.LittleEndian.PutUint16(b[60:], 1)
+		}},
+		{"program table overflow", func(b []byte) {
+			binary.LittleEndian.PutUint64(b[32:], ^uint64(0)-7)
+			binary.LittleEndian.PutUint16(b[54:], 56)
+			binary.LittleEndian.PutUint16(b[56:], 2)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := append([]byte(nil), base...)
+			tc.edit(b)
+			path := t.TempDir() + "/bad.elf"
+			if err := os.WriteFile(path, b, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewELFParser(path); err == nil {
+				t.Fatal("expected malformed ELF rejection")
+			}
+		})
+	}
+}
+
+func TestMalformedELFSectionAccess(t *testing.T) {
+	p := &ELFParser{Data: make([]byte, 64), Header: ELFHeader{Class: ELFCLASS64}}
+	p.Sections = []SectionHeader{{Type: SHT_PROGBITS, Flags: SHF_EXECINSTR, Offset: ^uint64(0) - 4, Size: 16}}
+	if got := p.GetCodeSections(); len(got) != 0 {
+		t.Fatalf("unexpected code sections: %v", got)
+	}
+	if got := p.parseRelaSection(SectionHeader{Offset: ^uint64(0) - 4, Size: 24}); len(got) != 0 {
+		t.Fatalf("unexpected relocations: %v", got)
+	}
+	p.Sections[0] = SectionHeader{Type: SHT_PROGBITS, Addr: ^uint64(0) - 3, Offset: 0, Size: 8}
+	if data, ok := p.DataReader()(^uint64(0)-2, -1); ok || data != nil {
+		t.Fatal("negative read length accepted")
+	}
+}
 
 func TestELFParse(t *testing.T) {
 	parser, err := NewELFParser("../../test/liblun.so")

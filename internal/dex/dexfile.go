@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 )
@@ -254,7 +255,7 @@ func (dex *DexFile) parseHeader() error {
 
 	// File size
 	h.FileSize = binary.LittleEndian.Uint32(dex.data[32:36])
-	if int(h.FileSize) > len(dex.data) {
+	if uint64(h.FileSize) > uint64(len(dex.data)) || h.FileSize < h.HeaderSize {
 		return fmt.Errorf("dex file size %d exceeds data size %d", h.FileSize, len(dex.data))
 	}
 
@@ -580,14 +581,11 @@ func (dex *DexFile) GetParameters(proto ProtoId) []uint32 {
 	}
 
 	off := proto.ParametersOff
-	if int(off)+4 > len(dex.data) {
+	if err := dex.checkRange(off, 1, 4, "parameters size"); err != nil {
 		return nil
 	}
 	size := binary.LittleEndian.Uint32(dex.data[off : off+4])
-	if size > 0xffff {
-		return nil
-	}
-	if int(off)+4+int(size)*2 > len(dex.data) {
+	if err := dex.checkRange64(uint64(off)+4, uint64(size), 2, "parameters"); err != nil {
 		return nil
 	}
 
@@ -606,11 +604,11 @@ func (dex *DexFile) GetInterfaces(cd ClassDef) []uint32 {
 		return nil
 	}
 	off := cd.InterfacesOff
-	if int(off)+4 > len(dex.data) {
+	if err := dex.checkRange(off, 1, 4, "interfaces size"); err != nil {
 		return nil
 	}
 	size := binary.LittleEndian.Uint32(dex.data[off : off+4])
-	if int(off)+4+int(size)*2 > len(dex.data) {
+	if err := dex.checkRange64(uint64(off)+4, uint64(size), 2, "interfaces"); err != nil {
 		return nil
 	}
 	out := make([]uint32, size)
@@ -637,22 +635,50 @@ func (dex *DexFile) GetClassData(cd ClassDef) *ClassData {
 }
 
 func (dex *DexFile) parseClassData(offset uint32) *ClassData {
+	if uint64(offset) >= uint64(len(dex.data)) {
+		return nil
+	}
 	cd := &ClassData{}
 	pos := offset
 
 	// Read sizes
-	cd.StaticFieldsSize, pos = dex.readULB128(pos)
-	cd.InstanceFieldsSize, pos = dex.readULB128(pos)
-	cd.DirectMethodsSize, pos = dex.readULB128(pos)
-	cd.VirtualMethodsSize, pos = dex.readULB128(pos)
+	var err error
+	if cd.StaticFieldsSize, pos, err = dex.readULEB128(pos); err != nil {
+		return nil
+	}
+	if cd.InstanceFieldsSize, pos, err = dex.readULEB128(pos); err != nil {
+		return nil
+	}
+	if cd.DirectMethodsSize, pos, err = dex.readULEB128(pos); err != nil {
+		return nil
+	}
+	if cd.VirtualMethodsSize, pos, err = dex.readULEB128(pos); err != nil {
+		return nil
+	}
+	remaining := uint64(len(dex.data)) - uint64(pos)
+	fieldCount := uint64(cd.StaticFieldsSize) + uint64(cd.InstanceFieldsSize)
+	methodCount := uint64(cd.DirectMethodsSize) + uint64(cd.VirtualMethodsSize)
+	if fieldCount*2+methodCount*3 > remaining ||
+		!dex.canAllocate(fieldCount, 8) || !dex.canAllocate(methodCount, 12) {
+		return nil
+	}
 
 	// Read static fields
 	cd.StaticFields = make([]Field, cd.StaticFieldsSize)
 	fieldIdx := uint32(0)
 	for i := uint32(0); i < cd.StaticFieldsSize; i++ {
-		fieldIdxDelta, p := dex.readULB128(pos)
+		if uint64(pos) >= uint64(len(dex.data)) {
+			return nil
+		}
+		fieldIdxDelta, p, err := dex.readULEB128(pos)
+		if err != nil {
+			return nil
+		}
 		fieldIdx += fieldIdxDelta
-		accessFlags, p2 := dex.readULB128(p)
+		accessFlags, p2, err := dex.readULEB128(p)
+		if err != nil {
+			return nil
+		}
 		cd.StaticFields[i] = Field{FieldIdx: fieldIdx, AccessFlags: accessFlags}
 		pos = p2
 	}
@@ -661,9 +687,18 @@ func (dex *DexFile) parseClassData(offset uint32) *ClassData {
 	cd.InstanceFields = make([]Field, cd.InstanceFieldsSize)
 	fieldIdx = 0
 	for i := uint32(0); i < cd.InstanceFieldsSize; i++ {
-		fieldIdxDelta, p := dex.readULB128(pos)
+		if uint64(pos) >= uint64(len(dex.data)) {
+			return nil
+		}
+		fieldIdxDelta, p, err := dex.readULEB128(pos)
+		if err != nil {
+			return nil
+		}
 		fieldIdx += fieldIdxDelta
-		accessFlags, p2 := dex.readULB128(p)
+		accessFlags, p2, err := dex.readULEB128(p)
+		if err != nil {
+			return nil
+		}
 		cd.InstanceFields[i] = Field{FieldIdx: fieldIdx, AccessFlags: accessFlags}
 		pos = p2
 	}
@@ -672,10 +707,22 @@ func (dex *DexFile) parseClassData(offset uint32) *ClassData {
 	cd.DirectMethods = make([]Method, cd.DirectMethodsSize)
 	methodIdx := uint32(0)
 	for i := uint32(0); i < cd.DirectMethodsSize; i++ {
-		methodIdxDelta, p := dex.readULB128(pos)
+		if uint64(pos) >= uint64(len(dex.data)) {
+			return nil
+		}
+		methodIdxDelta, p, err := dex.readULEB128(pos)
+		if err != nil {
+			return nil
+		}
 		methodIdx += methodIdxDelta
-		accessFlags, p2 := dex.readULB128(p)
-		codeOff, p3 := dex.readULB128(p2)
+		accessFlags, p2, err := dex.readULEB128(p)
+		if err != nil {
+			return nil
+		}
+		codeOff, p3, err := dex.readULEB128(p2)
+		if err != nil {
+			return nil
+		}
 		cd.DirectMethods[i] = Method{MethodIdx: methodIdx, AccessFlags: accessFlags, CodeOff: codeOff}
 		pos = p3
 	}
@@ -684,10 +731,22 @@ func (dex *DexFile) parseClassData(offset uint32) *ClassData {
 	cd.VirtualMethods = make([]Method, cd.VirtualMethodsSize)
 	methodIdx = 0
 	for i := uint32(0); i < cd.VirtualMethodsSize; i++ {
-		methodIdxDelta, p := dex.readULB128(pos)
+		if uint64(pos) >= uint64(len(dex.data)) {
+			return nil
+		}
+		methodIdxDelta, p, err := dex.readULEB128(pos)
+		if err != nil {
+			return nil
+		}
 		methodIdx += methodIdxDelta
-		accessFlags, p2 := dex.readULB128(p)
-		codeOff, p3 := dex.readULB128(p2)
+		accessFlags, p2, err := dex.readULEB128(p)
+		if err != nil {
+			return nil
+		}
+		codeOff, p3, err := dex.readULEB128(p2)
+		if err != nil {
+			return nil
+		}
 		cd.VirtualMethods[i] = Method{MethodIdx: methodIdx, AccessFlags: accessFlags, CodeOff: codeOff}
 		pos = p3
 	}
@@ -705,7 +764,7 @@ func (dex *DexFile) GetCodeItem(offset uint32) *CodeItem {
 		return cached
 	}
 
-	if int(offset)+16 > len(dex.data) {
+	if err := dex.checkRange(offset, 1, 16, "code item"); err != nil {
 		return nil
 	}
 
@@ -721,12 +780,13 @@ func (dex *DexFile) GetCodeItem(offset uint32) *CodeItem {
 
 	if ci.TriesSize > 0 {
 		// tries start after insns (insns are 2 bytes each), padded to 4 bytes
-		triesOff := offset + 16 + ci.InsnsSize*2
+		triesOff64 := uint64(offset) + 16 + uint64(ci.InsnsSize)*2
 		if ci.InsnsSize%2 != 0 {
-			triesOff += 2
+			triesOff64 += 2
 		}
-		handlersOff := triesOff + uint32(ci.TriesSize)*8
-		if int(handlersOff)+4 <= len(dex.data) {
+		handlersOff64 := triesOff64 + uint64(ci.TriesSize)*8
+		if handlersOff64 <= uint64(math.MaxUint32) && dex.checkRange(uint32(handlersOff64), 1, 4, "code handlers") == nil {
+			handlersOff := uint32(handlersOff64)
 			ci.HandlersOff = binary.LittleEndian.Uint32(dex.data[handlersOff : handlersOff+4])
 		}
 	}
@@ -741,14 +801,11 @@ func (dex *DexFile) GetInstructions(ci *CodeItem) []byte {
 	if ci == nil || ci.InsnsOff == 0 {
 		return nil
 	}
-	start := int(ci.InsnsOff)
-	end := start + int(ci.InsnsSize)*2
-	if start >= len(dex.data) {
+	if dex.checkRange(ci.InsnsOff, ci.InsnsSize, 2, "instructions") != nil {
 		return nil
 	}
-	if end > len(dex.data) {
-		end = len(dex.data)
-	}
+	start := int(ci.InsnsOff)
+	end := start + int(ci.InsnsSize)*2
 	return dex.data[start:end]
 }
 
@@ -800,13 +857,29 @@ func (dex *DexFile) readULEB128(offset uint32) (uint32, uint32, error) {
 
 // checkRange verifies that count entries of entrySize bytes at off fit in data.
 func (dex *DexFile) checkRange(off, count, entrySize uint32, what string) error {
+	return dex.checkRange64(uint64(off), uint64(count), uint64(entrySize), what)
+}
+
+func (dex *DexFile) checkRange64(off, count, entrySize uint64, what string) error {
 	if count == 0 {
 		return nil
 	}
-	end := uint64(off) + uint64(count)*uint64(entrySize)
+	if entrySize != 0 && count > math.MaxUint64/entrySize {
+		return fmt.Errorf("%s range overflows: off=0x%x count=%d size=%d", what, off, count, entrySize)
+	}
+	end := off + count*entrySize
+	if end < off {
+		return fmt.Errorf("%s range overflows: off=0x%x count=%d size=%d", what, off, count, entrySize)
+	}
 	if end > uint64(len(dex.data)) {
 		return fmt.Errorf("%s out of range: off=0x%x count=%d size=%d (file %d bytes)",
 			what, off, count, entrySize, len(dex.data))
 	}
 	return nil
+}
+
+func (dex *DexFile) canAllocate(count, itemSize uint64) bool {
+	return count <= uint64(math.MaxInt) && itemSize <= uint64(math.MaxInt) &&
+		(count == 0 || itemSize <= uint64(math.MaxInt)/count) &&
+		(count == 0 || itemSize <= uint64(len(dex.data))/count)
 }

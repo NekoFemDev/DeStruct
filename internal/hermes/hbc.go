@@ -14,60 +14,105 @@ var headerMagic = uint64(0x1F1903C103BC1FC6)
 
 const sha1Size = 20
 
+// checkedTableCount validates a record count before converting it to int or
+// allocating the destination. Division avoids overflow in count*recordSize.
+func checkedTableCount(r *bytes.Reader, count uint64, recordSize uint64, name string) (int, error) {
+	if recordSize == 0 || count > uint64(r.Len())/recordSize || count > uint64(int(^uint(0)>>1)) {
+		return 0, fmt.Errorf("%s: count %d exceeds remaining %d bytes", name, count, r.Len())
+	}
+	return int(count), nil
+}
+
+func readSection(r *bytes.Reader, size uint64, name string) ([]byte, error) {
+	n, err := checkedTableCount(r, size, 1, name)
+	if err != nil {
+		return nil, err
+	}
+	b := make([]byte, n)
+	_, err = io.ReadFull(r, b)
+	return b, err
+}
+
+func seekSection(r *bytes.Reader, offset uint64, size uint64, name string) error {
+	if offset > uint64(r.Size()) || size > uint64(r.Size())-offset {
+		return fmt.Errorf("%s: range [%d, %d) outside %d-byte file", name, offset, offset+size, r.Size())
+	}
+	_, err := r.Seek(int64(offset), io.SeekStart)
+	return err
+}
+
+func boundedRange(length int, offset, size uint64) (int, int, bool) {
+	if offset > uint64(length) || size > uint64(length)-offset {
+		return 0, 0, false
+	}
+	start := int(offset)
+	return start, start + int(size), true
+}
+
+func alignChecked(r *bytes.Reader, alignment uint64) error {
+	pos := uint64(r.Size() - int64(r.Len()))
+	padding := (alignment - pos%alignment) % alignment
+	if padding > uint64(r.Len()) {
+		return fmt.Errorf("alignment to %d exceeds file", alignment)
+	}
+	_, err := r.Seek(int64(padding), io.SeekCurrent)
+	return err
+}
+
 type Header struct {
-	Magic                         uint64
-	Version                       uint32
-	SourceHash                    [sha1Size]byte
-	FileLength                    uint32
-	GlobalCodeIndex               uint32
-	FunctionCount                 uint32
-	StringKindCount               uint32
-	IdentifierCount               uint32
-	StringCount                   uint32
-	OverflowStringCount           uint32
-	StringStorageSize             uint32
-	BigIntCount                   uint32
-	BigIntStorageSize             uint32
-	RegExpCount                   uint32
-	RegExpStorageSize             uint32
-	ArrayBufferSize               uint32
-	ObjKeyBufferSize              uint32
-	ObjValueBufferSize            uint32
-	LiteralValueBufferSize        uint32
-	ObjShapeTableCount            uint32
-	NumStringSwitchImms           uint32
-	CJSSegmentID                  uint32
-	CJSModuleCount                uint32
-	FunctionSourceCount           uint32
-	DebugInfoOffset               uint32
-	StaticBuiltins                bool
-	CJSModulesStaticallyResolved  bool
-	HasAsync                      bool
+	Magic                        uint64
+	Version                      uint32
+	SourceHash                   [sha1Size]byte
+	FileLength                   uint32
+	GlobalCodeIndex              uint32
+	FunctionCount                uint32
+	StringKindCount              uint32
+	IdentifierCount              uint32
+	StringCount                  uint32
+	OverflowStringCount          uint32
+	StringStorageSize            uint32
+	BigIntCount                  uint32
+	BigIntStorageSize            uint32
+	RegExpCount                  uint32
+	RegExpStorageSize            uint32
+	ArrayBufferSize              uint32
+	ObjKeyBufferSize             uint32
+	ObjValueBufferSize           uint32
+	LiteralValueBufferSize       uint32
+	ObjShapeTableCount           uint32
+	NumStringSwitchImms          uint32
+	CJSSegmentID                 uint32
+	CJSModuleCount               uint32
+	FunctionSourceCount          uint32
+	DebugInfoOffset              uint32
+	StaticBuiltins               bool
+	CJSModulesStaticallyResolved bool
+	HasAsync                     bool
 }
 
 type SmallFunctionHeader struct {
-	Offset              uint32
-	ParamCount          uint32
-	LoopDepth           uint32
-	BytecodeSizeInBytes uint32
-	FunctionName        uint32
-	NumberRegCount      uint32
-	NonPtrRegCount      uint32
-	FrameSize           uint8
-	ReadCacheSize       uint8
-	WriteCacheSize      uint8
+	Offset               uint32
+	ParamCount           uint32
+	LoopDepth            uint32
+	BytecodeSizeInBytes  uint32
+	FunctionName         uint32
+	NumberRegCount       uint32
+	NonPtrRegCount       uint32
+	FrameSize            uint8
+	ReadCacheSize        uint8
+	WriteCacheSize       uint8
 	PrivateNameCacheSize uint8
-	ProhibitInvoke      uint8
-	StrictMode          bool
-	HasExceptionHandler bool
-	HasDebugInfo        bool
-	Overflowed          bool
-	Kind                uint8
+	ProhibitInvoke       uint8
+	StrictMode           bool
+	HasExceptionHandler  bool
+	HasDebugInfo         bool
+	Overflowed           bool
+	Kind                 uint8
 	// v<97 fields
-	InfoOffset              uint32
-	EnvironmentSize         uint8
-	HighestReadCacheIndex   uint8
-	HighestWriteCacheIndex  uint8
+	InfoOffset             uint32
+	EnvironmentSize        uint8
+	HighestReadCacheIndex  uint8
+	HighestWriteCacheIndex uint8
 
 	// SmallHeaderFileOffset is the absolute file byte offset of this
 	// function's 12-byte packed small header entry in the function
@@ -184,7 +229,9 @@ func Parse(r io.Reader) (*HBCFile, error) {
 	}
 
 	// Align to 32 bytes after header (matches Python align_over_padding(32))
-	alignPadding(br, 32)
+	if err := alignChecked(br, 32); err != nil {
+		return nil, err
+	}
 
 	// Read function headers
 	if err := f.readFunctions(br); err != nil {
@@ -197,31 +244,51 @@ func Parse(r io.Reader) (*HBCFile, error) {
 	}
 
 	// Skip identifier hashes
-	alignPadding(br, 4)
-	skip := make([]byte, f.Header.IdentifierCount*4)
-	if _, err := io.ReadFull(br, skip); err != nil {
+	if err := alignChecked(br, 4); err != nil {
+		return nil, err
+	}
+	if n, err := checkedTableCount(br, uint64(f.Header.IdentifierCount), 4, "identifier hashes"); err != nil {
 		return nil, fmt.Errorf("skip identifier hashes: %w", err)
+	} else {
+		_, err = br.Seek(int64(n)*4, io.SeekCurrent)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Read small string table
-	alignPadding(br, 4)
-	smallTable := make([]byte, f.Header.StringCount*4)
-	if _, err := io.ReadFull(br, smallTable); err != nil {
-		return nil, fmt.Errorf("read small string table: %w", err)
+	if err := alignChecked(br, 4); err != nil {
+		return nil, err
+	}
+	n, err := checkedTableCount(br, uint64(f.Header.StringCount), 4, "small string table")
+	if err != nil {
+		return nil, err
+	}
+	smallTable, err := readSection(br, uint64(n)*4, "small string table")
+	if err != nil {
+		return nil, err
 	}
 
 	// Read overflow string table
-	alignPadding(br, 4)
-	overflowTable := make([]byte, f.Header.OverflowStringCount*8)
-	if _, err := io.ReadFull(br, overflowTable); err != nil {
-		return nil, fmt.Errorf("read overflow string table: %w", err)
+	if err := alignChecked(br, 4); err != nil {
+		return nil, err
+	}
+	n, err = checkedTableCount(br, uint64(f.Header.OverflowStringCount), 8, "overflow string table")
+	if err != nil {
+		return nil, err
+	}
+	overflowTable, err := readSection(br, uint64(n)*8, "overflow string table")
+	if err != nil {
+		return nil, err
 	}
 
 	// Read string storage
-	alignPadding(br, 4)
-	stringStorage := make([]byte, f.Header.StringStorageSize)
-	if _, err := io.ReadFull(br, stringStorage); err != nil {
-		return nil, fmt.Errorf("read string storage: %w", err)
+	if err := alignChecked(br, 4); err != nil {
+		return nil, err
+	}
+	stringStorage, err := readSection(br, uint64(f.Header.StringStorageSize), "string storage")
+	if err != nil {
+		return nil, err
 	}
 
 	// Decode strings
@@ -239,23 +306,23 @@ func Parse(r io.Reader) (*HBCFile, error) {
 		// offset: bits 1-23 (23 bits)
 		// length: bits 24-31 (8 bits)
 		isUTF16 := entry&1 != 0
-		offset := int((entry >> 1) & 0x7FFFFF) // 23 bits
-		length := int((entry >> 24) & 0xFF)    // 8 bits
+		offset := uint64((entry >> 1) & 0x7FFFFF) // 23 bits
+		length := uint64((entry >> 24) & 0xFF)    // 8 bits
 
 		if f.Header.Version < 56 {
 			// Older format: isIdentifier at bit 1, offset 22 bits
 			isUTF16 = entry&1 != 0
-			offset = int((entry >> 2) & 0x3FFFFF) // 22 bits
-			length = int((entry >> 24) & 0xFF)    // 8 bits
+			offset = uint64((entry >> 2) & 0x3FFFFF) // 22 bits
+			length = uint64((entry >> 24) & 0xFF)    // 8 bits
 		}
 
 		if length == 0xFF {
 			ovOff := offset * 8
-			if ovOff+8 <= len(overflowTable) {
+			if len(overflowTable) >= 8 && ovOff <= uint64(len(overflowTable)-8) {
 				ovOffset := binary.LittleEndian.Uint32(overflowTable[ovOff:])
 				ovLength := binary.LittleEndian.Uint32(overflowTable[ovOff+4:])
-				offset = int(ovOffset)
-				length = int(ovLength)
+				offset = uint64(ovOffset)
+				length = uint64(ovLength)
 			}
 		}
 
@@ -263,12 +330,13 @@ func Parse(r io.Reader) (*HBCFile, error) {
 			length *= 2
 		}
 
-		if offset+length > len(stringStorage) {
+		start, end, ok := boundedRange(len(stringStorage), offset, length)
+		if !ok {
 			f.Strings[i] = fmt.Sprintf("<out_of_range: off=%d len=%d storage=%d>", offset, length, len(stringStorage))
 			continue
 		}
 
-		raw := stringStorage[offset : offset+length]
+		raw := stringStorage[start:end]
 		if isUTF16 {
 			f.Strings[i] = decodeUTF16LE(raw)
 		} else {
@@ -277,37 +345,49 @@ func Parse(r io.Reader) (*HBCFile, error) {
 	}
 
 	// Read literal values / arrays
-	alignPadding(br, 4)
+	if err := alignChecked(br, 4); err != nil {
+		return nil, err
+	}
 	if f.Header.Version < 97 {
-		f.LiteralValues = make([]byte, f.Header.ArrayBufferSize)
-		if _, err := io.ReadFull(br, f.LiteralValues); err != nil {
+		f.LiteralValues, err = readSection(br, uint64(f.Header.ArrayBufferSize), "arrays")
+		if err != nil {
 			return nil, fmt.Errorf("read arrays: %w", err)
 		}
 	} else {
-		f.LiteralValues = make([]byte, f.Header.LiteralValueBufferSize)
-		if _, err := io.ReadFull(br, f.LiteralValues); err != nil {
+		f.LiteralValues, err = readSection(br, uint64(f.Header.LiteralValueBufferSize), "literal values")
+		if err != nil {
 			return nil, fmt.Errorf("read literal values: %w", err)
 		}
 	}
 
 	// Read object keys
-	alignPadding(br, 4)
-	f.ObjectKeys = make([]byte, f.Header.ObjKeyBufferSize)
-	if _, err := io.ReadFull(br, f.ObjectKeys); err != nil {
+	if err := alignChecked(br, 4); err != nil {
+		return nil, err
+	}
+	f.ObjectKeys, err = readSection(br, uint64(f.Header.ObjKeyBufferSize), "object keys")
+	if err != nil {
 		return nil, fmt.Errorf("read object keys: %w", err)
 	}
 
 	if f.Header.Version < 97 {
 		// Read object values
-		alignPadding(br, 4)
-		f.ObjectValues = make([]byte, f.Header.ObjValueBufferSize)
-		if _, err := io.ReadFull(br, f.ObjectValues); err != nil {
+		if err := alignChecked(br, 4); err != nil {
+			return nil, err
+		}
+		f.ObjectValues, err = readSection(br, uint64(f.Header.ObjValueBufferSize), "object values")
+		if err != nil {
 			return nil, fmt.Errorf("read object values: %w", err)
 		}
 	} else {
 		// Read shape table
-		alignPadding(br, 4)
-		f.ObjShapeTable = make([]ShapeTableEntry, f.Header.ObjShapeTableCount)
+		if err := alignChecked(br, 4); err != nil {
+			return nil, err
+		}
+		n, err := checkedTableCount(br, uint64(f.Header.ObjShapeTableCount), 8, "shape table")
+		if err != nil {
+			return nil, err
+		}
+		f.ObjShapeTable = make([]ShapeTableEntry, n)
 		for i := range f.ObjShapeTable {
 			if err := binary.Read(br, binary.LittleEndian, &f.ObjShapeTable[i]); err != nil {
 				return nil, fmt.Errorf("read shape table: %w", err)
@@ -315,9 +395,9 @@ func Parse(r io.Reader) (*HBCFile, error) {
 		}
 		f.ObjectShapeKeys = make([][]string, len(f.ObjShapeTable))
 		for i, entry := range f.ObjShapeTable {
-			start := int(entry.KeyBufferOffset)
-			if start > len(f.ObjectKeys) {
-				start = len(f.ObjectKeys)
+			start := len(f.ObjectKeys)
+			if uint64(entry.KeyBufferOffset) <= uint64(start) {
+				start = int(entry.KeyBufferOffset)
 			}
 			arr := unpackSLPArray(f.ObjectKeys[start:], int(entry.NumProps))
 			f.ObjectShapeKeys[i] = arr.ToStrings(f.Strings)
@@ -326,24 +406,31 @@ func Parse(r io.Reader) (*HBCFile, error) {
 
 	// Read bigints (version >= 87)
 	if f.Header.Version >= 87 {
-		alignPadding(br, 4)
-		f.BigIntValues = make([]OffsetLengthPair, f.Header.BigIntCount)
+		if err := alignChecked(br, 4); err != nil {
+			return nil, err
+		}
+		n, err := checkedTableCount(br, uint64(f.Header.BigIntCount), 8, "bigint table")
+		if err != nil {
+			return nil, err
+		}
+		f.BigIntValues = make([]OffsetLengthPair, n)
 		for i := range f.BigIntValues {
 			if err := binary.Read(br, binary.LittleEndian, &f.BigIntValues[i]); err != nil {
 				return nil, fmt.Errorf("read bigint table: %w", err)
 			}
 		}
-		alignPadding(br, 4)
-		f.BigIntData = make([]byte, f.Header.BigIntStorageSize)
-		if _, err := io.ReadFull(br, f.BigIntData); err != nil {
+		if err := alignChecked(br, 4); err != nil {
+			return nil, err
+		}
+		f.BigIntData, err = readSection(br, uint64(f.Header.BigIntStorageSize), "bigint data")
+		if err != nil {
 			return nil, fmt.Errorf("read bigint data: %w", err)
 		}
 
 		f.BigIntDecimal = make([]string, len(f.BigIntValues))
 		for i, entry := range f.BigIntValues {
-			start := int(entry.Offset)
-			end := start + int(entry.Length)
-			if start < 0 || end > len(f.BigIntData) || start > end {
+			start, end, ok := boundedRange(len(f.BigIntData), uint64(entry.Offset), uint64(entry.Length))
+			if !ok {
 				f.BigIntDecimal[i] = "0"
 				continue
 			}
@@ -352,22 +439,36 @@ func Parse(r io.Reader) (*HBCFile, error) {
 	}
 
 	// Read regex
-	alignPadding(br, 4)
-	f.RegExpTable = make([]OffsetLengthPair, f.Header.RegExpCount)
+	if err := alignChecked(br, 4); err != nil {
+		return nil, err
+	}
+	n, err = checkedTableCount(br, uint64(f.Header.RegExpCount), 8, "regexp table")
+	if err != nil {
+		return nil, err
+	}
+	f.RegExpTable = make([]OffsetLengthPair, n)
 	for i := range f.RegExpTable {
 		if err := binary.Read(br, binary.LittleEndian, &f.RegExpTable[i]); err != nil {
 			return nil, fmt.Errorf("read regexp table: %w", err)
 		}
 	}
-	alignPadding(br, 4)
-	f.RegExpStorage = make([]byte, f.Header.RegExpStorageSize)
-	if _, err := io.ReadFull(br, f.RegExpStorage); err != nil {
+	if err := alignChecked(br, 4); err != nil {
+		return nil, err
+	}
+	f.RegExpStorage, err = readSection(br, uint64(f.Header.RegExpStorageSize), "regexp storage")
+	if err != nil {
 		return nil, fmt.Errorf("read regexp storage: %w", err)
 	}
 
 	// Read CJS modules
-	alignPadding(br, 4)
-	f.CJSModules = make([]SymbolOffsetPair, f.Header.CJSModuleCount)
+	if err := alignChecked(br, 4); err != nil {
+		return nil, err
+	}
+	n, err = checkedTableCount(br, uint64(f.Header.CJSModuleCount), 8, "CJS modules")
+	if err != nil {
+		return nil, err
+	}
+	f.CJSModules = make([]SymbolOffsetPair, n)
 	for i := range f.CJSModules {
 		if err := binary.Read(br, binary.LittleEndian, &f.CJSModules[i]); err != nil {
 			return nil, fmt.Errorf("read CJS modules: %w", err)
@@ -376,8 +477,14 @@ func Parse(r io.Reader) (*HBCFile, error) {
 
 	// Read function sources (version >= 84)
 	if f.Header.Version >= 84 {
-		alignPadding(br, 4)
-		f.FunctionSources = make([]FunctionSourceEntry, f.Header.FunctionSourceCount)
+		if err := alignChecked(br, 4); err != nil {
+			return nil, err
+		}
+		n, err := checkedTableCount(br, uint64(f.Header.FunctionSourceCount), 8, "function sources")
+		if err != nil {
+			return nil, err
+		}
+		f.FunctionSources = make([]FunctionSourceEntry, n)
 		for i := range f.FunctionSources {
 			if err := binary.Read(br, binary.LittleEndian, &f.FunctionSources[i]); err != nil {
 				return nil, fmt.Errorf("read function sources: %w", err)
@@ -772,7 +879,16 @@ func (f *HBCFile) readHeader(r io.Reader) error {
 }
 
 func (f *HBCFile) readFunctions(r io.Reader) error {
-	f.FunctionHeaders = make([]SmallFunctionHeader, f.Header.FunctionCount)
+	br := r.(*bytes.Reader)
+	rawSize := uint64(12)
+	if f.Header.Version < 97 {
+		rawSize = 16
+	}
+	n, err := checkedTableCount(br, uint64(f.Header.FunctionCount), rawSize, "function headers")
+	if err != nil {
+		return err
+	}
+	f.FunctionHeaders = make([]SmallFunctionHeader, n)
 
 	for i := uint32(0); i < f.Header.FunctionCount; i++ {
 		var hdr SmallFunctionHeader
@@ -786,7 +902,6 @@ func (f *HBCFile) readFunctions(r io.Reader) error {
 			rawSize = 16
 		}
 		raw := make([]byte, rawSize)
-		br := r.(*bytes.Reader)
 		smallHeaderFileOffset := br.Size() - int64(br.Len())
 		if _, err := io.ReadFull(r, raw); err != nil {
 			return fmt.Errorf("read function header %d: %w", i, err)
@@ -805,14 +920,14 @@ func (f *HBCFile) readFunctions(r io.Reader) error {
 
 			// Word 2: bytecodeSizeInBytes(14) + functionName(8) + numberRegCount(5) + nonPtrRegCount(5)
 			w2 := binary.LittleEndian.Uint32(raw[4:8])
-			hdr.BytecodeSizeInBytes = w2 & 0x3FFF       // 14 bits
-			hdr.FunctionName = (w2 >> 14) & 0xFF        // 8 bits
-			hdr.NumberRegCount = (w2 >> 22) & 0x1F      // 5 bits
-			hdr.NonPtrRegCount = (w2 >> 27) & 0x1F      // 5 bits
+			hdr.BytecodeSizeInBytes = w2 & 0x3FFF  // 14 bits
+			hdr.FunctionName = (w2 >> 14) & 0xFF   // 8 bits
+			hdr.NumberRegCount = (w2 >> 22) & 0x1F // 5 bits
+			hdr.NonPtrRegCount = (w2 >> 27) & 0x1F // 5 bits
 
 			hdr.FrameSize = raw[8]
 			hdr.ReadCacheSize = raw[9]
-			hdr.WriteCacheSize = raw[10] & 0x7F         // 7 bits
+			hdr.WriteCacheSize = raw[10] & 0x7F           // 7 bits
 			hdr.PrivateNameCacheSize = (raw[10] >> 7) & 1 // 1 bit
 
 			// Flags byte
@@ -888,7 +1003,6 @@ func (f *HBCFile) readFunctions(r io.Reader) error {
 			}
 			newOffset |= int64(hdr.Offset)
 
-			br.Seek(newOffset, io.SeekStart)
 			hdr.LargeHeaderFileOffset = newOffset
 
 			// NOTE: below, hdr.Overflowed is deliberately never
@@ -928,6 +1042,9 @@ func (f *HBCFile) readFunctions(r io.Reader) error {
 				largeSize = 23
 			default:
 				largeSize = 31
+			}
+			if err := seekSection(br, uint64(newOffset), uint64(largeSize), "large function header"); err != nil {
+				return err
 			}
 			largeRaw := make([]byte, largeSize)
 			if _, err := io.ReadFull(r, largeRaw); err != nil {
@@ -987,19 +1104,27 @@ func (f *HBCFile) readFunctions(r io.Reader) error {
 			// an infoOffset pointer: seek there before reading exception
 			// handler / debug info data, exactly as hbc_file_parser.py's
 			// "elif self.header.version < 97: self.file_buffer.seek(...)".
-			br.Seek(int64(hdr.InfoOffset), io.SeekStart)
+			if err := seekSection(br, uint64(hdr.InfoOffset), 0, "function info"); err != nil {
+				return err
+			}
 		}
 
 		f.FunctionHeaders[i] = hdr
 
 		// Read exception handlers from current position (after large header if overflowed)
 		if hdr.HasExceptionHandler {
-			alignPadding(r, 4)
+			if err := alignChecked(br, 4); err != nil {
+				return err
+			}
 			var count uint32
 			if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
 				return fmt.Errorf("read exc handler count for func %d: %w", i, err)
 			}
-			handlers := make([]ExceptionHandlerInfo, count)
+			n, err := checkedTableCount(br, uint64(count), 12, "exception handlers")
+			if err != nil {
+				return err
+			}
+			handlers := make([]ExceptionHandlerInfo, n)
 			for j := range handlers {
 				if err := binary.Read(r, binary.LittleEndian, &handlers[j]); err != nil {
 					return fmt.Errorf("read exc handler %d for func %d: %w", j, i, err)
@@ -1010,7 +1135,9 @@ func (f *HBCFile) readFunctions(r io.Reader) error {
 
 		// Read debug info from current position
 		if hdr.HasDebugInfo {
-			alignPadding(r, 4)
+			if err := alignChecked(br, 4); err != nil {
+				return err
+			}
 			var dbg DebugOffsets
 			if err := binary.Read(r, binary.LittleEndian, &dbg); err != nil {
 				return fmt.Errorf("read debug offsets for func %d: %w", i, err)
@@ -1019,15 +1146,24 @@ func (f *HBCFile) readFunctions(r io.Reader) error {
 		}
 
 		// Seek back to before_pos (Python does this!)
-		br.Seek(beforePos, io.SeekStart)
+		if err := seekSection(br, uint64(beforePos), 0, "function header table"); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 func (f *HBCFile) readStringKinds(r io.Reader) error {
-	alignPadding(r, 4)
-	f.StringKinds = make([]StringKindEntry, f.Header.StringKindCount)
+	br := r.(*bytes.Reader)
+	if err := alignChecked(br, 4); err != nil {
+		return err
+	}
+	n, err := checkedTableCount(br, uint64(f.Header.StringKindCount), 4, "string kinds")
+	if err != nil {
+		return err
+	}
+	f.StringKinds = make([]StringKindEntry, n)
 	for i := range f.StringKinds {
 		var raw uint32
 		if err := binary.Read(r, binary.LittleEndian, &raw); err != nil {
@@ -1041,6 +1177,9 @@ func (f *HBCFile) readStringKinds(r io.Reader) error {
 			f.StringKinds[i].Count = raw & 0x3FFFFFFF
 			f.StringKinds[i].Kind = (raw >> 30) & 3
 		}
+		if uint64(len(f.StringKindOf)) > uint64(f.Header.StringCount) || uint64(f.StringKinds[i].Count) > uint64(f.Header.StringCount)-uint64(len(f.StringKindOf)) {
+			return fmt.Errorf("string kind run exceeds string count")
+		}
 		for c := uint32(0); c < f.StringKinds[i].Count; c++ {
 			f.StringKindOf = append(f.StringKindOf, f.StringKinds[i].Kind)
 		}
@@ -1049,16 +1188,15 @@ func (f *HBCFile) readStringKinds(r io.Reader) error {
 }
 
 func (f *HBCFile) getCode(funcIdx int) []byte {
-	if funcIdx >= len(f.FunctionHeaders) {
+	if funcIdx < 0 || funcIdx >= len(f.FunctionHeaders) {
 		return nil
 	}
 	hdr := f.FunctionHeaders[funcIdx]
-	offset := int(hdr.Offset)
-	size := int(hdr.BytecodeSizeInBytes)
-	if offset+size > len(f.rawData) {
+	offset, end, ok := boundedRange(len(f.rawData), uint64(hdr.Offset), uint64(hdr.BytecodeSizeInBytes))
+	if !ok {
 		return nil
 	}
-	return f.rawData[offset : offset+size]
+	return f.rawData[offset:end]
 }
 
 // SetCode replaces the bytecode for a function, splicing f.rawData and
@@ -1072,11 +1210,11 @@ func (f *HBCFile) SetCode(funcIdx int, newCode []byte) error {
 		return fmt.Errorf("function index %d out of range", funcIdx)
 	}
 	hdr := &f.FunctionHeaders[funcIdx]
-	offset := int(hdr.Offset)
-	oldSize := int(hdr.BytecodeSizeInBytes)
-	if offset < 0 || offset+oldSize > len(f.rawData) {
-		return fmt.Errorf("function's current bytecode range [%d, %d) is out of bounds for a %d-byte file", offset, offset+oldSize, len(f.rawData))
+	offset, end, ok := boundedRange(len(f.rawData), uint64(hdr.Offset), uint64(hdr.BytecodeSizeInBytes))
+	if !ok {
+		return fmt.Errorf("function's current bytecode range [%d, %d) is out of bounds for a %d-byte file", hdr.Offset, uint64(hdr.Offset)+uint64(hdr.BytecodeSizeInBytes), len(f.rawData))
 	}
+	oldSize := end - offset
 
 	// splicePoint mirrors patchOneFunction's: everything at or after the
 	// end of the OLD bytecode shifts by delta, including header tables
@@ -1221,15 +1359,4 @@ func decodeUTF16LE(b []byte) string {
 	}
 
 	return string(runes)
-}
-
-func alignPadding(r io.Reader, alignment uint32) {
-	if br, ok := r.(*bytes.Reader); ok {
-		pos := br.Size() - int64(br.Len())
-		mod := uint64(pos) % uint64(alignment)
-		if mod != 0 {
-			padding := make([]byte, uint64(alignment)-mod)
-			br.Read(padding)
-		}
-	}
 }

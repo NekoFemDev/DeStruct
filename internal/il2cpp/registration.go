@@ -196,17 +196,17 @@ func (ic *IL2CPP) readU64s(addr uint64, count int64) []uint64 {
 	if count <= 0 || count > 1<<28 {
 		return nil
 	}
-	out := make([]uint64, count)
 	off, ok := ic.mapVATR(addr)
 	if !ok {
-		return out
+		return nil
 	}
+	start, _, ok := recordRange(ic.ELF.data, off, uint64(count), 8)
+	if !ok {
+		return nil
+	}
+	out := make([]uint64, count)
 	for i := int64(0); i < count; i++ {
-		pos := int(off) + int(i)*8
-		if pos+8 > len(ic.ELF.data) {
-			break
-		}
-		out[i] = ic.ELF.u64(pos)
+		out[i] = ic.ELF.u64(start + int(i)*8)
 	}
 	return out
 }
@@ -218,16 +218,17 @@ func (ic *IL2CPP) readU64sStrict(addr uint64, count int64) ([]uint64, bool) {
 	if count < 0 || count > 1<<28 {
 		return nil, false
 	}
-	out := make([]uint64, count)
 	off, ok := ic.mapVATR(addr)
 	if !ok {
 		return nil, false
 	}
-	if int64(off)+count*8 > int64(len(ic.ELF.data)) {
+	start, _, ok := recordRange(ic.ELF.data, off, uint64(count), 8)
+	if !ok {
 		return nil, false
 	}
+	out := make([]uint64, count)
 	for i := int64(0); i < count; i++ {
-		out[i] = ic.ELF.u64(int(off) + int(i)*8)
+		out[i] = ic.ELF.u64(start + int(i)*8)
 	}
 	return out, true
 }
@@ -238,10 +239,11 @@ func (ic *IL2CPP) readRecord(addr uint64, l *structLayout) ([]byte, bool) {
 		return nil, false
 	}
 	n := l.size(ic.Version)
-	if int(off)+n > len(ic.ELF.data) {
+	start, end, ok := byteRange(ic.ELF.data, off, uint64(n))
+	if !ok {
 		return nil, false
 	}
-	return ic.ELF.data[off : int(off)+n], true
+	return ic.ELF.data[start:end], true
 }
 
 // findCodeRegistration ports SectionHelper.FindCodeRegistration for ELF.
@@ -272,6 +274,9 @@ func (ic *IL2CPP) findCodeRegistrationOld() uint64 {
 	for _, sec := range ic.ELF.dataSections() {
 		pos := sec.offset
 		for pos+8 <= sec.offsetEnd && pos+8 <= uint64(len(ic.ELF.data)) {
+			if pos > uint64(len(ic.ELF.data))-16 {
+				break
+			}
 			if int64(ic.ELF.u64(int(pos))) == int64(methodCount) {
 				ptr := ic.ELF.u64(int(pos) + 8)
 				if po, ok := ic.mapVATR(ptr); ok && ic.inDataRange(po) {
@@ -301,10 +306,11 @@ func (ic *IL2CPP) findCodeRegistration2019(sections []searchSection, imageCount 
 	}
 	var occurrences []occurrence
 	for si, sec := range sections {
-		if sec.offsetEnd > uint64(len(ic.ELF.data)) {
+		start, end, ok := byteRange(ic.ELF.data, sec.offset, sec.offsetEnd-sec.offset)
+		if !ok {
 			continue
 		}
-		buff := ic.ELF.data[sec.offset:sec.offsetEnd]
+		buff := ic.ELF.data[start:end]
 		for idx := 0; ; {
 			j := indexBytes(buff[idx:], featureBytes)
 			if j < 0 {
@@ -340,6 +346,9 @@ func (ic *IL2CPP) findCodeRegistration2019(sections []searchSection, imageCount 
 	for _, refs := range refs2 {
 		for _, refva2 := range refs {
 			for i := imageCount - 1; i >= 0; i-- {
+				if uint64(i) > refva2/8 {
+					continue
+				}
 				addr := refva2 - uint64(i)*8
 				if addr != 0 {
 					level3Targets[addr] = struct{}{}
@@ -353,17 +362,27 @@ func (ic *IL2CPP) findCodeRegistration2019(sections []searchSection, imageCount 
 		for _, refva := range refs1[o.va] {
 			for _, refva2 := range refs2[refva] {
 				for i := imageCount - 1; i >= 0; i-- {
+					if uint64(i) > refva2/8 {
+						continue
+					}
 					addr := refva2 - uint64(i)*8
 					for _, refva3 := range refs3[addr] {
+						if refva3 < 8 {
+							continue
+						}
 						countOff, ok := ic.mapVATR(refva3 - 8)
 						if !ok {
 							continue
 						}
 						if int64(ic.ELF.u64(int(countOff))) == int64(imageCount) {
 							if ic.Version >= 29 {
-								return refva3 - 8*14
+								if refva3 >= 8*14 {
+									return refva3 - 8*14
+								}
 							}
-							return refva3 - 8*13
+							if refva3 >= 8*13 {
+								return refva3 - 8*13
+							}
 						}
 					}
 				}
@@ -415,7 +434,7 @@ func (ic *IL2CPP) findMetadataRegistrationV21(typeDefsCount int64) uint64 {
 			if ic.pointerInExec {
 				check = ic.allInExecVA
 			}
-			if check(pointers) {
+			if check(pointers) && pos-sec.offset+sec.address >= 8*10 {
 				return pos - sec.offset + sec.address - 8*10
 			}
 		}
@@ -444,8 +463,8 @@ func (ic *IL2CPP) findMetadataRegistrationOld(typeDefsCount int64) uint64 {
 			if !ok || !ic.inDataRange(fileOff) {
 				continue
 			}
-			pointers := ic.readU64s(ptr, ic.metadataUsagesCount)
-			if ic.allInDataVA(pointers) {
+			pointers, valid := ic.readU64sStrict(ptr, ic.metadataUsagesCount)
+			if valid && ic.allInDataVA(pointers) && pos-sec.offset+sec.address >= 8*12 {
 				return pos - sec.offset + sec.address - 8*12
 			}
 		}
@@ -728,7 +747,7 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 				for _, rg := range ranges {
 					start := rg.start
 					length := rg.length
-					if start < 0 || length <= 0 || int(start)+int(length) > len(rgctxs) {
+					if start < 0 || length <= 0 || int(start) > len(rgctxs) || int(length) > len(rgctxs)-int(start) {
 						rgctxDic[rg.token] = nil
 						continue
 					}
@@ -745,6 +764,10 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 	entries := ic.readGenericMethodEntries(mr.u64("genericMethodTable"), mr.i64("genericMethodTableCount"))
 	specCount := mr.i64("methodSpecsCount")
 	if specCount < 0 || specCount > 1<<28 {
+		specCount = 0
+	}
+	specOff, mapped := ic.mapVATR(mr.u64("methodSpecs"))
+	if _, _, ok := recordRange(ic.ELF.data, specOff, uint64(specCount), 12); !mapped || !ok {
 		specCount = 0
 	}
 	ic.MethodSpecs = make([]Il2CppMethodSpec, specCount)
@@ -798,17 +821,17 @@ func (ic *IL2CPP) readU32s(addr uint64, count int64) []uint32 {
 	if count > 1<<30 {
 		return nil
 	}
-	out := make([]uint32, count)
 	off, ok := ic.mapVATR(addr)
 	if !ok {
-		return out
+		return nil
 	}
+	start, _, ok := recordRange(ic.ELF.data, off, uint64(count), 4)
+	if !ok {
+		return nil
+	}
+	out := make([]uint32, count)
 	for i := int64(0); i < count; i++ {
-		pos := int(off) + int(i)*4
-		if pos+4 > len(ic.ELF.data) {
-			break
-		}
-		out[i] = ic.ELF.u32(pos)
+		out[i] = ic.ELF.u32(start + int(i)*4)
 	}
 	return out
 }
@@ -861,17 +884,21 @@ func recordsRaw(ic *IL2CPP, addr uint64, count int64, l *structLayout) []record 
 		return nil
 	}
 	esz := l.size(ic.Version)
+	if esz <= 0 {
+		return nil
+	}
 	off, ok := ic.mapVATR(addr)
+	if !ok {
+		return nil
+	}
+	start, _, ok := recordRange(ic.ELF.data, off, uint64(count), uint64(esz))
 	if !ok {
 		return nil
 	}
 	out := make([]record, 0, count)
 	for i := int64(0); i < count; i++ {
-		pos := int(off) + int(i)*esz
-		if pos+esz > len(ic.ELF.data) {
-			break
-		}
-		out = append(out, record{b: ic.ELF.data[pos:], l: l, ver: ic.Version})
+		pos := start + int(i)*esz
+		out = append(out, record{b: ic.ELF.data[pos : pos+esz], l: l, ver: ic.Version})
 	}
 	return out
 }
@@ -912,8 +939,12 @@ func (ic *IL2CPP) GetFieldOffsetFromIndex(typeIndex int, fieldIndexInType int, f
 		if typeIndex >= 0 && typeIndex < len(ic.FieldOffsets) {
 			ptr := ic.FieldOffsets[typeIndex]
 			if ptr > 0 {
-				if off, ok := ic.mapVATR(ptr + uint64(fieldIndexInType)*4); ok && int(off)+4 <= len(ic.ELF.data) {
-					offset = int(int32(ic.ELF.u32(int(off))))
+				if fieldIndexInType >= 0 && uint64(fieldIndexInType) <= (^uint64(0)-ptr)/4 {
+					if off, ok := ic.mapVATR(ptr + uint64(fieldIndexInType)*4); ok {
+						if start, _, valid := byteRange(ic.ELF.data, off, 4); valid {
+							offset = int(int32(ic.ELF.u32(start)))
+						}
+					}
 				}
 			}
 		}

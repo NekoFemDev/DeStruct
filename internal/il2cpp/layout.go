@@ -2,6 +2,21 @@ package il2cpp
 
 import "encoding/binary"
 
+// byteRange checks a file-backed range before converting it to int.
+func byteRange(data []byte, off, size uint64) (int, int, bool) {
+	if off > uint64(len(data)) || size > uint64(len(data))-off {
+		return 0, 0, false
+	}
+	return int(off), int(off + size), true
+}
+
+func recordRange(data []byte, off, count, size uint64) (int, int, bool) {
+	if size == 0 || count > ^uint64(0)/size {
+		return 0, 0, false
+	}
+	return byteRange(data, off, count*size)
+}
+
 // structField is one field of a metadata/registration structure.
 //
 // Il2CppDumper reads these structures through .NET reflection and skips
@@ -155,23 +170,18 @@ func (r record) has(name string) bool { return r.l.offset(r.ver, name) >= 0 }
 // records slices a metadata table into fixed-size records.
 func records(data []byte, off uint32, size int32, l *structLayout, ver float64) []record {
 	esz := l.size(ver)
-	if esz == 0 || size <= 0 {
+	if esz <= 0 || size <= 0 || int(size)%esz != 0 {
+		return nil
+	}
+	start, _, ok := byteRange(data, uint64(off), uint64(size))
+	if !ok {
 		return nil
 	}
 	n := int(size) / esz
-	if n < 0 {
-		return nil
-	}
-	end := int(off) + n*esz
-	if end > len(data) || int(off) < 0 {
-		n = (len(data) - int(off)) / esz
-		if n < 0 {
-			n = 0
-		}
-	}
 	out := make([]record, n)
 	for i := 0; i < n; i++ {
-		out[i] = record{b: data[int(off)+i*esz:], l: l, ver: ver}
+		pos := start + i*esz
+		out[i] = record{b: data[pos : pos+esz], l: l, ver: ver}
 	}
 	return out
 }

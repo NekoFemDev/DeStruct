@@ -155,6 +155,12 @@ type ELFParser struct {
 	FromSegments bool
 }
 
+// elfRange checks untrusted file offsets without ever adding two untrusted
+// values. It also ensures both endpoints can be used as slice indices.
+func (p *ELFParser) elfRange(off, size uint64) bool {
+	return off <= uint64(len(p.Data)) && size <= uint64(len(p.Data))-off
+}
+
 // NewELFParser creates a new ELF parser
 func NewELFParser(path string) (*ELFParser, error) {
 	data, err := os.ReadFile(path)
@@ -211,6 +217,12 @@ func (p *ELFParser) parseHeader() error {
 
 	p.Header.Class = p.Data[4]
 	p.Header.Data = p.Data[5]
+	if p.Header.Class != ELFCLASS32 && p.Header.Class != ELFCLASS64 {
+		return fmt.Errorf("invalid ELF class %d", p.Header.Class)
+	}
+	if p.Header.Data != ELFDATA2LSB && p.Header.Data != ELFDATA2MSB {
+		return fmt.Errorf("invalid ELF byte order %d", p.Header.Data)
+	}
 
 	// Determine endianness
 	littleEndian := p.Header.Data == ELFDATA2LSB
@@ -227,8 +239,12 @@ func (p *ELFParser) parseHeader() error {
 		readUint64 = binary.BigEndian.Uint64
 	}
 
-	p.Header.Type = binary.LittleEndian.Uint16(p.Data[16:18])
-	p.Header.Machine = binary.LittleEndian.Uint16(p.Data[18:20])
+	var order binary.ByteOrder = binary.BigEndian
+	if littleEndian {
+		order = binary.LittleEndian
+	}
+	p.Header.Type = order.Uint16(p.Data[16:18])
+	p.Header.Machine = order.Uint16(p.Data[18:20])
 	p.Header.Version2 = readUint32(p.Data[20:24])
 
 	if p.Header.Class == ELFCLASS64 {
@@ -236,24 +252,24 @@ func (p *ELFParser) parseHeader() error {
 		p.Header.PhOff = readUint64(p.Data[32:40])
 		p.Header.ShOff = readUint64(p.Data[40:48])
 		p.Header.Flags = readUint32(p.Data[48:52])
-		p.Header.EhSize = binary.LittleEndian.Uint16(p.Data[52:54])
-		p.Header.PhEntSize = binary.LittleEndian.Uint16(p.Data[54:56])
-		p.Header.PhNum = binary.LittleEndian.Uint16(p.Data[56:58])
-		p.Header.ShEntSize = binary.LittleEndian.Uint16(p.Data[58:60])
-		p.Header.ShNum = binary.LittleEndian.Uint16(p.Data[60:62])
-		p.Header.ShStrNdx = binary.LittleEndian.Uint16(p.Data[62:64])
+		p.Header.EhSize = order.Uint16(p.Data[52:54])
+		p.Header.PhEntSize = order.Uint16(p.Data[54:56])
+		p.Header.PhNum = order.Uint16(p.Data[56:58])
+		p.Header.ShEntSize = order.Uint16(p.Data[58:60])
+		p.Header.ShNum = order.Uint16(p.Data[60:62])
+		p.Header.ShStrNdx = order.Uint16(p.Data[62:64])
 		p.Bits = 64
 	} else {
 		p.Header.Entry = uint64(readUint32(p.Data[24:28]))
 		p.Header.PhOff = uint64(readUint32(p.Data[28:32]))
 		p.Header.ShOff = uint64(readUint32(p.Data[32:36]))
 		p.Header.Flags = readUint32(p.Data[36:40])
-		p.Header.EhSize = binary.LittleEndian.Uint16(p.Data[40:42])
-		p.Header.PhEntSize = binary.LittleEndian.Uint16(p.Data[42:44])
-		p.Header.PhNum = binary.LittleEndian.Uint16(p.Data[44:46])
-		p.Header.ShEntSize = binary.LittleEndian.Uint16(p.Data[46:48])
-		p.Header.ShNum = binary.LittleEndian.Uint16(p.Data[48:50])
-		p.Header.ShStrNdx = binary.LittleEndian.Uint16(p.Data[50:52])
+		p.Header.EhSize = order.Uint16(p.Data[40:42])
+		p.Header.PhEntSize = order.Uint16(p.Data[42:44])
+		p.Header.PhNum = order.Uint16(p.Data[44:46])
+		p.Header.ShEntSize = order.Uint16(p.Data[46:48])
+		p.Header.ShNum = order.Uint16(p.Data[48:50])
+		p.Header.ShStrNdx = order.Uint16(p.Data[50:52])
 		p.Bits = 32
 	}
 
@@ -282,6 +298,14 @@ func (p *ELFParser) parseSections() error {
 	if p.Header.ShOff == 0 || p.Header.ShNum == 0 {
 		return nil
 	}
+	minSize := uint64(40)
+	if p.Header.Class == ELFCLASS64 {
+		minSize = 64
+	}
+	entSize := uint64(p.Header.ShEntSize)
+	if entSize < minSize || !p.elfRange(p.Header.ShOff, uint64(p.Header.ShNum)*entSize) || p.Header.ShOff%4 != 0 {
+		return fmt.Errorf("invalid ELF section header table")
+	}
 
 	var readUint32 func([]byte) uint32
 	var readUint64 func([]byte) uint64
@@ -298,9 +322,7 @@ func (p *ELFParser) parseSections() error {
 	offset := p.Header.ShOff
 
 	for i := 0; i < int(p.Header.ShNum); i++ {
-		if offset+uint64(p.Header.ShEntSize) > uint64(len(p.Data)) {
-			break
-		}
+		// The entire table was validated before allocating Sections.
 
 		data := p.Data[offset:]
 		s := SectionHeader{}
@@ -367,16 +389,14 @@ func (p *ELFParser) parseProgramHeaders() ([]ProgramHeader, error) {
 	if p.Header.Class != ELFCLASS64 {
 		minSize = 32
 	}
-	if entSize < minSize {
-		entSize = minSize
+	if entSize < minSize || !p.elfRange(p.Header.PhOff, uint64(p.Header.PhNum)*entSize) || p.Header.PhOff%4 != 0 {
+		return nil, fmt.Errorf("invalid ELF program header table")
 	}
 
 	phdrs := make([]ProgramHeader, 0, p.Header.PhNum)
 	offset := p.Header.PhOff
 	for i := 0; i < int(p.Header.PhNum); i++ {
-		if offset+entSize > uint64(len(p.Data)) {
-			break
-		}
+		// The entire table was validated before allocating phdrs.
 		data := p.Data[offset:]
 
 		ph := ProgramHeader{}
@@ -441,7 +461,7 @@ func (p *ELFParser) parseProgramSections() error {
 			if ph.Type != PT_LOAD || ph.FileSz == 0 {
 				continue
 			}
-			if vaddr >= ph.Vaddr && vaddr < ph.Vaddr+ph.FileSz {
+			if vaddr >= ph.Vaddr && vaddr-ph.Vaddr < ph.FileSz && p.elfRange(ph.Offset, vaddr-ph.Vaddr+1) {
 				return ph.Offset + (vaddr - ph.Vaddr), true
 			}
 		}
@@ -453,6 +473,9 @@ func (p *ELFParser) parseProgramSections() error {
 		ph := &phdrs[i]
 		switch ph.Type {
 		case PT_LOAD:
+			if !p.elfRange(ph.Offset, ph.FileSz) {
+				return fmt.Errorf("invalid PT_LOAD file range")
+			}
 			flags := uint64(0)
 			if ph.Flags&PF_R != 0 {
 				flags |= SHF_ALLOC
@@ -480,6 +503,9 @@ func (p *ELFParser) parseProgramSections() error {
 				AddrAlign: ph.Align,
 			})
 		case PT_GNU_EH_FRAME:
+			if !p.elfRange(ph.Offset, ph.FileSz) {
+				return fmt.Errorf("invalid PT_GNU_EH_FRAME file range")
+			}
 			p.Sections = append(p.Sections, SectionHeader{
 				SynthName: ".eh_frame_hdr",
 				Type:      SHT_PROGBITS,
@@ -490,6 +516,9 @@ func (p *ELFParser) parseProgramSections() error {
 				AddrAlign: ph.Align,
 			})
 		case PT_DYNAMIC:
+			if !p.elfRange(ph.Offset, ph.FileSz) {
+				return fmt.Errorf("invalid PT_DYNAMIC file range")
+			}
 			dynPh = ph
 		}
 	}
@@ -509,7 +538,10 @@ func (p *ELFParser) parseProgramSections() error {
 	dyn := p.parseDynamicEntries(dynOff, dynPh.FileSz)
 
 	addSection := func(name string, typ uint32, addr, size, entSize uint64) int {
-		off, _ := vaddrToOffset(addr)
+		off, ok := vaddrToOffset(addr)
+		if !ok || !p.elfRange(off, size) {
+			return -1
+		}
 		p.Sections = append(p.Sections, SectionHeader{
 			SynthName: name,
 			Type:      typ,
@@ -538,8 +570,12 @@ func (p *ELFParser) parseProgramSections() error {
 	dynsymIdx := -1
 	if symtab, ok := dyn[DT_SYMTAB]; ok && dynstrIdx >= 0 {
 		count := p.dynamicSymbolCount(dyn, syment, vaddrToOffset)
-		dynsymIdx = addSection(".dynsym", SHT_DYNSYM, symtab, count*syment, syment)
-		p.Sections[dynsymIdx].Link = uint32(dynstrIdx)
+		if syment > 0 && count <= uint64(len(p.Data))/syment {
+			dynsymIdx = addSection(".dynsym", SHT_DYNSYM, symtab, count*syment, syment)
+		}
+		if dynsymIdx >= 0 {
+			p.Sections[dynsymIdx].Link = uint32(dynstrIdx)
+		}
 	}
 
 	relaEnt := dyn[DT_RELAENT]
@@ -551,13 +587,13 @@ func (p *ELFParser) parseProgramSections() error {
 	}
 	if rela, ok := dyn[DT_RELA]; ok && dyn[DT_RELASZ] > 0 {
 		idx := addSection(".rela.dyn", SHT_RELA, rela, dyn[DT_RELASZ], relaEnt)
-		if dynsymIdx >= 0 {
+		if idx >= 0 && dynsymIdx >= 0 {
 			p.Sections[idx].Link = uint32(dynsymIdx)
 		}
 	}
 	if jmprel, ok := dyn[DT_JMPREL]; ok && dyn[DT_PLTRELSZ] > 0 {
 		idx := addSection(".rela.plt", SHT_RELA, jmprel, dyn[DT_PLTRELSZ], relaEnt)
-		if dynsymIdx >= 0 {
+		if idx >= 0 && dynsymIdx >= 0 {
 			p.Sections[idx].Link = uint32(dynsymIdx)
 		}
 	}
@@ -580,10 +616,10 @@ func (p *ELFParser) parseDynamicEntries(off, size uint64) map[int64]uint64 {
 	if p.Header.Class != ELFCLASS64 {
 		entSize = 8
 	}
-	end := off + size
-	if end > uint64(len(p.Data)) {
-		end = uint64(len(p.Data))
+	if size > uint64(len(p.Data))-off {
+		size = uint64(len(p.Data)) - off
 	}
+	end := off + size
 
 	for pos := off; pos+entSize <= end; pos += entSize {
 		var tag int64
@@ -624,7 +660,7 @@ func (p *ELFParser) parseDynamicEntries(off, size uint64) map[int64]uint64 {
 // DT_SYMTAB and DT_STRTAB, which adjacent-table linkers make exact.
 func (p *ELFParser) dynamicSymbolCount(dyn map[int64]uint64, syment uint64, vaddrToOffset func(uint64) (uint64, bool)) uint64 {
 	if hashAddr, ok := dyn[DT_HASH]; ok {
-		if off, ok := vaddrToOffset(hashAddr); ok && off+8 <= uint64(len(p.Data)) {
+		if off, ok := vaddrToOffset(hashAddr); ok && p.elfRange(off, 8) {
 			read32 := binary.LittleEndian.Uint32
 			if !p.IsEndian {
 				read32 = binary.BigEndian.Uint32
@@ -664,7 +700,7 @@ func (p *ELFParser) dynamicSymbolCount(dyn map[int64]uint64, syment uint64, vadd
 // the highest bucket index gives the symbol table's end.
 func (p *ELFParser) gnuHashSymbolCount(off uint64) (uint64, bool) {
 	data := p.Data
-	if off+16 > uint64(len(data)) {
+	if !p.elfRange(off, 16) {
 		return 0, false
 	}
 
@@ -681,8 +717,11 @@ func (p *ELFParser) gnuHashSymbolCount(off uint64) (uint64, bool) {
 	if p.Header.Class != ELFCLASS64 {
 		wordSize = 4
 	}
+	if uint64(bloomSize) > (uint64(len(data))-off-16)/wordSize {
+		return 0, false
+	}
 	bucketsOff := off + 16 + uint64(bloomSize)*wordSize
-	if bucketsOff > uint64(len(data)) || uint64(nbuckets) > (uint64(len(data))-bucketsOff)/4 {
+	if uint64(nbuckets) > (uint64(len(data))-bucketsOff)/4 {
 		return 0, false
 	}
 
@@ -709,10 +748,11 @@ func (p *ELFParser) gnuHashSymbolCount(off uint64) (uint64, bool) {
 		if idx < uint64(symoffset) {
 			return 0, false
 		}
-		pos := chainsOff + (idx-uint64(symoffset))*4
-		if pos+4 > uint64(len(data)) {
+		chainIndex := idx - uint64(symoffset)
+		if chainsOff > uint64(len(data)) || chainIndex >= (uint64(len(data))-chainsOff)/4 {
 			return 0, false
 		}
+		pos := chainsOff + chainIndex*4
 		word := read32(data[pos : pos+4])
 		idx++
 		if word&1 != 0 {
@@ -769,14 +809,19 @@ func (p *ELFParser) parseSymbolTable(sec SectionHeader) error {
 		entSize = sec.EntSize
 	}
 
+	minSize := uint64(16)
+	if p.Header.Class == ELFCLASS64 {
+		minSize = 24
+	}
+	if entSize < minSize || sec.Size%entSize != 0 || sec.Offset%4 != 0 || !p.elfRange(sec.Offset, sec.Size) {
+		return fmt.Errorf("invalid ELF symbol table range or entry size")
+	}
 	count := sec.Size / entSize
 	p.Symbols = make([]SymbolEntry, 0, count)
 
 	offset := sec.Offset
 	for i := uint64(0); i < count; i++ {
-		if offset+entSize > uint64(len(p.Data)) {
-			break
-		}
+		// Validated the entire table before allocating Symbols.
 
 		data := p.Data[offset:]
 		sym := SymbolEntry{}
@@ -785,7 +830,7 @@ func (p *ELFParser) parseSymbolTable(sec SectionHeader) error {
 			sym.Name = readUint32(data[0:4])
 			sym.Info = data[4]
 			sym.Other = data[5]
-			sym.Shndx = binary.LittleEndian.Uint16(data[6:8])
+			sym.Shndx = p.elfOrder().Uint16(data[6:8])
 			sym.Value = readUint64(data[8:16])
 			sym.Size = readUint64(data[16:24])
 		} else {
@@ -794,7 +839,7 @@ func (p *ELFParser) parseSymbolTable(sec SectionHeader) error {
 			sym.Size = uint64(readUint32(data[8:12]))
 			sym.Info = data[12]
 			sym.Other = data[13]
-			sym.Shndx = binary.LittleEndian.Uint16(data[14:16])
+			sym.Shndx = p.elfOrder().Uint16(data[14:16])
 		}
 
 		if sym.Info&0xf == STT_FUNC {
@@ -805,6 +850,13 @@ func (p *ELFParser) parseSymbolTable(sec SectionHeader) error {
 	}
 
 	return nil
+}
+
+func (p *ELFParser) elfOrder() binary.ByteOrder {
+	if p.IsEndian {
+		return binary.LittleEndian
+	}
+	return binary.BigEndian
 }
 
 // GetSymbolName returns the name of a symbol
@@ -823,7 +875,7 @@ func (p *ELFParser) GetSymbolName(sym SymbolEntry) string {
 	}
 
 	strSec := p.Sections[strTabNdx]
-	if uint64(sym.Name)+256 > strSec.Size {
+	if uint64(sym.Name) >= strSec.Size || !p.elfRange(strSec.Offset, strSec.Size) {
 		return ""
 	}
 
@@ -832,12 +884,15 @@ func (p *ELFParser) GetSymbolName(sym SymbolEntry) string {
 		return ""
 	}
 
-	// Read until null terminator
-	end := bytes.IndexByte(p.Data[start:], 0)
-	if end < 0 {
-		end = 256
+	// Never search beyond the string table or the bounded name length.
+	limit := strSec.Size - uint64(sym.Name)
+	if limit > 256 {
+		limit = 256
 	}
-
+	end := bytes.IndexByte(p.Data[start:start+limit], 0)
+	if end < 0 {
+		return ""
+	}
 	return string(p.Data[start : start+uint64(end)])
 }
 
@@ -904,7 +959,7 @@ func (p *ELFParser) ReadCString(vaddr uint64) (string, bool) {
 // printable-text/NUL-termination checks; shared by ReadCString's
 // normal and sectionless paths.
 func (p *ELFParser) readCStringInSection(s SectionHeader, vaddr uint64) (string, bool) {
-	if vaddr < s.Addr || vaddr >= s.Addr+s.Size {
+	if vaddr < s.Addr || vaddr-s.Addr >= s.Size || !p.elfRange(s.Offset, s.Size) {
 		return "", false
 	}
 	fileOff := s.Offset + (vaddr - s.Addr)
@@ -954,7 +1009,7 @@ func (p *ELFParser) GetCodeSections() []CodeSection {
 			// Check if executable flag is set (bit 2)
 			if s.Flags&0x4 != 0 {
 				offset := s.Offset
-				if offset+s.Size > uint64(len(p.Data)) {
+				if !p.elfRange(offset, s.Size) {
 					continue
 				}
 
@@ -988,14 +1043,18 @@ func (p *ELFParser) getSectionName(sec SectionHeader) string {
 	}
 
 	strSec := p.Sections[p.Header.ShStrNdx]
-	start := strSec.Offset + uint64(sec.Name)
-	if start >= uint64(len(p.Data)) {
+	if uint64(sec.Name) >= strSec.Size || !p.elfRange(strSec.Offset, strSec.Size) {
 		return ""
 	}
+	start := strSec.Offset + uint64(sec.Name)
 
-	end := bytes.IndexByte(p.Data[start:], 0)
+	limit := strSec.Size - uint64(sec.Name)
+	if limit > 64 {
+		limit = 64
+	}
+	end := bytes.IndexByte(p.Data[start:start+limit], 0)
 	if end < 0 {
-		end = 64
+		return ""
 	}
 
 	return string(p.Data[start : start+uint64(end)])
@@ -1123,6 +1182,13 @@ func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
 			entSize = 16
 		}
 	}
+	minSize := uint64(16)
+	if p.Header.Class == ELFCLASS64 {
+		minSize = 24
+	}
+	if entSize < minSize || dynsymSec.Size%entSize != 0 || dynsymSec.Offset%4 != 0 || !p.elfRange(dynsymSec.Offset, dynsymSec.Size) || dynsymSec.Link >= uint32(len(p.Sections)) {
+		return nil, 0, fmt.Errorf("invalid ELF dynamic symbol table")
+	}
 	count := dynsymSec.Size / entSize
 	syms := make([]SymbolEntry, 0, count)
 
@@ -1138,16 +1204,14 @@ func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
 
 	offset := dynsymSec.Offset
 	for i := uint64(0); i < count; i++ {
-		if offset+entSize > uint64(len(p.Data)) {
-			break
-		}
+		// Validated the complete table before allocating syms.
 		data := p.Data[offset:]
 		sym := SymbolEntry{}
 		if p.Header.Class == ELFCLASS64 {
 			sym.Name = readUint32(data[0:4])
 			sym.Info = data[4]
 			sym.Other = data[5]
-			sym.Shndx = binary.LittleEndian.Uint16(data[6:8])
+			sym.Shndx = p.elfOrder().Uint16(data[6:8])
 			sym.Value = readUint64(data[8:16])
 			sym.Size = readUint64(data[16:24])
 		} else {
@@ -1156,7 +1220,7 @@ func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
 			sym.Size = uint64(readUint32(data[8:12]))
 			sym.Info = data[12]
 			sym.Other = data[13]
-			sym.Shndx = binary.LittleEndian.Uint16(data[14:16])
+			sym.Shndx = p.elfOrder().Uint16(data[14:16])
 		}
 		syms = append(syms, sym)
 		offset += entSize
@@ -1176,6 +1240,13 @@ func (p *ELFParser) parseRelaSection(sec SectionHeader) []RelaEntry {
 			entSize = 12
 		}
 	}
+	minSize := uint64(12)
+	if p.Header.Class == ELFCLASS64 {
+		minSize = 24
+	}
+	if entSize < minSize || sec.Size%entSize != 0 || sec.Offset%4 != 0 || !p.elfRange(sec.Offset, sec.Size) {
+		return nil
+	}
 	count := sec.Size / entSize
 	entries := make([]RelaEntry, 0, count)
 
@@ -1191,9 +1262,7 @@ func (p *ELFParser) parseRelaSection(sec SectionHeader) []RelaEntry {
 
 	offset := sec.Offset
 	for i := uint64(0); i < count; i++ {
-		if offset+entSize > uint64(len(p.Data)) {
-			break
-		}
+		// Validated the complete table before allocating entries.
 		data := p.Data[offset:]
 		if p.Header.Class == ELFCLASS64 {
 			entries = append(entries, RelaEntry{
@@ -1293,6 +1362,9 @@ func (p *ELFParser) ResolvePLT() (map[uint64]string, error) {
 	}
 	defer d.Close()
 
+	if !p.elfRange(pltSec.Offset, pltSec.Size) {
+		return nil, fmt.Errorf("invalid ELF .plt range")
+	}
 	pltCode := p.Data[pltSec.Offset : pltSec.Offset+pltSec.Size]
 	insns, err := d.DisassembleDetailed(pltCode, pltSec.Addr)
 	if err != nil {
@@ -1440,21 +1512,22 @@ func (p *ELFParser) ResolveGOT() (map[uint64]string, error) {
 // when it recognizes a switch idiom.
 func (p *ELFParser) DataReader() func(addr uint64, n int) ([]byte, bool) {
 	return func(addr uint64, n int) ([]byte, bool) {
+		if n <= 0 {
+			return nil, false
+		}
 		for _, s := range p.Sections {
-			if s.Type != SHT_PROGBITS || s.Size == 0 {
+			if s.Type != SHT_PROGBITS || s.Size == 0 || !p.elfRange(s.Offset, s.Size) {
 				continue
 			}
-			if addr < s.Addr || addr >= s.Addr+s.Size {
+			if addr < s.Addr || addr-s.Addr >= s.Size {
 				continue
 			}
 			off := s.Offset + (addr - s.Addr)
-			end := off + uint64(n)
-			if end > s.Offset+s.Size {
-				end = s.Offset + s.Size
+			available := s.Size - (addr - s.Addr)
+			if available > uint64(n) {
+				available = uint64(n)
 			}
-			if end > uint64(len(p.Data)) {
-				end = uint64(len(p.Data))
-			}
+			end := off + available
 			if end <= off {
 				return nil, false
 			}

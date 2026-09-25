@@ -389,11 +389,21 @@ func (m *Metadata) readTables() {
 			dic := make(map[uint32]int)
 			m.attributeRanges[i] = dic
 			start := int(m.imageDefs[i].i32("customAttributeStart"))
-			count := int(m.imageDefs[i].u32("customAttributeCount"))
-			for j := start; j < start+count; j++ {
-				if j < 0 {
-					continue
-				}
+			count := uint64(m.imageDefs[i].u32("customAttributeCount"))
+			if start < 0 {
+				continue
+			}
+			limit := len(m.attributeTypeRanges)
+			if v >= 29 {
+				limit = len(m.attributeDataRanges)
+			}
+			if start >= limit {
+				continue
+			}
+			if count > uint64(limit-start) {
+				count = uint64(limit - start)
+			}
+			for j := start; j < start+int(count); j++ {
 				if v >= 29 {
 					if j < len(m.attributeDataRanges) {
 						dic[m.attributeDataRanges[j].u32("token")] = j
@@ -420,11 +430,14 @@ func (m *Metadata) processMetadataUsage() {
 	for _, l := range lists {
 		start := l.u32("start")
 		count := l.u32("count")
-		for i := uint32(0); i < count; i++ {
-			off := start + i
-			if int(off) >= len(pairs) {
-				continue
-			}
+		if uint64(start) >= uint64(len(pairs)) {
+			continue
+		}
+		end := uint64(start) + uint64(count)
+		if end > uint64(len(pairs)) {
+			end = uint64(len(pairs))
+		}
+		for off := uint64(start); off < end; off++ {
 			p := pairs[off]
 			usage := encodedIndexType(p.u32("encodedSourceIndex"))
 			decoded := m.DecodedMethodIndex(p.u32("encodedSourceIndex"))
@@ -457,8 +470,8 @@ func (m *Metadata) GetStringFromIndex(index uint32) string {
 	if s, ok := m.stringCache[index]; ok {
 		return s
 	}
-	base := int(m.Header.u32("stringOffset")) + int(index)
-	if base < 0 || base >= len(m.Data) {
+	base, _, ok := byteRange(m.Data, uint64(m.Header.u32("stringOffset"))+uint64(index), 1)
+	if !ok {
 		m.stringCache[index] = ""
 		return ""
 	}
@@ -473,16 +486,15 @@ func (m *Metadata) GetStringFromIndex(index uint32) string {
 
 // GetStringLiteralFromIndex reads a managed string literal.
 func (m *Metadata) GetStringLiteralFromIndex(index uint32) string {
-	if int(index) >= len(m.stringLiterals) {
+	if uint64(index) >= uint64(len(m.stringLiterals)) {
 		return ""
 	}
 	lit := m.stringLiterals[index]
-	base := int(m.Header.u32("stringLiteralDataOffset")) + int(lit.u32("dataIndex"))
-	length := int(lit.u32("length"))
-	if base < 0 || base+length > len(m.Data) {
+	base, end, ok := byteRange(m.Data, uint64(m.Header.u32("stringLiteralDataOffset"))+uint64(lit.u32("dataIndex")), uint64(lit.u32("length")))
+	if !ok {
 		return ""
 	}
-	return string(m.Data[base : base+length])
+	return string(m.Data[base:end])
 }
 
 func (m *Metadata) GetFieldDefaultValueFromIndex(index int32) (record, bool) {
@@ -549,39 +561,33 @@ func (m *Metadata) NestedTypeIndex(offset int) int32 { return m.nestedTypeIndice
 func (m *Metadata) FieldRef(index int) record { return m.fieldRefs[index] }
 
 func readInt32Array(data []byte, off uint32, size int32) []int32 {
-	n := int(size) / 4
-	if off == 0 || size <= 0 {
+	if off == 0 || size <= 0 || size%4 != 0 {
 		return nil
 	}
-	end := int(off) + n*4
-	if end > len(data) || int(off) < 0 {
-		n = (len(data) - int(off)) / 4
-		if n < 0 {
-			return nil
-		}
+	start, _, ok := byteRange(data, uint64(off), uint64(size))
+	if !ok {
+		return nil
 	}
+	n := int(size) / 4
 	out := make([]int32, n)
 	for i := 0; i < n; i++ {
-		out[i] = leI32(data, int(off)+i*4)
+		out[i] = leI32(data, start+i*4)
 	}
 	return out
 }
 
 func readUint32Array(data []byte, off uint32, size int32) []uint32 {
-	n := int(size) / 4
-	if off == 0 || size <= 0 {
+	if off == 0 || size <= 0 || size%4 != 0 {
 		return nil
 	}
-	end := int(off) + n*4
-	if end > len(data) || int(off) < 0 {
-		n = (len(data) - int(off)) / 4
-		if n < 0 {
-			return nil
-		}
+	start, _, ok := byteRange(data, uint64(off), uint64(size))
+	if !ok {
+		return nil
 	}
+	n := int(size) / 4
 	out := make([]uint32, n)
 	for i := 0; i < n; i++ {
-		out[i] = leU32(data, int(off)+i*4)
+		out[i] = leU32(data, start+i*4)
 	}
 	return out
 }

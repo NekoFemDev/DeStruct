@@ -106,21 +106,21 @@ func newELF(data []byte) (*elfFile, error) {
 }
 
 func (e *elfFile) u16(off int) uint16 {
-	if off < 0 || off+2 > len(e.data) {
+	if off < 0 || off > len(e.data) || len(e.data)-off < 2 {
 		return 0
 	}
 	return e.order.Uint16(e.data[off:])
 }
 
 func (e *elfFile) u32(off int) uint32 {
-	if off < 0 || off+4 > len(e.data) {
+	if off < 0 || off > len(e.data) || len(e.data)-off < 4 {
 		return 0
 	}
 	return e.order.Uint32(e.data[off:])
 }
 
 func (e *elfFile) u64(off int) uint64 {
-	if off < 0 || off+8 > len(e.data) {
+	if off < 0 || off > len(e.data) || len(e.data)-off < 8 {
 		return 0
 	}
 	return e.order.Uint64(e.data[off:])
@@ -133,8 +133,15 @@ func (e *elfFile) parsePhdrs64() {
 	if phentsize <= 0 {
 		phentsize = 56
 	}
+	if phentsize < 56 {
+		return
+	}
+	start, _, ok := byteRange(e.data, phoff, uint64(phnum)*uint64(phentsize))
+	if !ok {
+		return
+	}
 	for i := 0; i < phnum; i++ {
-		o := int(phoff) + i*phentsize
+		o := start + i*phentsize
 		if o+56 > len(e.data) {
 			break
 		}
@@ -156,8 +163,15 @@ func (e *elfFile) parsePhdrs32() {
 	if phentsize <= 0 {
 		phentsize = 32
 	}
+	if phentsize < 32 {
+		return
+	}
+	start, _, ok := byteRange(e.data, phoff, uint64(phnum)*uint64(phentsize))
+	if !ok {
+		return
+	}
 	for i := 0; i < phnum; i++ {
-		o := int(phoff) + i*phentsize
+		o := start + i*phentsize
 		if o+32 > len(e.data) {
 			break
 		}
@@ -182,7 +196,11 @@ func (e *elfFile) parseDynamic() {
 		if !e.is64 {
 			ent = 8
 		}
-		for off := int(ph.off); off+ent <= int(ph.off+ph.filesz) && off+ent <= len(e.data); off += ent {
+		start, end, ok := byteRange(e.data, ph.off, ph.filesz)
+		if !ok {
+			continue
+		}
+		for off := start; off <= end-ent; off += ent {
 			var tag int64
 			var val uint64
 			if e.is64 {
@@ -212,6 +230,9 @@ func (e *elfFile) parseSymbols() {
 		syment = 16
 	}
 	if v, ok := e.dyn[dtSyment]; ok && v != 0 {
+		if v < uint64(syment) || v > uint64(len(e.data)) {
+			return
+		}
 		syment = int(v)
 	}
 	off, ok := e.mapVATR(symtab)
@@ -222,11 +243,16 @@ func (e *elfFile) parseSymbols() {
 	if v, ok := e.dyn[dtStrtab]; ok {
 		strtab = v
 	}
-	for i := 0; i < int(count); i++ {
-		o := int(off) + i*syment
-		if o+syment > len(e.data) {
-			break
-		}
+	start, _, ok := byteRange(e.data, off, 0)
+	if !ok {
+		return
+	}
+	available := (len(e.data) - start) / syment
+	if count < uint64(available) {
+		available = int(count)
+	}
+	for i := 0; i < available; i++ {
+		o := start + i*syment
 		var nameOff uint32
 		var sym elfSymbol
 		if e.is64 {
@@ -239,7 +265,9 @@ func (e *elfFile) parseSymbols() {
 			sym.size = uint64(e.u32(o + 8))
 		}
 		if strtab != 0 && nameOff != 0 {
-			sym.name = e.readCString(strtab + uint64(nameOff))
+			if strtab <= ^uint64(0)-uint64(nameOff) {
+				sym.name = e.readCString(strtab + uint64(nameOff))
+			}
 		}
 		e.symbols = append(e.symbols, sym)
 	}
@@ -251,7 +279,9 @@ func (e *elfFile) parseSymbols() {
 func (e *elfFile) symbolCount() uint64 {
 	if hash, ok := e.dyn[dtHash]; ok {
 		if off, ok := e.mapVATR(hash); ok {
-			return uint64(e.u32(int(off) + 4)) // nchain
+			if start, _, valid := byteRange(e.data, off, 8); valid {
+				return uint64(e.u32(start + 4)) // nchain
+			}
 		}
 	}
 	hash, ok := e.dyn[dtGnuHash]
@@ -262,12 +292,23 @@ func (e *elfFile) symbolCount() uint64 {
 	if !ok {
 		return 0
 	}
-	o := int(off)
+	o, _, ok := byteRange(e.data, off, 16)
+	if !ok {
+		return 0
+	}
 	nbuckets := e.u32(o)
 	symoffset := e.u32(o + 4)
 	bloomSize := e.u32(o + 8)
-	bucketsOff := o + 16 + 8*int(bloomSize)
-	if bucketsOff+4*int(nbuckets) > len(e.data) {
+	bloomWord := uint64(8)
+	if !e.is64 {
+		bloomWord = 4
+	}
+	_, bucketsOff, ok := recordRange(e.data, off+16, uint64(bloomSize), bloomWord)
+	if !ok {
+		return 0
+	}
+	_, chains, ok := recordRange(e.data, uint64(bucketsOff), uint64(nbuckets), 4)
+	if !ok {
 		return 0
 	}
 	var last uint32
@@ -280,9 +321,11 @@ func (e *elfFile) symbolCount() uint64 {
 	if last < symoffset {
 		return uint64(symoffset)
 	}
-	chains := bucketsOff + 4*int(nbuckets)
-	pos := chains + 4*int(last-symoffset)
-	for pos+4 <= len(e.data) {
+	_, pos, ok := recordRange(e.data, uint64(chains), uint64(last-symoffset), 4)
+	if !ok {
+		return 0
+	}
+	for pos <= len(e.data)-4 {
 		c := e.u32(pos)
 		pos += 4
 		last++
@@ -297,17 +340,24 @@ func (e *elfFile) applyRelocations() {
 	if rela, ok := e.dyn[dtRela]; ok {
 		size := e.dyn[dtRelaSz]
 		ent := 24
+		if !e.is64 {
+			ent = 12
+		}
 		if v, ok := e.dyn[dtRelaEnt]; ok && v != 0 {
-			ent = int(v)
+			if v < uint64(ent) || v > uint64(len(e.data)) {
+				ent = 0
+			} else {
+				ent = int(v)
+			}
 		}
 		off, ok := e.mapVATR(rela)
-		if ok {
-			for i := 0; i+ent <= int(size); i += ent {
-				o := int(off) + i
-				if o+ent > len(e.data) {
-					break
+		if ok && ent != 0 {
+			start, _, valid := byteRange(e.data, off, size)
+			if valid {
+				for i := uint64(0); i < size/uint64(ent); i++ {
+					o := start + int(i)*ent
+					e.applyRela64(o, ent)
 				}
-				e.applyRela64(o, ent)
 			}
 		}
 	}
@@ -315,16 +365,20 @@ func (e *elfFile) applyRelocations() {
 		size := e.dyn[dtRelSz]
 		ent := 8
 		if v, ok := e.dyn[dtRelEnt]; ok && v != 0 {
-			ent = int(v)
+			if v < uint64(ent) || v > uint64(len(e.data)) {
+				ent = 0
+			} else {
+				ent = int(v)
+			}
 		}
 		off, ok := e.mapVATR(rel)
-		if ok {
-			for i := 0; i+ent <= int(size); i += ent {
-				o := int(off) + i
-				if o+ent > len(e.data) {
-					break
+		if ok && ent != 0 {
+			start, _, valid := byteRange(e.data, off, size)
+			if valid {
+				for i := uint64(0); i < size/uint64(ent); i++ {
+					o := start + int(i)*ent
+					e.applyRel32(o)
 				}
-				e.applyRel32(o)
 			}
 		}
 	}
@@ -369,11 +423,11 @@ func (e *elfFile) applyRela64(o, ent int) {
 		return
 	}
 	if e.is64 {
-		if int(target)+8 <= len(e.data) {
-			e.order.PutUint64(e.data[target:], value)
+		if start, _, ok := byteRange(e.data, target, 8); ok {
+			e.order.PutUint64(e.data[start:], value)
 		}
-	} else if int(target)+4 <= len(e.data) {
-		e.order.PutUint32(e.data[target:], uint32(value))
+	} else if start, _, ok := byteRange(e.data, target, 4); ok {
+		e.order.PutUint32(e.data[start:], uint32(value))
 	}
 }
 
@@ -386,18 +440,19 @@ func (e *elfFile) applyRel32(o int) {
 	rtype := rInfo & 0xff
 	rsym := rInfo >> 8
 	target, ok := e.mapVATR(rOffset)
-	if !ok || int(target)+4 > len(e.data) {
+	start, _, valid := byteRange(e.data, target, 4)
+	if !ok || !valid {
 		return
 	}
 	if e.machine == em386 && rtype == r386_32 {
-		e.order.PutUint32(e.data[target:], uint32(e.symValue(uint64(rsym))))
+		e.order.PutUint32(e.data[start:], uint32(e.symValue(uint64(rsym))))
 	} else if e.machine != em386 && rtype == rARM_ABS32 {
-		e.order.PutUint32(e.data[target:], uint32(e.symValue(uint64(rsym))))
+		e.order.PutUint32(e.data[start:], uint32(e.symValue(uint64(rsym))))
 	}
 }
 
 func (e *elfFile) symValue(index uint64) uint64 {
-	if int(index) < len(e.symbols) {
+	if index < uint64(len(e.symbols)) {
 		return e.symbols[index].value
 	}
 	return 0
@@ -409,8 +464,13 @@ func (e *elfFile) mapVATR(addr uint64) (uint64, bool) {
 		if ph.typ != ptLoad {
 			continue
 		}
-		if addr >= ph.vaddr && addr < ph.vaddr+ph.filesz {
-			return ph.off + (addr - ph.vaddr), true
+		if addr >= ph.vaddr && addr-ph.vaddr < ph.filesz {
+			delta := addr - ph.vaddr
+			if ph.off <= ^uint64(0)-delta {
+				if _, _, ok := byteRange(e.data, ph.off+delta, 1); ok {
+					return ph.off + delta, true
+				}
+			}
 		}
 	}
 	return 0, false
@@ -422,7 +482,7 @@ func (e *elfFile) mapRTVA(addr uint64) uint64 {
 		if ph.typ != ptLoad {
 			continue
 		}
-		if addr >= ph.off && addr < ph.off+ph.filesz {
+		if addr >= ph.off && addr-ph.off < ph.filesz && ph.vaddr <= ^uint64(0)-(addr-ph.off) {
 			return addr - ph.off + ph.vaddr
 		}
 	}
@@ -434,7 +494,10 @@ func (e *elfFile) readU64(addr uint64) uint64 {
 	if !ok {
 		return 0
 	}
-	return e.u64(int(off))
+	if start, _, ok := byteRange(e.data, off, 8); ok {
+		return e.u64(start)
+	}
+	return 0
 }
 
 func (e *elfFile) readU32(addr uint64) uint32 {
@@ -442,11 +505,14 @@ func (e *elfFile) readU32(addr uint64) uint32 {
 	if !ok {
 		return 0
 	}
-	return e.u32(int(off))
+	if start, _, ok := byteRange(e.data, off, 4); ok {
+		return e.u32(start)
+	}
+	return 0
 }
 
 func (e *elfFile) readBytes(off, n int) []byte {
-	if off < 0 || n < 0 || off+n > len(e.data) {
+	if off < 0 || n < 0 || uint64(off) > uint64(len(e.data)) || uint64(n) > uint64(len(e.data))-uint64(off) {
 		return nil
 	}
 	return e.data[off : off+n]
@@ -458,7 +524,10 @@ func (e *elfFile) readCString(addr uint64) string {
 	if !ok {
 		return ""
 	}
-	end := int(off)
+	end, _, ok := byteRange(e.data, off, 1)
+	if !ok {
+		return ""
+	}
 	for end < len(e.data) && e.data[end] != 0 {
 		end++
 	}
@@ -480,6 +549,9 @@ func (e *elfFile) execSections() []searchSection {
 		if ph.typ != ptLoad || ph.memsz == 0 {
 			continue
 		}
+		if !e.validSection(ph) {
+			continue
+		}
 		switch ph.flags {
 		case pfX, pfX | pfW, pfX | pfR, pfX | pfW | pfR:
 			out = append(out, searchSection{
@@ -497,6 +569,9 @@ func (e *elfFile) dataSections() []searchSection {
 		if ph.typ != ptLoad || ph.memsz == 0 {
 			continue
 		}
+		if !e.validSection(ph) {
+			continue
+		}
 		switch ph.flags {
 		case pfW, pfR, pfW | pfR:
 			out = append(out, searchSection{
@@ -506,6 +581,13 @@ func (e *elfFile) dataSections() []searchSection {
 		}
 	}
 	return out
+}
+
+func (e *elfFile) validSection(ph elfPhdr) bool {
+	if _, _, ok := byteRange(e.data, ph.off, ph.filesz); !ok {
+		return false
+	}
+	return ph.vaddr <= ^uint64(0)-ph.memsz && ph.vaddr <= ^uint64(0)-ph.filesz
 }
 
 // findReferences scans the data sections once and returns every slot
@@ -523,7 +605,7 @@ func (e *elfFile) findReferences(targets map[uint64]struct{}) map[uint64][]uint6
 		if end > uint64(len(e.data)) {
 			end = uint64(len(e.data))
 		}
-		for pos+8 <= end {
+		for pos <= end && end-pos >= 8 {
 			v := e.u64(int(pos))
 			if _, ok := targets[v]; ok {
 				out[v] = append(out[v], pos-sec.offset+sec.address)

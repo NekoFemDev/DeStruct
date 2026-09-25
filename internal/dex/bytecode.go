@@ -554,24 +554,33 @@ type Instruction struct {
 }
 
 func readU16(code []byte, unit int) uint16 {
+	if unit < 0 || unit > len(code)/2 {
+		return 0
+	}
 	i := unit * 2
-	if i < 0 || i+2 > len(code) {
+	if i+2 > len(code) {
 		return 0
 	}
 	return uint16(code[i]) | uint16(code[i+1])<<8
 }
 
 func readU32(code []byte, unit int) uint32 {
+	if unit < 0 || unit > len(code)/2 {
+		return 0
+	}
 	i := unit * 2
-	if i < 0 || i+4 > len(code) {
+	if i+4 > len(code) {
 		return 0
 	}
 	return uint32(code[i]) | uint32(code[i+1])<<8 | uint32(code[i+2])<<16 | uint32(code[i+3])<<24
 }
 
 func readU64(code []byte, unit int) uint64 {
+	if unit < 0 || unit > len(code)/2 {
+		return 0
+	}
 	i := unit * 2
-	if i < 0 || i+8 > len(code) {
+	if i+8 > len(code) {
 		return 0
 	}
 	var v uint64
@@ -964,53 +973,62 @@ func decodeInstructionMode(code []byte, off int, compact23x bool) Instruction {
 // parseSwitchPayload decodes a packed-switch or sparse-switch payload,
 // returning it and its size in code units.
 func parseSwitchPayload(code []byte, off int) (*SwitchPayload, int) {
+	if off < 0 || off > len(code)/2 || off+4 > len(code)/2 {
+		return nil, 0
+	}
 	ident := readU16(code, off)
-	size := int(readU16(code, off+1))
-	if size < 0 || size > 1<<20 {
-		size = 0
+	size := uint64(readU16(code, off+1))
+	if ident == pseudoPackedSwitch {
+		if uint64(off)*2+8 > uint64(len(code)) || uint64(size) > uint64((len(code)-((off+4)*2))/4) {
+			return nil, 0
+		}
+	} else {
+		if uint64(off)*2+4 > uint64(len(code)) || uint64(size) > uint64((len(code)-((off+2)*2))/8) {
+			return nil, 0
+		}
 	}
 
 	if ident == pseudoPackedSwitch {
 		p := &SwitchPayload{Packed: true, FirstKey: int32(readU32(code, off+2))}
-		p.Targets = make([]int32, size)
-		for i := 0; i < size; i++ {
-			p.Targets[i] = int32(readU32(code, off+4+i*2))
+		p.Targets = make([]int32, int(size))
+		for i := uint64(0); i < size; i++ {
+			p.Targets[i] = int32(readU32(code, off+4+int(i)*2))
 		}
-		return p, 4 + size*2
+		return p, 4 + int(size)*2
 	}
 
 	// sparse-switch: keys then targets
 	p := &SwitchPayload{}
-	p.Keys = make([]int32, size)
-	p.Targets = make([]int32, size)
-	for i := 0; i < size; i++ {
-		p.Keys[i] = int32(readU32(code, off+2+i*2))
+	p.Keys = make([]int32, int(size))
+	p.Targets = make([]int32, int(size))
+	for i := uint64(0); i < size; i++ {
+		p.Keys[i] = int32(readU32(code, off+2+int(i)*2))
 	}
-	base := off + 2 + size*2
-	for i := 0; i < size; i++ {
-		p.Targets[i] = int32(readU32(code, base+i*2))
+	base := off + 2 + int(size)*2
+	for i := uint64(0); i < size; i++ {
+		p.Targets[i] = int32(readU32(code, base+int(i)*2))
 	}
-	return p, 2 + size*4
+	return p, 2 + int(size)*4
 }
 
 // parseArrayPayload decodes a fill-array-data payload, returning it and its
 // size in code units.
 func parseArrayPayload(code []byte, off int) (*ArrayData, int) {
-	width := int(readU16(code, off+1))
-	size := int(readU32(code, off+2))
-	if size < 0 || size > 1<<20 {
-		size = 0
+	if off < 0 || off > len(code)/2 || off+4 > len(code)/2 {
+		return nil, 0
 	}
-	if width <= 0 || width > 8 {
-		width = 1
+	width := int(readU16(code, off+1))
+	size := uint64(readU32(code, off+2))
+	if width <= 0 || width > 8 || size > uint64((len(code)-off*2-8)/width) {
+		return nil, 0
 	}
 
 	a := &ArrayData{ElementWidth: width}
 	if size > 0 {
-		a.Elements = make([]uint64, size)
+		a.Elements = make([]uint64, int(size))
 		base := off*2 + 8
-		for i := 0; i < size; i++ {
-			start := base + i*width
+		for i := uint64(0); i < size; i++ {
+			start := base + int(i)*width
 			if start+width > len(code) {
 				break
 			}
@@ -1022,6 +1040,6 @@ func parseArrayPayload(code []byte, off int) (*ArrayData, int) {
 		}
 	}
 
-	dataUnits := (size*width + 1) / 2
-	return a, 4 + dataUnits
+	dataUnits := (size*uint64(width) + 1) / 2
+	return a, 4 + int(dataUnits)
 }

@@ -7,6 +7,8 @@ import (
 	"math"
 	"os"
 	"strings"
+
+	"github.com/destruct/destruct/internal/archivelimits"
 )
 
 const (
@@ -36,39 +38,39 @@ const (
 )
 
 type ClassFile struct {
-	Magic            uint32
-	MinorVersion     uint16
-	MajorVersion     uint16
-	ConstantPool     []ConstantPoolEntry
-	AccessFlags      uint16
-	ThisClass        uint16
-	SuperClass       uint16
-	Interfaces       []uint16
-	Fields           []FieldInfo
-	Methods          []MethodInfo
-	Attributes       []AttributeInfo
-	SourceFile       string
+	Magic        uint32
+	MinorVersion uint16
+	MajorVersion uint16
+	ConstantPool []ConstantPoolEntry
+	AccessFlags  uint16
+	ThisClass    uint16
+	SuperClass   uint16
+	Interfaces   []uint16
+	Fields       []FieldInfo
+	Methods      []MethodInfo
+	Attributes   []AttributeInfo
+	SourceFile   string
 }
 
 type ConstantPoolEntry struct {
-	Tag  ConstantPoolEntryType
-	UTF8 *ConstantUtf8
-	Integer *ConstantInteger
-	Float *ConstantFloat
-	Long *ConstantLong
-	Double *ConstantDouble
-	Class *ConstantClass
-	String *ConstantString
-	Fieldref *ConstantFieldref
-	Methodref *ConstantMethodref
+	Tag                ConstantPoolEntryType
+	UTF8               *ConstantUtf8
+	Integer            *ConstantInteger
+	Float              *ConstantFloat
+	Long               *ConstantLong
+	Double             *ConstantDouble
+	Class              *ConstantClass
+	String             *ConstantString
+	Fieldref           *ConstantFieldref
+	Methodref          *ConstantMethodref
 	InterfaceMethodref *ConstantInterfaceMethodref
-	NameAndType *ConstantNameAndType
-	MethodHandle *ConstantMethodHandle
-	MethodType *ConstantMethodType
-	Dynamic *ConstantDynamic
-	InvokeDynamic *ConstantInvokeDynamic
-	Module *ConstantModule
-	Package *ConstantPackage
+	NameAndType        *ConstantNameAndType
+	MethodHandle       *ConstantMethodHandle
+	MethodType         *ConstantMethodType
+	Dynamic            *ConstantDynamic
+	InvokeDynamic      *ConstantInvokeDynamic
+	Module             *ConstantModule
+	Package            *ConstantPackage
 }
 
 type ConstantUtf8 struct {
@@ -169,17 +171,17 @@ const (
 )
 
 type FieldInfo struct {
-	AccessFlags uint16
-	NameIndex   uint16
+	AccessFlags     uint16
+	NameIndex       uint16
 	DescriptorIndex uint16
-	Attributes  []AttributeInfo
+	Attributes      []AttributeInfo
 }
 
 type MethodInfo struct {
-	AccessFlags uint16
-	NameIndex   uint16
+	AccessFlags     uint16
+	NameIndex       uint16
 	DescriptorIndex uint16
-	Attributes  []AttributeInfo
+	Attributes      []AttributeInfo
 }
 
 type AttributeInfo struct {
@@ -203,7 +205,7 @@ type ExceptionEntry struct {
 }
 
 type LineNumberEntry struct {
-	StartPC   uint16
+	StartPC    uint16
 	LineNumber uint16
 }
 
@@ -624,6 +626,9 @@ func parseAttributes(cr *reader, count uint16, pool []ConstantPoolEntry) ([]Attr
 		if err != nil {
 			return nil, err
 		}
+		if uint64(length) > archivelimits.MaxEntrySize {
+			return nil, fmt.Errorf("attribute %d length %d exceeds %d-byte limit", i, length, archivelimits.MaxEntrySize)
+		}
 		data, err := cr.readBytes(int(length))
 		if err != nil {
 			return nil, err
@@ -753,13 +758,16 @@ func parseCodeAttribute(data []byte) (*CodeAttribute, error) {
 		MaxLocals: binary.BigEndian.Uint16(data[2:4]),
 	}
 
-	codeLen := int(binary.BigEndian.Uint32(data[4:8]))
-	if len(data) < 8+codeLen {
+	codeLen := binary.BigEndian.Uint32(data[4:8])
+	if uint64(codeLen) > uint64(len(data)-8) {
 		return nil, fmt.Errorf("code length exceeds data")
 	}
-	code.Code = data[8 : 8+codeLen]
+	code.Code = data[8 : 8+int(codeLen)]
 
-	offset := 8 + codeLen
+	offset := 8 + int(codeLen)
+	if offset+2 > len(data) {
+		return nil, fmt.Errorf("code attribute truncated: missing exception table")
+	}
 	excTableLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
 	offset += 2
 
@@ -785,12 +793,21 @@ func parseCodeAttribute(data []byte) (*CodeAttribute, error) {
 			if offset+6 > len(data) {
 				break
 			}
-			attrLen := int(binary.BigEndian.Uint32(data[offset+2 : offset+6]))
+			attrLen := uint64(binary.BigEndian.Uint32(data[offset+2 : offset+6]))
+			if attrLen > uint64(len(data)-(offset+6)) {
+				// Declared length runs past the attribute; keep the
+				// available bytes and stop - nothing follows to read.
+				code.Attributes[i] = AttributeInfo{
+					NameIndex: binary.BigEndian.Uint16(data[offset : offset+2]),
+					Data:      data[offset+6:],
+				}
+				break
+			}
 			code.Attributes[i] = AttributeInfo{
 				NameIndex: binary.BigEndian.Uint16(data[offset : offset+2]),
-				Data:      data[offset+6 : min(offset+6+attrLen, len(data))],
+				Data:      data[offset+6 : offset+6+int(attrLen)],
 			}
-			offset += 6 + attrLen
+			offset += 6 + int(attrLen)
 		}
 	}
 

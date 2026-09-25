@@ -273,6 +273,29 @@ func TestDecodeFillArrayData(t *testing.T) {
 	}
 }
 
+func TestMalformedPayloadsDoNotAllocateOrReadPastInput(t *testing.T) {
+	// Both payload headers advertise more records than the remaining bytes.
+	packed := []byte{0x00, 0x01, 0xff, 0xff, 0, 0, 0, 0}
+	if payload, size := parseSwitchPayload(packed, 0); payload != nil || size != 0 {
+		t.Fatalf("truncated packed payload = (%v, %d)", payload, size)
+	}
+
+	array := []byte{0x00, 0x03, 0x08, 0x00, 0xff, 0xff, 0xff, 0xff}
+	if payload, size := parseArrayPayload(array, 0); payload != nil || size != 0 {
+		t.Fatalf("truncated array payload = (%v, %d)", payload, size)
+	}
+}
+
+func TestMalformedRangesAreRejected(t *testing.T) {
+	dex := &DexFile{data: make([]byte, 16)}
+	if err := dex.checkRange64(^uint64(0)-1, 2, 4, "test"); err == nil {
+		t.Fatal("overflowing range accepted")
+	}
+	if err := dex.checkRange(12, 2, 4, "test"); err == nil {
+		t.Fatal("out-of-range records accepted")
+	}
+}
+
 func TestDecodeMUTF8(t *testing.T) {
 	// 'A', encoded NUL, U+00E9, U+1F600 as a UTF-16 surrogate pair.
 	raw := []byte{
