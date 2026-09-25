@@ -218,18 +218,40 @@ type LocalVariableEntry struct {
 }
 
 type reader struct {
-	r   io.Reader
-	buf []byte
+	r         io.Reader
+	buf       []byte
+	remaining int64 // readable bytes left when the total size is known, else -1
 }
 
+// maxStreamAttributeSize bounds a single attribute when the total input size
+// is unknown (streaming callers). Attributes of real class files are far
+// smaller; Code attributes cannot exceed 65535 bytes by JVMS §4.7.3.
+const maxStreamAttributeSize = 16 << 20
+
 func newReader(r io.Reader) *reader {
-	return &reader{r: r}
+	return newReaderSized(r, -1)
+}
+
+func newReaderSized(r io.Reader, size int64) *reader {
+	return &reader{r: r, remaining: size}
+}
+
+// fits reports whether a declared byte count can still be satisfied by the
+// input. For streams of unknown size the static cap applies.
+func (r *reader) fits(n uint64) bool {
+	if r.remaining >= 0 {
+		return n <= uint64(r.remaining)
+	}
+	return n <= maxStreamAttributeSize
 }
 
 func (r *reader) readByte() (byte, error) {
 	b := make([]byte, 1)
 	if _, err := io.ReadFull(r.r, b); err != nil {
 		return 0, err
+	}
+	if r.remaining >= 0 {
+		r.remaining--
 	}
 	return b[0], nil
 }
@@ -239,6 +261,9 @@ func (r *reader) readUint16() (uint16, error) {
 	if _, err := io.ReadFull(r.r, b); err != nil {
 		return 0, err
 	}
+	if r.remaining >= 0 {
+		r.remaining -= 2
+	}
 	return binary.BigEndian.Uint16(b), nil
 }
 
@@ -247,13 +272,22 @@ func (r *reader) readUint32() (uint32, error) {
 	if _, err := io.ReadFull(r.r, b); err != nil {
 		return 0, err
 	}
+	if r.remaining >= 0 {
+		r.remaining -= 4
+	}
 	return binary.BigEndian.Uint32(b), nil
 }
 
 func (r *reader) readBytes(n int) ([]byte, error) {
+	if n < 0 || !r.fits(uint64(n)) {
+		return nil, io.ErrUnexpectedEOF
+	}
 	b := make([]byte, n)
 	if _, err := io.ReadFull(r.r, b); err != nil {
 		return nil, err
+	}
+	if r.remaining >= 0 {
+		r.remaining -= int64(n)
 	}
 	return b, nil
 }
@@ -265,15 +299,23 @@ func ParseClassFile(filename string) (*ClassFile, error) {
 	}
 	defer f.Close()
 
-	return parseClassFile(f)
+	size := int64(-1)
+	if info, err := f.Stat(); err == nil {
+		size = info.Size()
+	}
+	return parseClassFileSized(f, size)
 }
 
 func ParseClassFileFromReader(r io.Reader) (*ClassFile, error) {
-	return parseClassFile(r)
+	return parseClassFileSized(r, -1)
 }
 
 func parseClassFile(r io.Reader) (*ClassFile, error) {
-	cr := newReader(r)
+	return parseClassFileSized(r, -1)
+}
+
+func parseClassFileSized(r io.Reader, size int64) (*ClassFile, error) {
+	cr := newReaderSized(r, size)
 	cf := &ClassFile{}
 
 	var err error
@@ -626,8 +668,8 @@ func parseAttributes(cr *reader, count uint16, pool []ConstantPoolEntry) ([]Attr
 		if err != nil {
 			return nil, err
 		}
-		if uint64(length) > archivelimits.MaxEntrySize {
-			return nil, fmt.Errorf("attribute %d length %d exceeds %d-byte limit", i, length, archivelimits.MaxEntrySize)
+		if uint64(length) > archivelimits.MaxEntrySize || !cr.fits(uint64(length)) {
+			return nil, fmt.Errorf("attribute %d length %d exceeds remaining input", i, length)
 		}
 		data, err := cr.readBytes(int(length))
 		if err != nil {

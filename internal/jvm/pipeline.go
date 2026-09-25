@@ -302,7 +302,7 @@ func ReadJAR(path string) ([]*ClassFile, error) {
 }
 
 func ParseClassFileFromBytes(data []byte) (*ClassFile, error) {
-	return ParseClassFileFromReader(bytes.NewReader(data))
+	return parseClassFileSized(bytes.NewReader(data), int64(len(data)))
 }
 
 func decompileClassFile(cf *ClassFile) (*ir.Program, error) {
