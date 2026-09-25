@@ -51,7 +51,9 @@
 - [x] Replace direct `os.Exit` calls in command handlers with `func run(args []string) error`; keep process termination only in `main`. This will improve CLI testing and library reuse.
 - [x] Normalize file extensions at the pipeline boundary and validate file signatures where possible. `.JAR`, `.APK`, and similarly cased inputs should behave consistently.
 - [ ] Replace unsafe Capstone structure pointer arithmetic in `internal/native/disasm.go` with a small, version-stable C helper API. Add lifecycle checks for nil/repeated `Close` and document thread-safety.
-- [ ] Add `context.Context` cancellation to long-running JAR/APK, ELF, Flutter, Hermes, and IL2CPP operations so Ctrl-C and API timeouts stop work cleanly.
+- [x] Add `context.Context` cancellation to long-running JAR/APK, ELF, Flutter, Hermes, and IL2CPP operations so Ctrl-C and API timeouts stop work cleanly.
+  - [x] Pipeline-routed: JVM/APK/DEX/ELF/Flutter (`RunContext` + per-entry/per-function checks)
+  - [ ] Hermes/IL2CPP deep ctx threading (follow-up, separate session — currently boundary-only checks)
 
 ### Maintainability and Tooling
 - [ ] Separate parsing, decompilation, rendering, and file-output responsibilities currently concentrated in `internal/pipeline/pipeline.go`.

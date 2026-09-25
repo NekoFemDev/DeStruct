@@ -1,6 +1,7 @@
 package dex
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -303,12 +304,22 @@ func dexToProgram(dex *DexFile) *ir.Program {
 
 // DecompileDexStreaming processes a DEX file with a callback for each class.
 func DecompileDexStreaming(path string, onClass func(*ir.Class), onSkip func(string, error)) error {
+	return DecompileDexStreamingContext(context.Background(), path, onClass, onSkip)
+}
+
+// DecompileDexStreamingContext is DecompileDexStreaming with cancellation:
+// ctx is checked once per class, so a long DEX aborts at the next class
+// boundary with ctx.Err() when the context is done.
+func DecompileDexStreamingContext(ctx context.Context, path string, onClass func(*ir.Class), onSkip func(string, error)) error {
 	dex, err := ParseDexFile(path)
 	if err != nil {
 		return fmt.Errorf("parsing dex file: %w", err)
 	}
 
 	for _, classDef := range dex.Classes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		class := classFromDef(dex, classDef)
 		if class == nil {
 			continue
@@ -323,6 +334,13 @@ func DecompileDexStreaming(path string, onClass func(*ir.Class), onSkip func(str
 // onClass once per class. Duplicate class names (multidex overrides) are
 // skipped after the first occurrence.
 func DecompileApkStreaming(path string, onClass func(*ir.Class), onSkip func(string, error)) error {
+	return DecompileApkStreamingContext(context.Background(), path, onClass, onSkip)
+}
+
+// DecompileApkStreamingContext is DecompileApkStreaming with cancellation:
+// ctx is checked once per .dex entry and once per class, so a long multidex
+// APK aborts at the next boundary with ctx.Err().
+func DecompileApkStreamingContext(ctx context.Context, path string, onClass func(*ir.Class), onSkip func(string, error)) error {
 	r, err := archivelimits.Open(path)
 	if err != nil {
 		return fmt.Errorf("opening apk: %w", err)
@@ -333,6 +351,9 @@ func DecompileApkStreaming(path string, onClass func(*ir.Class), onSkip func(str
 	var budget archivelimits.ReadBudget
 	classCount := 0
 	for _, f := range r.File {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if !strings.HasSuffix(f.Name, ".dex") {
 			continue
 		}
@@ -351,6 +372,9 @@ func DecompileApkStreaming(path string, onClass func(*ir.Class), onSkip func(str
 			continue
 		}
 		for _, classDef := range dex.Classes {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			classCount++
 			if classCount > archivelimits.MaxClasses {
 				return fmt.Errorf("apk exceeds %d-class limit", archivelimits.MaxClasses)
@@ -373,6 +397,16 @@ func DecompileApkStreaming(path string, onClass func(*ir.Class), onSkip func(str
 
 // CountDexClasses counts the number of classes in a DEX file.
 func CountDexClasses(path string) (int, error) {
+	return CountDexClassesContext(context.Background(), path)
+}
+
+// CountDexClassesContext is CountDexClasses with cancellation support. The
+// count itself is cheap once the file is parsed; the context is checked
+// before parsing begins.
+func CountDexClassesContext(ctx context.Context, path string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	dex, err := ParseDexFile(path)
 	if err != nil {
 		return 0, err
@@ -383,6 +417,13 @@ func CountDexClasses(path string) (int, error) {
 // CountApkDexClasses counts the total number of classes across all DEX files
 // in an APK.
 func CountApkDexClasses(path string) (int, error) {
+	return CountApkDexClassesContext(context.Background(), path)
+}
+
+// CountApkDexClassesContext is CountApkDexClasses with cancellation: ctx is
+// checked once per .dex entry, so counting a large multidex APK stops at the
+// next entry when the context is done.
+func CountApkDexClassesContext(ctx context.Context, path string) (int, error) {
 	r, err := archivelimits.Open(path)
 	if err != nil {
 		return 0, fmt.Errorf("opening apk: %w", err)
@@ -392,6 +433,9 @@ func CountApkDexClasses(path string) (int, error) {
 	total := 0
 	var budget archivelimits.ReadBudget
 	for _, f := range r.File {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		if !strings.HasSuffix(f.Name, ".dex") {
 			continue
 		}

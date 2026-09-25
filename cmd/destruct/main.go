@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/destruct/destruct/internal/hermes"
 	"github.com/destruct/destruct/internal/il2cpp"
@@ -16,7 +19,14 @@ import (
 const version = "0.1.0"
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	// Cancel in-flight work on Ctrl-C (SIGINT) or SIGTERM. Long-running
+	// pipeline operations poll this context at their natural boundaries
+	// (per archive entry / per function), so the process stops promptly
+	// instead of finishing the whole input first.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, os.Args[1:]); err != nil {
 		if !errors.Is(err, errUsage) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		}
@@ -29,8 +39,10 @@ func main() {
 var errUsage = errors.New("invalid usage")
 
 // run dispatches a single CLI invocation. Command handlers return errors
-// instead of terminating the process, which keeps them testable.
-func run(args []string) error {
+// instead of terminating the process, which keeps them testable. ctx is the
+// signal-cancelled context from main; handlers that run long operations
+// thread it into the work and check it at their boundaries.
+func run(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		printUsage()
 		return errUsage
@@ -38,11 +50,11 @@ func run(args []string) error {
 
 	switch cmd := args[0]; cmd {
 	case "jvm":
-		return handleJVM(args[1:])
+		return handleJVM(ctx, args[1:])
 	case "dex":
-		return handleDex(args[1:])
+		return handleDex(ctx, args[1:])
 	case "hermes":
-		return handleHermes(args[1:])
+		return handleHermes(ctx, args[1:])
 	case "assemble":
 		return handleAssemble(args[1:])
 	case "patch":
@@ -50,13 +62,13 @@ func run(args []string) error {
 	case "interactive", "repl":
 		return handleInteractive(args[1:])
 	case "flutter":
-		return handleFlutter(args[1:])
+		return handleFlutter(ctx, args[1:])
 	case "elf":
-		return handleELF(args[1:])
+		return handleELF(ctx, args[1:])
 	case "il2cpp":
-		return handleIL2CPP(args[1:])
+		return handleIL2CPP(ctx, args[1:])
 	case "pe":
-		return handlePE(args[1:])
+		return handlePE(ctx, args[1:])
 	case "version":
 		fmt.Printf("DeStruct v%s\n", version)
 		return nil
@@ -152,7 +164,7 @@ Examples:
   destruct elf libnative.so -o output/`)
 }
 
-func handleJVM(args []string) error {
+func handleJVM(ctx context.Context, args []string) error {
 	opts, input := parseFlags(args)
 	if opts.printOptions {
 		return printOptionsJSON("jvm", opts)
@@ -175,7 +187,7 @@ func handleJVM(args []string) error {
 		Project: opts.project,
 	})
 
-	if err := p.Run(); err != nil {
+	if err := p.RunContext(ctx); err != nil {
 		return err
 	}
 
@@ -183,7 +195,7 @@ func handleJVM(args []string) error {
 	return nil
 }
 
-func handleDex(args []string) error {
+func handleDex(ctx context.Context, args []string) error {
 	opts, input := parseFlags(args)
 	if opts.printOptions {
 		return printOptionsJSON("dex", opts)
@@ -206,7 +218,7 @@ func handleDex(args []string) error {
 		Project: opts.project,
 	})
 
-	if err := p.Run(); err != nil {
+	if err := p.RunContext(ctx); err != nil {
 		return err
 	}
 
@@ -214,10 +226,14 @@ func handleDex(args []string) error {
 	return nil
 }
 
-func handleHermes(args []string) error {
+func handleHermes(ctx context.Context, args []string) error {
 	opts, input := parseFlags(args)
 	if input == "" {
 		return errors.New("input .hbc file required")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	if err := os.MkdirAll(opts.output, 0o755); err != nil {
@@ -231,6 +247,13 @@ func handleHermes(args []string) error {
 
 	fmt.Printf("Parsed Hermes bytecode v%d (%d functions, %d strings)\n",
 		file.Header.Version, file.Header.FunctionCount, file.Header.StringCount)
+
+	// hermes' decompiler/disassembler methods do not accept a context, so an
+	// in-flight pass can only be observed at these phase boundaries rather
+	// than aborted per function.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if opts.decompile {
 		// Use decompiler
@@ -523,7 +546,7 @@ func handlePatch(args []string) error {
 	return nil
 }
 
-func handleFlutter(args []string) error {
+func handleFlutter(ctx context.Context, args []string) error {
 	opts, input := parseFlags(args)
 	if opts.printOptions {
 		return printOptionsJSON("flutter", opts)
@@ -550,7 +573,7 @@ func handleFlutter(args []string) error {
 		Project: opts.project,
 	})
 
-	if err := p.Run(); err != nil {
+	if err := p.RunContext(ctx); err != nil {
 		return err
 	}
 
@@ -558,7 +581,7 @@ func handleFlutter(args []string) error {
 	return nil
 }
 
-func handleELF(args []string) error {
+func handleELF(ctx context.Context, args []string) error {
 	opts, input := parseFlags(args)
 	if input == "" {
 		return errors.New("input file required")
@@ -601,7 +624,7 @@ func handleELF(args []string) error {
 		EmitLLVM:        opts.emitLLVM,
 	})
 
-	if err := p.Run(); err != nil {
+	if err := p.RunContext(ctx); err != nil {
 		return err
 	}
 
@@ -615,7 +638,7 @@ func handleELF(args []string) error {
 // Usage: destruct il2cpp <libil2cpp.so> <global-metadata.dat> [-o output/]
 // The two positional arguments may be given in either order; they are
 // detected from their magic numbers.
-func handleIL2CPP(args []string) error {
+func handleIL2CPP(ctx context.Context, args []string) error {
 	output := "output"
 	verbose := false
 	printOptions := false
@@ -661,6 +684,12 @@ func handleIL2CPP(args []string) error {
 		lib, meta = meta, lib
 	}
 
+	// il2cpp.Run does not accept a context, so cancellation can only be
+	// observed at this boundary rather than mid-dump.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	result, err := il2cpp.Run(il2cpp.Options{
 		LibPath:      lib,
 		MetadataPath: meta,
@@ -668,6 +697,9 @@ func handleIL2CPP(args []string) error {
 		Verbose:      verbose,
 	})
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
@@ -704,7 +736,7 @@ func looksLikeELF(path string) bool {
 	return string(magic[:]) == "\x7fELF"
 }
 
-func handlePE(args []string) error {
+func handlePE(ctx context.Context, args []string) error {
 	opts, input := parseFlags(args)
 	if opts.printOptions {
 		return printOptionsJSON("pe", opts)
@@ -722,7 +754,7 @@ func handlePE(args []string) error {
 		Project: opts.project,
 	})
 
-	if err := p.Run(); err != nil {
+	if err := p.RunContext(ctx); err != nil {
 		return err
 	}
 

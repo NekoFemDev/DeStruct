@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -113,7 +114,24 @@ func (p *Pipeline) validateInputSignature() error {
 	return nil
 }
 
+// Run executes the pipeline with a background context. It is a thin
+// wrapper around RunContext, kept so existing callers don't have to change.
 func (p *Pipeline) Run() error {
+	return p.RunContext(context.Background())
+}
+
+// RunContext executes the pipeline, cancelling the format-specific work if
+// ctx is done. ctx is checked at the natural boundaries of each format's
+// long loop - per .class/.dex entry for JAR/DEX/APK, per function for ELF -
+// so a SIGINT or API timeout stops work cleanly instead of only after the
+// whole input has been processed. The format runners that accept a context
+// are called through their Context variants; Flutter's in-process scan
+// (unflutter.Run) does not take a context, so it is only checked at its
+// outer boundary.
+func (p *Pipeline) RunContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := p.validateInputSignature(); err != nil {
 		return err
 	}
@@ -124,28 +142,28 @@ func (p *Pipeline) Run() error {
 
 	switch p.opts.Format {
 	case FormatFlutter:
-		return p.decompileFlutter()
+		return p.decompileFlutter(ctx)
 
 	case FormatJVM:
-		return p.decompileAndGenerateJVM()
+		return p.decompileAndGenerateJVM(ctx)
 
 	case FormatDEX:
-		return p.decompileAndGenerateDEX()
+		return p.decompileAndGenerateDEX(ctx)
 
 	case FormatELF:
 		if p.opts.Decompile && p.opts.SplitFunctions {
-			return p.decompileELFArm64()
+			return p.decompileELFArm64(ctx)
 		}
 		if p.opts.Decompile && p.opts.EnhanceComments {
-			if err := p.decompileELFArm64(); err != nil {
+			if err := p.decompileELFArm64(ctx); err != nil {
 				return err
 			}
 			return p.ApplyARM64DecompilationEnhancements()
 		}
-		return p.disassembleELF()
+		return p.disassembleELF(ctx)
 
 	default:
-		prog, err := p.decompileELFOrPE()
+		prog, err := p.decompileELFOrPE(ctx)
 		if err != nil {
 			return fmt.Errorf("decompilation: %w", err)
 		}
@@ -159,7 +177,7 @@ func (p *Pipeline) Run() error {
 	}
 }
 
-func (p *Pipeline) decompileAndGenerateJVM() error {
+func (p *Pipeline) decompileAndGenerateJVM(ctx context.Context) error {
 	ext := p.ext()
 
 	gen := javagen.NewGenerator(javagen.Options{
@@ -176,7 +194,7 @@ func (p *Pipeline) decompileAndGenerateJVM() error {
 		return gen.Generate(prog)
 	}
 
-	total, err := jvm.CountClassEntries(p.opts.Input)
+	total, err := jvm.CountClassEntriesContext(ctx, p.opts.Input)
 	if err != nil {
 		return fmt.Errorf("reading jar: %w", err)
 	}
@@ -226,7 +244,7 @@ func (p *Pipeline) decompileAndGenerateJVM() error {
 	count := 0
 	skipped := 0
 	lastReport := time.Now()
-	err = jvm.DecompileJARStreaming(p.opts.Input,
+	err = jvm.DecompileJARStreamingContext(ctx, p.opts.Input,
 		func(cf *jvm.ClassFile, prog *ir.Program) error {
 			for _, class := range prog.Classes {
 				currentMu.Lock()
@@ -274,7 +292,7 @@ func (p *Pipeline) decompileAndGenerateJVM() error {
 	return nil
 }
 
-func (p *Pipeline) decompileAndGenerateDEX() error {
+func (p *Pipeline) decompileAndGenerateDEX(ctx context.Context) error {
 	ext := p.ext()
 
 	gen := javagen.NewGenerator(javagen.Options{
@@ -286,7 +304,7 @@ func (p *Pipeline) decompileAndGenerateDEX() error {
 	// For DEX files, we process them directly
 	if ext == ".dex" {
 		// Count classes first
-		total, err := dex.CountDexClasses(p.opts.Input)
+		total, err := dex.CountDexClassesContext(ctx, p.opts.Input)
 		if err != nil {
 			return fmt.Errorf("counting dex classes: %w", err)
 		}
@@ -319,7 +337,7 @@ func (p *Pipeline) decompileAndGenerateDEX() error {
 			}
 		}()
 
-		err = dex.DecompileDexStreaming(p.opts.Input, func(class *ir.Class) {
+		err = dex.DecompileDexStreamingContext(ctx, p.opts.Input, func(class *ir.Class) {
 			fullName := class.Package + "." + class.Name
 			if class.Package == "" {
 				fullName = class.Name
@@ -347,13 +365,13 @@ func (p *Pipeline) decompileAndGenerateDEX() error {
 
 	// For APK files, extract and process all DEX files
 	if ext == ".apk" {
-		total, err := dex.CountApkDexClasses(p.opts.Input)
+		total, err := dex.CountApkDexClassesContext(ctx, p.opts.Input)
 		if err != nil {
 			return fmt.Errorf("counting apk dex classes: %w", err)
 		}
 		fmt.Printf("Found %d classes in %s\n", total, filepath.Base(p.opts.Input))
 
-		err = dex.DecompileApkStreaming(p.opts.Input, func(class *ir.Class) {
+		err = dex.DecompileApkStreamingContext(ctx, p.opts.Input, func(class *ir.Class) {
 			fullName := class.Package + "." + class.Name
 			if class.Package == "" {
 				fullName = class.Name
@@ -373,13 +391,17 @@ func (p *Pipeline) decompileAndGenerateDEX() error {
 	return fmt.Errorf("unsupported DEX file format: %s", ext)
 }
 
-func (p *Pipeline) decompileFlutter() error {
+func (p *Pipeline) decompileFlutter(ctx context.Context) error {
 	input := p.opts.Input
 	ext := p.ext()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	// If input is APK, extract libapp.so first.
 	if ext == ".apk" {
-		soPath, err := p.extractLibapp(input)
+		soPath, err := p.extractLibapp(ctx, input)
 		if err != nil {
 			return fmt.Errorf("extract libapp.so from APK: %w", err)
 		}
@@ -392,13 +414,21 @@ func (p *Pipeline) decompileFlutter() error {
 		args = append(args, "--verbose")
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if exitCode, err := unflutter.Run(args); err != nil {
 		return fmt.Errorf("unflutter (exit %d): %w", exitCode, err)
+	}
+	// unflutter.Run does not accept a context, so an in-flight scan can only
+	// be observed here, at its outer boundary, rather than aborted mid-scan.
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Combine per-function .txt and .bin files into output root.
 	asmDir := filepath.Join(p.opts.Output, "asm")
-	if err := combineAsmFiles(asmDir, p.opts.Output); err != nil {
+	if err := combineAsmFiles(ctx, asmDir, p.opts.Output); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not combine asm files: %v\n", err)
 	} else {
 		fmt.Printf("Combined: %s/asm.txt + asm.bin\n", p.opts.Output)
@@ -409,7 +439,7 @@ func (p *Pipeline) decompileFlutter() error {
 	return nil
 }
 
-func combineAsmFiles(asmDir, outDir string) error {
+func combineAsmFiles(ctx context.Context, asmDir, outDir string) error {
 	entries, err := os.ReadDir(asmDir)
 	if err != nil {
 		return err
@@ -423,6 +453,9 @@ func combineAsmFiles(asmDir, outDir string) error {
 	var funcs []funcEntry
 
 	for _, e := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".txt") || e.Name() == "asm.txt" {
 			continue
 		}
@@ -461,7 +494,7 @@ func combineAsmFiles(asmDir, outDir string) error {
 	return binOut.Commit()
 }
 
-func (p *Pipeline) extractLibapp(apkPath string) (string, error) {
+func (p *Pipeline) extractLibapp(ctx context.Context, apkPath string) (string, error) {
 	zr, err := archivelimits.Open(apkPath)
 	if err != nil {
 		return "", err
@@ -470,6 +503,9 @@ func (p *Pipeline) extractLibapp(apkPath string) (string, error) {
 
 	var budget archivelimits.ReadBudget
 	for _, f := range zr.File {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if strings.HasPrefix(f.Name, "lib/arm64-v8a/") && strings.HasSuffix(f.Name, "libapp.so") {
 			data, err := budget.ReadEntry(f)
 			if err != nil {
@@ -496,20 +532,24 @@ func (p *Pipeline) extractLibapp(apkPath string) (string, error) {
 	return "", fmt.Errorf("libapp.so not found in lib/arm64-v8a/")
 }
 
-func (p *Pipeline) decompileELFOrPE() (*ir.Program, error) {
+func (p *Pipeline) decompileELFOrPE(ctx context.Context) (*ir.Program, error) {
 	// For now, use native disassembler for ELF files
 	ext := p.ext()
 
 	if ext == ".so" || ext == ".elf" || ext == "" {
-		return nil, p.disassembleELF()
+		return nil, p.disassembleELF(ctx)
 	}
 
 	return nil, fmt.Errorf("PE decompilation not yet implemented")
 }
 
-func (p *Pipeline) disassembleELF() error {
+func (p *Pipeline) disassembleELF(ctx context.Context) error {
 	if p.opts.Decompile {
-		return p.decompileELFArm64()
+		return p.decompileELFArm64(ctx)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	fmt.Printf("Parsing ELF file: %s\n", p.opts.Input)
@@ -549,7 +589,10 @@ func (p *Pipeline) disassembleELF() error {
 // internal/arm64lift/lift.go's own trailing doc comment for its
 // documented, honest limitations) is reported inline as a comment in
 // the output and counted, not fatal.
-func (p *Pipeline) decompileELFArm64() error {
+func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	fmt.Printf("Parsing ELF file: %s\n", p.opts.Input)
 
 	elf, err := native.NewELFParser(p.opts.Input)
@@ -640,6 +683,9 @@ func (p *Pipeline) decompileELFArm64() error {
 	var ok, empty, failed int
 	lastReport := time.Now()
 	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		code, codeOK := readFunctionCode(c, elf)
 		if !codeOK {
 			continue

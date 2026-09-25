@@ -3,7 +3,9 @@ package pipeline
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,7 +96,7 @@ func TestExtractLibappArchiveLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := New(Options{Input: path})
-	if _, err := p.extractLibapp(path); err == nil {
+	if _, err := p.extractLibapp(context.Background(), path); err == nil {
 		t.Fatal("extract accepted oversized entry")
 	}
 }
@@ -192,5 +194,39 @@ func TestValidateInputSignature(t *testing.T) {
 		if err := p.validateInputSignature(); err == nil {
 			t.Errorf("expected signature failure for %s", name)
 		}
+	}
+}
+
+// TestRunContextCanceled verifies that an already-cancelled context makes
+// RunContext return immediately (before creating output or touching the
+// input), which is the signal path Ctrl-C / API timeouts rely on.
+func TestRunContextCanceled(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "app.jar")
+	f, err := os.Create(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := zip.NewWriter(f)
+	if _, err := w.Create("A.class"); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	out := filepath.Join(dir, "out")
+	p := New(Options{Input: input, Output: out, Format: FormatJVM})
+	if err := p.RunContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunContext with cancelled ctx = %v, want context.Canceled", err)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Fatalf("output directory created despite cancellation (stat err = %v)", statErr)
 	}
 }

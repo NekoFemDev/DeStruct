@@ -3,7 +3,9 @@ package jvm
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -211,5 +213,50 @@ func TestDecompileClassFile_ManyTryCatchBlocksStaysFast(t *testing.T) {
 	}
 	if len(prog.Classes) != 1 || len(prog.Classes[0].Methods) == 0 {
 		t.Fatalf("expected a decompiled class with at least one method, got %#v", prog.Classes)
+	}
+}
+
+// TestDecompileJARStreamingContextCancelMidArchive verifies that cancelling
+// the context mid-archive aborts at the next entry boundary instead of
+// grinding through the rest of the jar.
+func TestDecompileJARStreamingContextCancelMidArchive(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "many.jar")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := zip.NewWriter(f)
+	for _, name := range []string{"A.class", "B.class", "C.class"} {
+		entry, err := w.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write([]byte("not a classfile")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	skips := 0
+	err = DecompileJARStreamingContext(ctx, path,
+		func(cf *ClassFile, prog *ir.Program) error { return nil },
+		func(entryName string, reason SkipReason, entryErr error) {
+			skips++
+			cancel() // cancel after the first malformed entry
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("DecompileJARStreamingContext = %v, want context.Canceled", err)
+	}
+	if skips != 1 {
+		t.Fatalf("processed %d entries after cancellation, want 1 (should stop at the next entry boundary)", skips)
 	}
 }

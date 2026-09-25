@@ -3,6 +3,7 @@ package jvm
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"fmt"
 	"strings"
 
@@ -114,6 +115,13 @@ const maxClassFileSize = archivelimits.MaxEntrySize
 // zip.OpenReader already has the central directory in memory - and lets
 // callers show "N / total" progress before streaming begins.
 func CountClassEntries(path string) (int, error) {
+	return CountClassEntriesContext(context.Background(), path)
+}
+
+// CountClassEntriesContext is CountClassEntries with cancellation: it
+// returns ctx.Err() as soon as the context is done, rather than only after
+// walking every entry in a very large archive.
+func CountClassEntriesContext(ctx context.Context, path string) (int, error) {
 	r, err := archivelimits.Open(path)
 	if err != nil {
 		return 0, err
@@ -122,6 +130,9 @@ func CountClassEntries(path string) (int, error) {
 
 	n := 0
 	for _, f := range r.File {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		if strings.HasSuffix(f.Name, ".class") && !strings.Contains(f.Name, "META-INF") {
 			n++
 			if n > archivelimits.MaxClasses {
@@ -187,6 +198,14 @@ func (r SkipReason) String() string {
 // aborting the whole run - a single class that fails to generate should
 // not cost the rest of a large .jar.
 func DecompileJARStreaming(path string, onClass func(cf *ClassFile, prog *ir.Program) error, onSkip func(entryName string, reason SkipReason, err error)) error {
+	return DecompileJARStreamingContext(context.Background(), path, onClass, onSkip)
+}
+
+// DecompileJARStreamingContext is DecompileJARStreaming with cancellation.
+// ctx is checked once per .class entry, so a Ctrl-C or API timeout aborts a
+// long archive at the next entry boundary and returns ctx.Err() instead of
+// continuing through the rest of the jar.
+func DecompileJARStreamingContext(ctx context.Context, path string, onClass func(cf *ClassFile, prog *ir.Program) error, onSkip func(entryName string, reason SkipReason, err error)) error {
 	r, err := archivelimits.Open(path)
 	if err != nil {
 		return err
@@ -196,6 +215,9 @@ func DecompileJARStreaming(path string, onClass func(cf *ClassFile, prog *ir.Pro
 	classes := 0
 	var budget archivelimits.ReadBudget
 	for _, f := range r.File {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if !strings.HasSuffix(f.Name, ".class") || strings.Contains(f.Name, "META-INF") {
 			continue
 		}
