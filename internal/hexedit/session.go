@@ -79,6 +79,11 @@ type Session struct {
 	funcs      []Function
 	funcsBuilt bool
 	funcsErr   error
+
+	// confirmFn, when set by the REPL, replaces the reader-backed
+	// confirmation prompt so apply/save questions consume lines from
+	// the same input stream as the command loop.
+	confirmFn func(prompt string) bool
 }
 
 // Open maps path and starts a session. opts.Out defaults to os.Stdout
@@ -140,6 +145,14 @@ func (s *Session) Cursor() Addr { return s.cursor }
 
 // SetCursor moves the cursor.
 func (s *Session) SetCursor(a Addr) { s.cursor = a }
+
+// Dirty reports whether any patch is staged.
+func (s *Session) Dirty() bool { return s.dirty() }
+
+// SetConfirm overrides how apply/save confirmation prompts are
+// answered. The REPL uses this to read answers from its own line
+// stream; without an override, prompts read from Options.In.
+func (s *Session) SetConfirm(fn func(prompt string) bool) { s.confirmFn = fn }
 
 // printf writes formatted output to the session's writer.
 func (s *Session) printf(format string, args ...interface{}) {

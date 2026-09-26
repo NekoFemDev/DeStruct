@@ -27,9 +27,11 @@ func main() {
 	defer stop()
 
 	if err := run(ctx, os.Args[1:]); err != nil {
-		if !errors.Is(err, errUsage) {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if errors.Is(err, errUsage) {
+			// Usage errors have already printed their message.
+			os.Exit(2)
 		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }
@@ -61,6 +63,8 @@ func run(ctx context.Context, args []string) error {
 		return handlePatch(args[1:])
 	case "interactive", "repl":
 		return handleInteractive(args[1:])
+	case "hex":
+		return handleHex(ctx, args[1:])
 	case "flutter":
 		return handleFlutter(ctx, args[1:])
 	case "elf":
@@ -95,6 +99,8 @@ Commands:
   elf       Disassemble ELF binaries to readable assembly (--decompile: AArch64-only pseudocode)
   il2cpp    Dump Unity IL2CPP metadata (global-metadata.dat + libil2cpp.so) to dump.cs
   pe        Disassemble PE binaries to readable assembly
+  hex       Interactive hex editor with staged patching (mapped read-only;
+             ELF disasm/decompile; -c for one-shot scripting)
   version   Show version
   help      Show this help
 
@@ -161,7 +167,10 @@ Examples:
   destruct patch file.hbc -t "isPro"
   destruct flutter libapp.so -o output/ --decompile
   destruct il2cpp libil2cpp.so global-metadata.dat -o output/
-  destruct elf libnative.so -o output/`)
+  destruct elf libnative.so -o output/
+  destruct hex libil2cpp.so
+  destruct hex lib.so -c "info" -c "disasm 0x1000 32"
+  destruct hex lib.so -c "search \"UnityPlayer\"" -c "read 0x2000"`)
 }
 
 func handleJVM(ctx context.Context, args []string) error {

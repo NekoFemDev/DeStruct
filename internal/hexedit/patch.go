@@ -281,8 +281,19 @@ func (s *Session) printDiff() {
 	}
 }
 
-// confirm prints an interactive y/N prompt and reads one line.
+// confirm prints an interactive y/N prompt and reads one line. The REPL
+// overrides this via SetConfirm so apply/save prompts consume lines
+// from the same buffered stream as the command loop.
 func (s *Session) confirm(prompt string) bool {
+	if s.confirmFn != nil {
+		return s.confirmFn(prompt)
+	}
+	return s.defaultConfirm(prompt)
+}
+
+// defaultConfirm is the reader-backed confirmation used outside the
+// REPL (the -c batch path).
+func (s *Session) defaultConfirm(prompt string) bool {
 	s.printf("%s [y/N] ", prompt)
 	line, _ := s.in.ReadString('\n')
 	switch strings.ToLower(strings.TrimSpace(line)) {
