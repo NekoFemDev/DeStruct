@@ -68,3 +68,11 @@ capstone-6.0.0-Alpha10/
 
 # Bundled Capstone build artifacts
 third_party/capstone/build/
+
+# Local decompiler run artifacts at the repo root - not source and not
+# the tracked test fixtures under test/ (see the test/** note above).
+/test_output/
+/classes.dex
+/global-metadata.dat
+# NestLoader release bundle + its extracted directory
+/NestLoader*
