@@ -1,6 +1,7 @@
 package il2cpp
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strings"
@@ -141,10 +142,20 @@ func (e *Executor) fail(table string, index int64, cause string) {
 func (e *Executor) Err() error { return e.err }
 
 func NewExecutor(m *Metadata, ic *IL2CPP) *Executor {
+	return NewExecutorContext(context.Background(), m, ic)
+}
+
+// NewExecutorContext is NewExecutor with cancellation: ctx is checked in
+// both custom-attribute-generator passes, once per image.
+func NewExecutorContext(ctx context.Context, m *Metadata, ic *IL2CPP) *Executor {
 	e := &Executor{Metadata: m, IL2CPP: ic}
 	if ic.Version >= 27 && ic.Version < 29 {
 		total := 0
 		for i := 0; i < m.ImageCount(); i++ {
+			if err := ctx.Err(); err != nil {
+				e.err = err
+				return e
+			}
 			img := m.Image(i)
 			start, count := int64(img.i32("customAttributeStart")), int64(img.u32("customAttributeCount"))
 			if count == 0 {
@@ -163,6 +174,10 @@ func NewExecutor(m *Metadata, ic *IL2CPP) *Executor {
 		}
 		e.customAttributeGenerators = make([]uint64, total)
 		for i := 0; i < m.ImageCount(); i++ {
+			if err := ctx.Err(); err != nil {
+				e.err = err
+				return e
+			}
 			img := m.Image(i)
 			mod := ic.CodeGenModules[m.ImageName(i)]
 			if img.u32("customAttributeCount") == 0 {
@@ -171,7 +186,7 @@ func NewExecutor(m *Metadata, ic *IL2CPP) *Executor {
 			if mod == nil {
 				continue
 			}
-			ptrs := ic.readU64s(mod.CustomAttributeCacheGenerator, int64(img.u32("customAttributeCount")))
+			ptrs := ic.readU64sContext(ctx, mod.CustomAttributeCacheGenerator, int64(img.u32("customAttributeCount")))
 			if len(ptrs) != int(img.u32("customAttributeCount")) {
 				e.fail("images", int64(i), "custom attribute generator table truncated")
 				return e

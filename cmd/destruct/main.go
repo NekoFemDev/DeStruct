@@ -248,9 +248,8 @@ func handleHermes(ctx context.Context, args []string) error {
 	fmt.Printf("Parsed Hermes bytecode v%d (%d functions, %d strings)\n",
 		file.Header.Version, file.Header.FunctionCount, file.Header.StringCount)
 
-	// hermes' decompiler/disassembler methods do not accept a context, so an
-	// in-flight pass can only be observed at these phase boundaries rather
-	// than aborted per function.
+	// The decompiler/disassembler context variants check ctx at function and
+	// instruction boundaries, so Ctrl-C aborts an in-flight pass.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -264,7 +263,9 @@ func handleHermes(ctx context.Context, args []string) error {
 			return err
 		}
 		defer f.Close()
-		d.DecompileAll(f)
+		if err := d.DecompileAllContext(ctx, f); err != nil {
+			return err
+		}
 		fmt.Printf("Decompiled: %s\n", dasmPath)
 	} else {
 		// Use disassembler
@@ -278,13 +279,19 @@ func handleHermes(ctx context.Context, args []string) error {
 
 		// Use simplified format for patching
 		if opts.patch {
-			d.DisassembleAllPatch(f)
+			if err := d.DisassembleAllPatchContext(ctx, f); err != nil {
+				return err
+			}
 			fmt.Printf("Simplified disassembly (for patching): %s\n", hasmPath)
 		} else if opts.hex {
-			d.DisassembleAllHex(f)
+			if err := d.DisassembleAllHexContext(ctx, f); err != nil {
+				return err
+			}
 			fmt.Printf("Hex-editor disassembly: %s\n", hasmPath)
 		} else if opts.patchMap {
-			d.DisassembleAllPatchMap(f)
+			if err := d.DisassembleAllPatchMapContext(ctx, f); err != nil {
+				return err
+			}
 			fmt.Printf("Hex-editor patch map (absolute file offsets per operand): %s\n", hasmPath)
 		} else {
 			// hermes-dec-exact format: matches the reference Python
@@ -292,13 +299,18 @@ func handleHermes(ctx context.Context, args []string) error {
 			// bytecode versions 97-99 (the opcode table DeStruct ships
 			// targets that range; older versions will decode structurally
 			// but instruction mnemonics may not match).
-			d.DisassembleAllExact(f)
+			if err := d.DisassembleAllExactContext(ctx, f); err != nil {
+				return err
+			}
 			fmt.Printf("Disassembly (hermes-dec exact format): %s\n", hasmPath)
 		}
 	}
 
 	// Print summary
 	for i, hdr := range file.FunctionHeaders {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		name := "<unknown>"
 		if int(hdr.FunctionName) < len(file.Strings) {
 			name = file.Strings[hdr.FunctionName]
@@ -684,22 +696,16 @@ func handleIL2CPP(ctx context.Context, args []string) error {
 		lib, meta = meta, lib
 	}
 
-	// il2cpp.Run does not accept a context, so cancellation can only be
-	// observed at this boundary rather than mid-dump.
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	result, err := il2cpp.Run(il2cpp.Options{
+	// RunContext threads ctx through the metadata parse, registration
+	// search, init and per-type dump loops, so an in-flight dump aborts at
+	// the next boundary.
+	result, err := il2cpp.RunContext(ctx, il2cpp.Options{
 		LibPath:      lib,
 		MetadataPath: meta,
 		OutputDir:    output,
 		Verbose:      verbose,
 	})
 	if err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
 		return err
 	}
 

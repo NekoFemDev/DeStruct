@@ -1,6 +1,7 @@
 package hermes
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -776,7 +777,7 @@ var functionKindNames = map[uint8]string{
 // separator line of 15 '=' characters, blank line), matching
 // disassemble_function() in hbc_disassembler.py line for line.
 func (d *Disassembler) DisassembleFunctionExact(funcIdx int, w io.Writer) {
-	d.disassembleFunctionExact(funcIdx, w, false)
+	_ = d.disassembleFunctionExact(context.Background(), funcIdx, w, false)
 }
 
 // DisassembleFunctionExactEditable is DisassembleFunctionExact plus one
@@ -797,12 +798,14 @@ func (d *Disassembler) DisassembleFunctionExact(funcIdx int, w io.Writer) {
 // comment, which would leave no way to actually retarget one of a
 // switch's cases through this text format at all.
 func (d *Disassembler) DisassembleFunctionExactEditable(funcIdx int, w io.Writer) {
-	d.disassembleFunctionExact(funcIdx, w, true)
+	_ = d.disassembleFunctionExact(context.Background(), funcIdx, w, true)
 }
 
-func (d *Disassembler) disassembleFunctionExact(funcIdx int, w io.Writer, editable bool) {
+// disassembleFunctionExact is the ctx-aware core of the exact-format
+// per-function disassemblers; ctx is checked per instruction.
+func (d *Disassembler) disassembleFunctionExact(ctx context.Context, funcIdx int, w io.Writer, editable bool) error {
 	if funcIdx < 0 || funcIdx >= len(d.File.FunctionHeaders) {
-		return
+		return nil
 	}
 	hdr := d.File.FunctionHeaders[funcIdx]
 	name := "<unknown>"
@@ -846,6 +849,9 @@ func (d *Disassembler) disassembleFunctionExact(funcIdx int, w io.Writer, editab
 	fileBase := d.File.FunctionHeaders[funcIdx].Offset
 	offset := uint32(0)
 	for offset < uint32(len(code)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		pi := decodeInstructionFull(code, offset, d.Table, d.File.rawData, fileBase)
 		if pi == nil || pi.Inst == nil {
 			break
@@ -866,6 +872,7 @@ func (d *Disassembler) disassembleFunctionExact(funcIdx int, w io.Writer, editab
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, strings.Repeat("=", 15))
 	fmt.Fprintln(w)
+	return nil
 }
 
 // pyBit renders a bool as Python's repr() of the underlying c_uint8:1
@@ -882,9 +889,21 @@ func pyBit(b bool) string {
 // hermes-dec text layout, one after another - equivalent to running
 // hermes-dec's do_disassemble() over the whole file.
 func (d *Disassembler) DisassembleAllExact(w io.Writer) {
+	_ = d.DisassembleAllExactContext(context.Background(), w)
+}
+
+// DisassembleAllExactContext is DisassembleAllExact with cancellation: ctx
+// is checked per function and per instruction.
+func (d *Disassembler) DisassembleAllExactContext(ctx context.Context, w io.Writer) error {
 	for funcIdx := range d.File.FunctionHeaders {
-		d.DisassembleFunctionExact(funcIdx, w)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := d.disassembleFunctionExact(ctx, funcIdx, w, false); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // DisassembleAllExactEditable is DisassembleAllExact using
@@ -893,9 +912,21 @@ func (d *Disassembler) DisassembleAllExact(w io.Writer) {
 // AssembleAndPatch's diffing/alignment step, not by default disassembly
 // output.
 func (d *Disassembler) DisassembleAllExactEditable(w io.Writer) {
+	_ = d.DisassembleAllExactEditableContext(context.Background(), w)
+}
+
+// DisassembleAllExactEditableContext is DisassembleAllExactEditable with
+// cancellation.
+func (d *Disassembler) DisassembleAllExactEditableContext(ctx context.Context, w io.Writer) error {
 	for funcIdx := range d.File.FunctionHeaders {
-		d.DisassembleFunctionExactEditable(funcIdx, w)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := d.disassembleFunctionExact(ctx, funcIdx, w, true); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -913,8 +944,14 @@ func (d *Disassembler) DisassembleAllExactEditable(w io.Writer) {
 // line per operand giving its precise byte range in the file and its raw
 // bytes, so the person can locate and edit the exact bytes in a hex editor.
 func (d *Disassembler) DisassembleFunctionPatchMap(funcIdx int, w io.Writer) {
+	_ = d.disassembleFunctionPatchMap(context.Background(), funcIdx, w)
+}
+
+// disassembleFunctionPatchMap is the ctx-aware core of
+// DisassembleFunctionPatchMap; ctx is checked per instruction.
+func (d *Disassembler) disassembleFunctionPatchMap(ctx context.Context, funcIdx int, w io.Writer) error {
 	if funcIdx < 0 || funcIdx >= len(d.File.FunctionHeaders) {
-		return
+		return nil
 	}
 	hdr := d.File.FunctionHeaders[funcIdx]
 	name := "<unknown>"
@@ -928,6 +965,9 @@ func (d *Disassembler) DisassembleFunctionPatchMap(funcIdx int, w io.Writer) {
 	code := d.File.getCode(funcIdx)
 	offset := uint32(0)
 	for offset < uint32(len(code)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		pi := decodeInstructionFull(code, offset, d.Table, d.File.rawData, hdr.Offset)
 		if pi == nil || pi.Inst == nil {
 			break
@@ -968,6 +1008,7 @@ func (d *Disassembler) DisassembleFunctionPatchMap(funcIdx int, w io.Writer) {
 		}
 		offset = pi.NextOffset
 	}
+	return nil
 }
 
 // rawBytesHex renders the little-endian on-disk byte representation of an
@@ -987,7 +1028,18 @@ func rawBytesHex(value uint64, size int) string {
 
 // DisassembleAllPatchMap writes the patch map for every function in the file.
 func (d *Disassembler) DisassembleAllPatchMap(w io.Writer) {
+	_ = d.DisassembleAllPatchMapContext(context.Background(), w)
+}
+
+// DisassembleAllPatchMapContext is DisassembleAllPatchMap with cancellation.
+func (d *Disassembler) DisassembleAllPatchMapContext(ctx context.Context, w io.Writer) error {
 	for funcIdx := range d.File.FunctionHeaders {
-		d.DisassembleFunctionPatchMap(funcIdx, w)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := d.disassembleFunctionPatchMap(ctx, funcIdx, w); err != nil {
+			return err
+		}
 	}
+	return nil
 }

@@ -2,6 +2,7 @@ package il2cpp
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,6 +45,16 @@ func DefaultDumpOptions() DumpOptions {
 
 // DumpCS writes a dump.cs in the Il2CppDumper format.
 func (e *Executor) DumpCS(opts DumpOptions) error {
+	return e.DumpCSContext(context.Background(), opts)
+}
+
+// DumpCSContext is DumpCS with cancellation: ctx is checked per image and
+// per type definition (the per-class boundary); the member and attribute
+// loops inside dumpType poll it as well.
+func (e *Executor) DumpCSContext(ctx context.Context, opts DumpOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m := e.Metadata
 	if opts.OutputDir == "" {
 		opts.OutputDir = "output"
@@ -61,11 +72,17 @@ func (e *Executor) DumpCS(opts DumpOptions) error {
 	w := bufio.NewWriterSize(f, 1<<20)
 
 	for i := 0; i < m.ImageCount(); i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		img := m.Image(i)
 		fmt.Fprintf(w, "// Image %d: %s - %d\n", i, m.ImageName(i), img.i32("typeStart"))
 	}
 
 	for imageIndex := 0; imageIndex < m.ImageCount(); imageIndex++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		img := m.Image(imageIndex)
 		imageName := m.ImageName(imageIndex)
 		typeStart := int(img.i32("typeStart"))
@@ -76,7 +93,12 @@ func (e *Executor) DumpCS(opts DumpOptions) error {
 		}
 		typeEnd := typeStart + int(count)
 		for typeDefIndex := typeStart; typeDefIndex < typeEnd; typeDefIndex++ {
-			e.dumpType(w, imageIndex, imageName, typeDefIndex, opts)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := e.dumpType(ctx, w, imageIndex, imageName, typeDefIndex, opts); err != nil {
+				return err
+			}
 			if err := e.Err(); err != nil {
 				return err
 			}
@@ -92,7 +114,10 @@ func (e *Executor) DumpCS(opts DumpOptions) error {
 
 // dumpType writes one type definition. Any unexpected decoder panic is
 // returned as a table-indexed error instead of leaking to the CLI.
-func (e *Executor) dumpType(w *bufio.Writer, imageIndex int, imageName string, typeDefIndex int, opts DumpOptions) {
+func (e *Executor) dumpType(ctx context.Context, w *bufio.Writer, imageIndex int, imageName string, typeDefIndex int, opts DumpOptions) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			e.fail("typeDefs", int64(typeDefIndex), fmt.Sprintf("decoder error: %v", r))
@@ -114,6 +139,9 @@ func (e *Executor) dumpType(w *bufio.Writer, imageIndex int, imageName string, t
 	if count := int(td.u16("interfaces_count")); count > 0 {
 		start := int(td.i32("interfacesStart"))
 		for i := 0; i < count; i++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			idx := start + i
 			if idx < 0 || idx >= len(m.interfaceIndices) {
 				break
@@ -126,7 +154,7 @@ func (e *Executor) dumpType(w *bufio.Writer, imageIndex int, imageName string, t
 	fmt.Fprintf(w, "\n// Dll : %s\n", imageName)
 	fmt.Fprintf(w, "// Namespace: %s\n", m.GetStringFromIndex(td.u32("namespaceIndex")))
 	if opts.DumpAttributes {
-		w.WriteString(e.GetCustomAttribute(imageIndex, td.i32("customAttributeIndex"), td.u32("token"), ""))
+		w.WriteString(e.GetCustomAttributeContext(ctx, imageIndex, td.i32("customAttributeIndex"), td.u32("token"), ""))
 	}
 
 	flags := td.u32("flags")
@@ -174,21 +202,27 @@ func (e *Executor) dumpType(w *bufio.Writer, imageIndex int, imageName string, t
 
 	firstSection := true
 	if opts.DumpFields && td.u16("field_count") > 0 {
-		e.dumpFields(w, imageIndex, typeDefIndex, td, opts)
+		if err := e.dumpFields(ctx, w, imageIndex, typeDefIndex, td, opts); err != nil {
+			return err
+		}
 		firstSection = false
 	}
 	if opts.DumpProperties && td.u16("property_count") > 0 {
 		if !firstSection {
 			w.WriteString("\n")
 		}
-		e.dumpProperties(w, imageIndex, td)
+		if err := e.dumpProperties(ctx, w, imageIndex, td); err != nil {
+			return err
+		}
 		firstSection = false
 	}
 	if opts.DumpMethods && td.u16("method_count") > 0 {
 		if !firstSection {
 			w.WriteString("\n")
 		}
-		e.dumpMethods(w, imageIndex, imageName, td, opts)
+		if err := e.dumpMethods(ctx, w, imageIndex, imageName, td, opts); err != nil {
+			return err
+		}
 		firstSection = false
 	}
 	if firstSection {
@@ -196,23 +230,27 @@ func (e *Executor) dumpType(w *bufio.Writer, imageIndex int, imageName string, t
 	} else {
 		w.WriteString("\n}\n")
 	}
+	return nil
 }
 
-func (e *Executor) dumpFields(w *bufio.Writer, imageIndex int, typeDefIndex int, td record, opts DumpOptions) {
+func (e *Executor) dumpFields(ctx context.Context, w *bufio.Writer, imageIndex int, typeDefIndex int, td record, opts DumpOptions) error {
 	m := e.Metadata
 	fieldCount := int(td.u16("field_count"))
 	if fieldCount == 0 {
-		return
+		return nil
 	}
 	w.WriteString("\t// Fields\n")
 	fieldStart := int(td.i32("fieldStart"))
 	for i := fieldStart; i < fieldStart+fieldCount; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		fieldDef := m.FieldDef(i)
 		fieldType := e.typeAt(int(fieldDef.i32("typeIndex")))
 		isStatic := false
 		isConst := false
 		if opts.DumpAttributes {
-			w.WriteString(e.GetCustomAttribute(imageIndex, fieldDef.i32("customAttributeIndex"), fieldDef.u32("token"), "\t"))
+			w.WriteString(e.GetCustomAttributeContext(ctx, imageIndex, fieldDef.i32("customAttributeIndex"), fieldDef.u32("token"), "\t"))
 		}
 		w.WriteString("\t")
 		switch fieldType.Attrs & fieldAttributeFieldAccessMask {
@@ -258,20 +296,24 @@ func (e *Executor) dumpFields(w *bufio.Writer, imageIndex int, typeDefIndex int,
 			w.WriteString(";\n")
 		}
 	}
+	return nil
 }
 
-func (e *Executor) dumpProperties(w *bufio.Writer, imageIndex int, td record) {
+func (e *Executor) dumpProperties(ctx context.Context, w *bufio.Writer, imageIndex int, td record) error {
 	m := e.Metadata
 	propertyCount := int(td.u16("property_count"))
 	if propertyCount == 0 {
-		return
+		return nil
 	}
 	w.WriteString("\t// Properties\n")
 	propertyStart := int(td.i32("propertyStart"))
 	methodStart := int(td.i32("methodStart"))
 	for i := propertyStart; i < propertyStart+propertyCount; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		propertyDef := m.PropertyDef(i)
-		w.WriteString(e.GetCustomAttribute(imageIndex, propertyDef.i32("customAttributeIndex"), propertyDef.u32("token"), "\t"))
+		w.WriteString(e.GetCustomAttributeContext(ctx, imageIndex, propertyDef.i32("customAttributeIndex"), propertyDef.u32("token"), "\t"))
 		w.WriteString("\t")
 		if get := propertyDef.i32("get"); get >= 0 {
 			methodDef := m.MethodDef(methodStart + int(get))
@@ -293,22 +335,26 @@ func (e *Executor) dumpProperties(w *bufio.Writer, imageIndex int, td record) {
 		}
 		w.WriteString("}\n")
 	}
+	return nil
 }
 
-func (e *Executor) dumpMethods(w *bufio.Writer, imageIndex int, imageName string, td record, opts DumpOptions) {
+func (e *Executor) dumpMethods(ctx context.Context, w *bufio.Writer, imageIndex int, imageName string, td record, opts DumpOptions) error {
 	m := e.Metadata
 	methodCount := int(td.u16("method_count"))
 	if methodCount == 0 {
-		return
+		return nil
 	}
 	w.WriteString("\t// Methods\n")
 	methodStart := int(td.i32("methodStart"))
 	for i := methodStart; i < methodStart+methodCount; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		w.WriteString("\n")
 		methodDef := m.MethodDef(i)
 		isAbstract := methodDef.u16("flags")&methodAttributeAbstract != 0
 		if opts.DumpAttributes {
-			w.WriteString(e.GetCustomAttribute(imageIndex, methodDef.i32("customAttributeIndex"), methodDef.u32("token"), "\t"))
+			w.WriteString(e.GetCustomAttributeContext(ctx, imageIndex, methodDef.i32("customAttributeIndex"), methodDef.u32("token"), "\t"))
 		}
 		methodPointer := e.IL2CPP.GetMethodPointer(imageName, methodDef)
 		slot := methodDef.u16("slot")
@@ -352,6 +398,7 @@ func (e *Executor) dumpMethods(w *bufio.Writer, imageIndex int, imageName string
 			w.WriteString(") { }\n")
 		}
 	}
+	return nil
 }
 
 // formatMethodLocation builds the tab-indented location comment line
@@ -495,6 +542,14 @@ func (e *Executor) getModifiers(methodDef record) string {
 // GetCustomAttribute renders every custom attribute attached to an
 // entity, one per line.
 func (e *Executor) GetCustomAttribute(imageIndex int, customAttributeIndex int32, token uint32, padding string) string {
+	return e.GetCustomAttributeContext(context.Background(), imageIndex, customAttributeIndex, token, padding)
+}
+
+// GetCustomAttributeContext is GetCustomAttribute with cancellation: ctx is
+// checked per attribute, so a single entity with a very long attribute list
+// can be interrupted. An interrupted render returns ""; the enclosing dump
+// loop observes ctx on its next iteration and stops.
+func (e *Executor) GetCustomAttributeContext(ctx context.Context, imageIndex int, customAttributeIndex int32, token uint32, padding string) string {
 	m := e.Metadata
 	if m.Version < 21 {
 		return ""
@@ -515,6 +570,9 @@ func (e *Executor) GetCustomAttribute(imageIndex int, customAttributeIndex int32
 		count := int(rangeRec.i32("count"))
 		start := int(rangeRec.i32("start"))
 		for i := 0; i < count; i++ {
+			if err := ctx.Err(); err != nil {
+				return ""
+			}
 			idx := start + i
 			if idx < 0 || idx >= len(m.attributeTypes) {
 				break
@@ -548,6 +606,9 @@ func (e *Executor) GetCustomAttribute(imageIndex int, customAttributeIndex int32
 	// and emits nothing for that entity).
 	lines := make([]string, 0, reader.Count())
 	for i := uint32(0); i < reader.Count(); i++ {
+		if err := ctx.Err(); err != nil {
+			return ""
+		}
 		s := reader.safeGetString()
 		if s == "" {
 			break

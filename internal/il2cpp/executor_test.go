@@ -3,6 +3,7 @@ package il2cpp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"testing"
 )
@@ -28,7 +29,7 @@ func TestDumpTypeReportsMalformedReference(t *testing.T) {
 	m.typeDefs[0].b[parent] = 2
 	e := &Executor{Metadata: m, IL2CPP: &IL2CPP{}}
 	var out bytes.Buffer
-	e.dumpType(bufio.NewWriter(&out), 0, "image", 0, DefaultDumpOptions())
+	e.dumpType(context.Background(), bufio.NewWriter(&out), 0, "image", 0, DefaultDumpOptions())
 	var refErr *ReferenceError
 	if !errors.As(e.Err(), &refErr) || refErr.Table != "types" || refErr.Index != 2 {
 		t.Fatalf("expected types[2] error, got %v", e.Err())

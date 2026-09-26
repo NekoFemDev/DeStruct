@@ -1,6 +1,7 @@
 package il2cpp
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -193,6 +194,14 @@ func (ic *IL2CPP) readU32(addr uint64) uint32 { return ic.ELF.readU32(addr) }
 func (ic *IL2CPP) readI32(addr uint64) int32  { return int32(ic.ELF.readU32(addr)) }
 
 func (ic *IL2CPP) readU64s(addr uint64, count int64) []uint64 {
+	return ic.readU64sContext(context.Background(), addr, count)
+}
+
+// readU64sContext is readU64s with cancellation: the word copy polls ctx
+// every 4096 words and returns nil once cancelled. Callers that hold a ctx
+// re-check ctx.Err() afterwards so cancellation is not mistaken for a
+// truncated table.
+func (ic *IL2CPP) readU64sContext(ctx context.Context, addr uint64, count int64) []uint64 {
 	if count <= 0 || count > 1<<28 {
 		return nil
 	}
@@ -206,6 +215,9 @@ func (ic *IL2CPP) readU64s(addr uint64, count int64) []uint64 {
 	}
 	out := make([]uint64, count)
 	for i := int64(0); i < count; i++ {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return nil
+		}
 		out[i] = ic.ELF.u64(start + int(i)*8)
 	}
 	return out
@@ -215,6 +227,11 @@ func (ic *IL2CPP) readU64s(addr uint64, count int64) []uint64 {
 // of it falls outside the mapped file, matching the exception the C#
 // reader raises for an unmappable array.
 func (ic *IL2CPP) readU64sStrict(addr uint64, count int64) ([]uint64, bool) {
+	return ic.readU64sStrictContext(context.Background(), addr, count)
+}
+
+// readU64sStrictContext is readU64sStrict with cancellation.
+func (ic *IL2CPP) readU64sStrictContext(ctx context.Context, addr uint64, count int64) ([]uint64, bool) {
 	if count < 0 || count > 1<<28 {
 		return nil, false
 	}
@@ -228,6 +245,9 @@ func (ic *IL2CPP) readU64sStrict(addr uint64, count int64) ([]uint64, bool) {
 	}
 	out := make([]uint64, count)
 	for i := int64(0); i < count; i++ {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return nil, false
+		}
 		out[i] = ic.ELF.u64(start + int(i)*8)
 	}
 	return out, true
@@ -247,22 +267,30 @@ func (ic *IL2CPP) readRecord(addr uint64, l *structLayout) ([]byte, bool) {
 }
 
 // findCodeRegistration ports SectionHelper.FindCodeRegistration for ELF.
-func (ic *IL2CPP) findCodeRegistration(imageCount int) uint64 {
+// Cancellation is reported as 0; the caller re-checks ctx.Err() to
+// distinguish it from "not found".
+func (ic *IL2CPP) findCodeRegistration(ctx context.Context, imageCount int) uint64 {
 	if ic.Version >= 24.2 {
-		cr := ic.findCodeRegistration2019(ic.ELF.execSections(), imageCount)
+		cr := ic.findCodeRegistration2019(ctx, ic.ELF.execSections(), imageCount)
+		if ctx.Err() != nil {
+			return 0
+		}
 		if cr == 0 {
-			cr = ic.findCodeRegistration2019(ic.ELF.dataSections(), imageCount)
+			cr = ic.findCodeRegistration2019(ctx, ic.ELF.dataSections(), imageCount)
 		} else {
 			ic.pointerInExec = true
 		}
 		return cr
 	}
-	return ic.findCodeRegistrationOld()
+	return ic.findCodeRegistrationOld(ctx)
 }
 
-func (ic *IL2CPP) findCodeRegistrationOld() uint64 {
+func (ic *IL2CPP) findCodeRegistrationOld(ctx context.Context) uint64 {
 	methodCount := 0
 	for i := range ic.metadata.methodDefs {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return 0
+		}
 		if ic.metadata.methodDefs[i].has("methodIndex") {
 			if ic.metadata.methodDefs[i].i32("methodIndex") >= 0 {
 				methodCount++
@@ -272,16 +300,24 @@ func (ic *IL2CPP) findCodeRegistrationOld() uint64 {
 		}
 	}
 	for _, sec := range ic.ELF.dataSections() {
+		if ctx.Err() != nil {
+			return 0
+		}
 		pos := sec.offset
+		scanned := uint64(0)
 		for pos+8 <= sec.offsetEnd && pos+8 <= uint64(len(ic.ELF.data)) {
+			scanned++
+			if scanned%512 == 0 && ctx.Err() != nil { // every 4096 bytes
+				return 0
+			}
 			if pos > uint64(len(ic.ELF.data))-16 {
 				break
 			}
 			if int64(ic.ELF.u64(int(pos))) == int64(methodCount) {
 				ptr := ic.ELF.u64(int(pos) + 8)
 				if po, ok := ic.mapVATR(ptr); ok && ic.inDataRange(po) {
-					pointers, ok := ic.readU64sStrict(ptr, int64(methodCount))
-					if ok && ic.allInExecVA(pointers) {
+					pointers, ok := ic.readU64sStrictContext(ctx, ptr, int64(methodCount))
+					if ok && ic.allInExecVA(ctx, pointers) {
 						return pos - sec.offset + sec.address
 					}
 				}
@@ -296,7 +332,7 @@ func (ic *IL2CPP) findCodeRegistrationOld() uint64 {
 // locate the code registration through the generated module names.
 var featureBytes = []byte("mscorlib.dll\x00")
 
-func (ic *IL2CPP) findCodeRegistration2019(sections []searchSection, imageCount int) uint64 {
+func (ic *IL2CPP) findCodeRegistration2019(ctx context.Context, sections []searchSection, imageCount int) uint64 {
 	// Level 1: find pointers to the mscorlib.dll string literal.
 	level1Targets := make(map[uint64]struct{})
 	type occurrence struct {
@@ -306,13 +342,16 @@ func (ic *IL2CPP) findCodeRegistration2019(sections []searchSection, imageCount 
 	}
 	var occurrences []occurrence
 	for si, sec := range sections {
+		if ctx.Err() != nil {
+			return 0
+		}
 		start, end, ok := byteRange(ic.ELF.data, sec.offset, sec.offsetEnd-sec.offset)
 		if !ok {
 			continue
 		}
 		buff := ic.ELF.data[start:end]
 		for idx := 0; ; {
-			j := indexBytes(buff[idx:], featureBytes)
+			j := indexBytesContext(ctx, buff[idx:], featureBytes)
 			if j < 0 {
 				break
 			}
@@ -323,14 +362,23 @@ func (ic *IL2CPP) findCodeRegistration2019(sections []searchSection, imageCount 
 			idx++
 		}
 	}
+	if ctx.Err() != nil {
+		return 0
+	}
 	if len(occurrences) == 0 {
 		return 0
 	}
-	refs1 := ic.ELF.findReferences(level1Targets)
+	refs1 := ic.ELF.findReferences(ctx, level1Targets)
+	if ctx.Err() != nil {
+		return 0
+	}
 
 	// Level 2: pointers to the moduleName slots found above.
 	level2Targets := make(map[uint64]struct{})
 	for _, o := range occurrences {
+		if ctx.Err() != nil {
+			return 0
+		}
 		for _, r := range refs1[o.va] {
 			level2Targets[r] = struct{}{}
 		}
@@ -338,12 +386,18 @@ func (ic *IL2CPP) findCodeRegistration2019(sections []searchSection, imageCount 
 	if len(level2Targets) == 0 {
 		return 0
 	}
-	refs2 := ic.ELF.findReferences(level2Targets)
+	refs2 := ic.ELF.findReferences(ctx, level2Targets)
+	if ctx.Err() != nil {
+		return 0
+	}
 
 	// Level 3: the codeGenModules array element holding the address of
 	// (moduleNameSlot - i*ptr) for some module index i.
 	level3Targets := make(map[uint64]struct{})
 	for _, refs := range refs2 {
+		if ctx.Err() != nil {
+			return 0
+		}
 		for _, refva2 := range refs {
 			for i := imageCount - 1; i >= 0; i-- {
 				if uint64(i) > refva2/8 {
@@ -356,11 +410,23 @@ func (ic *IL2CPP) findCodeRegistration2019(sections []searchSection, imageCount 
 			}
 		}
 	}
-	refs3 := ic.ELF.findReferences(level3Targets)
+	refs3 := ic.ELF.findReferences(ctx, level3Targets)
+	if ctx.Err() != nil {
+		return 0
+	}
 
 	for _, o := range occurrences {
+		if ctx.Err() != nil {
+			return 0
+		}
 		for _, refva := range refs1[o.va] {
+			if ctx.Err() != nil {
+				return 0
+			}
 			for _, refva2 := range refs2[refva] {
+				if ctx.Err() != nil {
+					return 0
+				}
 				for i := imageCount - 1; i >= 0; i-- {
 					if uint64(i) > refva2/8 {
 						continue
@@ -392,18 +458,21 @@ func (ic *IL2CPP) findCodeRegistration2019(sections []searchSection, imageCount 
 	return 0
 }
 
-func (ic *IL2CPP) findMetadataRegistration(typeDefsCount int64, imageCount int) uint64 {
+func (ic *IL2CPP) findMetadataRegistration(ctx context.Context, typeDefsCount int64, imageCount int) uint64 {
 	if ic.Version < 19 {
 		return 0
 	}
 	if ic.Version >= 27 {
-		return ic.findMetadataRegistrationV21(typeDefsCount)
+		return ic.findMetadataRegistrationV21(ctx, typeDefsCount)
 	}
-	return ic.findMetadataRegistrationOld(typeDefsCount)
+	return ic.findMetadataRegistrationOld(ctx, typeDefsCount)
 }
 
-func (ic *IL2CPP) findMetadataRegistrationV21(typeDefsCount int64) uint64 {
+func (ic *IL2CPP) findMetadataRegistrationV21(ctx context.Context, typeDefsCount int64) uint64 {
 	for _, sec := range ic.ELF.dataSections() {
+		if ctx.Err() != nil {
+			return 0
+		}
 		end := sec.offsetEnd
 		if end > uint64(len(ic.ELF.data)) {
 			end = uint64(len(ic.ELF.data))
@@ -411,7 +480,12 @@ func (ic *IL2CPP) findMetadataRegistrationV21(typeDefsCount int64) uint64 {
 		if end < 8 {
 			continue
 		}
+		scanned := uint64(0)
 		for pos := sec.offset; pos+8 <= end; pos += 8 {
+			scanned++
+			if scanned%512 == 0 && ctx.Err() != nil { // every 4096 bytes
+				return 0
+			}
 			if int64(ic.ELF.u64(int(pos))) != typeDefsCount {
 				continue
 			}
@@ -426,13 +500,13 @@ func (ic *IL2CPP) findMetadataRegistrationV21(typeDefsCount int64) uint64 {
 			if !ok || !ic.inDataRange(fileOff) {
 				continue
 			}
-			pointers, ok := ic.readU64sStrict(ptr, typeDefsCount)
+			pointers, ok := ic.readU64sStrictContext(ctx, ptr, typeDefsCount)
 			if !ok {
 				continue
 			}
-			check := ic.allInDataVA
+			check := func(p []uint64) bool { return ic.allInDataVA(ctx, p) }
 			if ic.pointerInExec {
-				check = ic.allInExecVA
+				check = func(p []uint64) bool { return ic.allInExecVA(ctx, p) }
 			}
 			if check(pointers) && pos-sec.offset+sec.address >= 8*10 {
 				return pos - sec.offset + sec.address - 8*10
@@ -442,8 +516,11 @@ func (ic *IL2CPP) findMetadataRegistrationV21(typeDefsCount int64) uint64 {
 	return 0
 }
 
-func (ic *IL2CPP) findMetadataRegistrationOld(typeDefsCount int64) uint64 {
+func (ic *IL2CPP) findMetadataRegistrationOld(ctx context.Context, typeDefsCount int64) uint64 {
 	for _, sec := range ic.ELF.dataSections() {
+		if ctx.Err() != nil {
+			return 0
+		}
 		end := sec.offsetEnd
 		if end > uint64(len(ic.ELF.data)) {
 			end = uint64(len(ic.ELF.data))
@@ -451,7 +528,12 @@ func (ic *IL2CPP) findMetadataRegistrationOld(typeDefsCount int64) uint64 {
 		if end < 8 {
 			continue
 		}
+		scanned := uint64(0)
 		for pos := sec.offset; pos+8 <= end; pos += 8 {
+			scanned++
+			if scanned%512 == 0 && ctx.Err() != nil { // every 4096 bytes
+				return 0
+			}
 			if int64(ic.ELF.u64(int(pos))) != typeDefsCount {
 				continue
 			}
@@ -463,8 +545,8 @@ func (ic *IL2CPP) findMetadataRegistrationOld(typeDefsCount int64) uint64 {
 			if !ok || !ic.inDataRange(fileOff) {
 				continue
 			}
-			pointers, valid := ic.readU64sStrict(ptr, ic.metadataUsagesCount)
-			if valid && ic.allInDataVA(pointers) && pos-sec.offset+sec.address >= 8*12 {
+			pointers, valid := ic.readU64sStrictContext(ctx, ptr, ic.metadataUsagesCount)
+			if valid && ic.allInDataVA(ctx, pointers) && pos-sec.offset+sec.address >= 8*12 {
 				return pos - sec.offset + sec.address - 8*12
 			}
 		}
@@ -481,8 +563,11 @@ func (ic *IL2CPP) inDataRange(fileOff uint64) bool {
 	return false
 }
 
-func (ic *IL2CPP) allInDataVA(pointers []uint64) bool {
-	for _, p := range pointers {
+func (ic *IL2CPP) allInDataVA(ctx context.Context, pointers []uint64) bool {
+	for i, p := range pointers {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return false
+		}
 		found := false
 		for _, sec := range ic.ELF.dataSections() {
 			if p >= sec.address && p <= sec.addressEnd {
@@ -497,8 +582,11 @@ func (ic *IL2CPP) allInDataVA(pointers []uint64) bool {
 	return true
 }
 
-func (ic *IL2CPP) allInExecVA(pointers []uint64) bool {
-	for _, p := range pointers {
+func (ic *IL2CPP) allInExecVA(ctx context.Context, pointers []uint64) bool {
+	for i, p := range pointers {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return false
+		}
 		found := false
 		for _, sec := range ic.ELF.execSections() {
 			if p >= sec.address && p <= sec.addressEnd {
@@ -514,10 +602,20 @@ func (ic *IL2CPP) allInExecVA(pointers []uint64) bool {
 }
 
 func indexBytes(haystack, needle []byte) int {
+	return indexBytesContext(context.Background(), haystack, needle)
+}
+
+// indexBytesContext is indexBytes with cancellation: the byte scan polls ctx
+// every 4096 offsets and reports "not found" once cancelled; callers hold a
+// ctx and re-check ctx.Err() before continuing.
+func indexBytesContext(ctx context.Context, haystack, needle []byte) int {
 	if len(needle) == 0 || len(haystack) < len(needle) {
 		return -1
 	}
 	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return -1
+		}
 		match := true
 		for j := range needle {
 			if haystack[i+j] != needle[j] {
@@ -591,8 +689,13 @@ func (ic *IL2CPP) readCRFields(addr uint64) bool {
 	return true
 }
 
-// init parses the code and metadata registrations.
-func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
+// init parses the code and metadata registrations. ctx is checked at each
+// table boundary and inside the per-entry loops, so a cancelled dump stops
+// between tables instead of finishing the registration walk.
+func (ic *IL2CPP) init(ctx context.Context, codeRegistration, metadataRegistration uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	const limit = 0x50000
 	b, ok := ic.readRecord(codeRegistration, &layoutCodeRegistration)
 	if !ok {
@@ -609,7 +712,10 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 		cr = record{b: b, l: &layoutCodeRegistration, ver: ic.Version}
 	}
 	if ic.Version == 27.1 && cr.has("codeGenModules") {
-		mods := ic.readU64s(cr.u64("codeGenModules"), int64(cr.u64("codeGenModulesCount")))
+		mods := ic.readU64sContext(ctx, cr.u64("codeGenModules"), int64(cr.u64("codeGenModulesCount")))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		for _, modAddr := range mods {
 			mb, ok := ic.readRecord(modAddr, &layoutCodeGenModule)
 			if !ok {
@@ -619,7 +725,10 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 			if mr.i64("rgctxsCount") > 0 {
 				rgctxs := ic.readRGCTXDefs(mr.u64("rgctxs"), mr.i64("rgctxsCount"))
 				allLarge := len(rgctxs) > 0
-				for _, rg := range rgctxs {
+				for i, rg := range rgctxs {
+					if i&0xFFF == 0 && ctx.Err() != nil {
+						return ctx.Err()
+					}
 					if rg.index <= limit {
 						allLarge = false
 						break
@@ -655,25 +764,34 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 	}
 	mr := record{b: mb, l: &layoutMetadataRegistration, ver: ic.Version}
 
-	ic.GenericMethodPointers = ic.readU64s(cr.u64("genericMethodPointers"), int64(cr.u64("genericMethodPointersCount")))
-	ic.InvokerPointers = ic.readU64s(cr.u64("invokerPointers"), int64(cr.u64("invokerPointersCount")))
+	ic.GenericMethodPointers = ic.readU64sContext(ctx, cr.u64("genericMethodPointers"), int64(cr.u64("genericMethodPointersCount")))
+	ic.InvokerPointers = ic.readU64sContext(ctx, cr.u64("invokerPointers"), int64(cr.u64("invokerPointersCount")))
 	if ic.Version < 27 && cr.has("customAttributeGenerators") {
-		ic.CustomAttributeGenerators = ic.readU64s(cr.u64("customAttributeGenerators"), int64(cr.u64("customAttributeCount")))
+		ic.CustomAttributeGenerators = ic.readU64sContext(ctx, cr.u64("customAttributeGenerators"), int64(cr.u64("customAttributeCount")))
 	}
 	if ic.Version > 16 && ic.Version < 27 {
-		ic.MetadataUsages = ic.readU64s(mr.u64("metadataUsages"), ic.metadataUsagesCount)
+		ic.MetadataUsages = ic.readU64sContext(ctx, mr.u64("metadataUsages"), ic.metadataUsagesCount)
 	}
 	if ic.Version >= 22 {
 		if cr.u64("reversePInvokeWrapperCount") != 0 {
-			ic.ReversePInvokeWrappers = ic.readU64s(cr.u64("reversePInvokeWrappers"), int64(cr.u64("reversePInvokeWrapperCount")))
+			ic.ReversePInvokeWrappers = ic.readU64sContext(ctx, cr.u64("reversePInvokeWrappers"), int64(cr.u64("reversePInvokeWrapperCount")))
 		}
 		if cr.u64("unresolvedVirtualCallCount") != 0 {
-			ic.UnresolvedVirtualCallPointers = ic.readU64s(cr.u64("unresolvedVirtualCallPointers"), int64(cr.u64("unresolvedVirtualCallCount")))
+			ic.UnresolvedVirtualCallPointers = ic.readU64sContext(ctx, cr.u64("unresolvedVirtualCallPointers"), int64(cr.u64("unresolvedVirtualCallCount")))
 		}
 	}
-	ic.GenericInstPointers = ic.readU64s(mr.u64("genericInsts"), mr.i64("genericInstsCount"))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ic.GenericInstPointers = ic.readU64sContext(ctx, mr.u64("genericInsts"), mr.i64("genericInstsCount"))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	ic.GenericInsts = make([]*il2CppGenericInst, len(ic.GenericInstPointers))
 	for i, p := range ic.GenericInstPointers {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if b, ok := ic.readRecord(p, &layoutGenericInst); ok {
 			r := record{b: b, l: &layoutGenericInst, ver: ic.Version}
 			ic.GenericInsts[i] = &il2CppGenericInst{TypeArgc: r.i64("type_argc"), TypeArgv: r.u64("type_argv")}
@@ -681,26 +799,41 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 	}
 	ic.fieldOffsetsArePointers = ic.Version > 21
 	if ic.Version == 21 {
-		fieldTest := ic.readU64s(mr.u64("fieldOffsets"), 6)
+		fieldTest := ic.readU64sContext(ctx, mr.u64("fieldOffsets"), 6)
 		if len(fieldTest) >= 6 {
 			ic.fieldOffsetsArePointers = fieldTest[0] == 0 && fieldTest[1] == 0 && fieldTest[2] == 0 &&
 				fieldTest[3] == 0 && fieldTest[4] == 0 && fieldTest[5] > 0
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if ic.fieldOffsetsArePointers {
-		ic.FieldOffsets = ic.readU64s(mr.u64("fieldOffsets"), mr.i64("fieldOffsetsCount"))
+		ic.FieldOffsets = ic.readU64sContext(ctx, mr.u64("fieldOffsets"), mr.i64("fieldOffsetsCount"))
 	} else {
 		raw := ic.readU32s(mr.u64("fieldOffsets"), mr.i64("fieldOffsetsCount"))
 		ic.FieldOffsets = make([]uint64, len(raw))
 		for i, v := range raw {
+			if i&0xFFF == 0 && ctx.Err() != nil {
+				return ctx.Err()
+			}
 			ic.FieldOffsets[i] = uint64(v)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
-	typesPtrs := ic.readU64s(mr.u64("types"), mr.i64("typesCount"))
+	typesPtrs := ic.readU64sContext(ctx, mr.u64("types"), mr.i64("typesCount"))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	ic.Types = make([]*Il2CppType, len(typesPtrs))
 	ic.typeDic = make(map[uint64]*Il2CppType, len(typesPtrs))
 	for i, p := range typesPtrs {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		b, ok := ic.readRecord(p, &layoutIl2CppType)
 		if !ok {
 			continue
@@ -713,17 +846,23 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 	}
 
 	if ic.Version >= 24.2 {
-		modPtrs := ic.readU64s(cr.u64("codeGenModules"), int64(cr.u64("codeGenModulesCount")))
+		modPtrs := ic.readU64sContext(ctx, cr.u64("codeGenModules"), int64(cr.u64("codeGenModulesCount")))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		ic.CodeGenModules = make(map[string]*codeGenModule, len(modPtrs))
 		ic.CodeGenModuleMethodPointers = make(map[string][]uint64, len(modPtrs))
 		ic.RGCTXsDictionary = make(map[string]map[uint32][]rgctxDefinition, len(modPtrs))
-		for _, modAddr := range modPtrs {
+		for i, modAddr := range modPtrs {
+			if i&0xFFF == 0 && ctx.Err() != nil {
+				return ctx.Err()
+			}
 			b, ok := ic.readRecord(modAddr, &layoutCodeGenModule)
 			if !ok {
 				continue
 			}
 			r := record{b: b, l: &layoutCodeGenModule, ver: ic.Version}
-			name := ic.ELF.readCString(r.u64("moduleName"))
+			name := ic.ELF.readCStringContext(ctx, r.u64("moduleName"))
 			m := &codeGenModule{
 				Name:                          name,
 				Address:                       modAddr,
@@ -737,14 +876,17 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 				CustomAttributeCacheGenerator: r.u64("customAttributeCacheGenerator"),
 			}
 			ic.CodeGenModules[name] = m
-			ic.CodeGenModuleMethodPointers[name] = ic.readU64s(m.MethodPointers, m.MethodPointerCount)
+			ic.CodeGenModuleMethodPointers[name] = ic.readU64sContext(ctx, m.MethodPointers, m.MethodPointerCount)
 
 			rgctxDic := make(map[uint32][]rgctxDefinition)
 			ic.RGCTXsDictionary[name] = rgctxDic
 			if m.RGCTXsCount > 0 {
 				rgctxs := ic.readRGCTXDefs(m.RGCTXs, m.RGCTXsCount)
 				ranges := ic.readRGCTXRanges(m.RGCTXRanges, m.RGCTXRangesCount)
-				for _, rg := range ranges {
+				for j, rg := range ranges {
+					if j&0xFFF == 0 && ctx.Err() != nil {
+						return ctx.Err()
+					}
 					start := rg.start
 					length := rg.length
 					if start < 0 || length <= 0 || int(start) > len(rgctxs) || int(length) > len(rgctxs)-int(start) {
@@ -758,7 +900,10 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 			}
 		}
 	} else {
-		ic.MethodPointers = ic.readU64s(cr.u64("methodPointers"), int64(cr.u64("methodPointersCount")))
+		ic.MethodPointers = ic.readU64sContext(ctx, cr.u64("methodPointers"), int64(cr.u64("methodPointersCount")))
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	entries := ic.readGenericMethodEntries(mr.u64("genericMethodTable"), mr.i64("genericMethodTableCount"))
@@ -772,6 +917,9 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 	}
 	ic.MethodSpecs = make([]Il2CppMethodSpec, specCount)
 	for i := range ic.MethodSpecs {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		b, ok := ic.readRecord(mr.u64("methodSpecs")+uint64(i)*12, &layoutMethodSpec)
 		if !ok {
 			continue
@@ -784,7 +932,10 @@ func (ic *IL2CPP) init(codeRegistration, metadataRegistration uint64) error {
 	}
 	ic.MethodDefMethodSpecs = make(map[int][]int)
 	ic.MethodSpecGenericPtrs = make([]uint64, len(ic.MethodSpecs))
-	for _, e := range entries {
+	for i, e := range entries {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if e.genericMethodIndex < 0 || int(e.genericMethodIndex) >= len(ic.MethodSpecs) {
 			continue
 		}

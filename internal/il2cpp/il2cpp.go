@@ -1,6 +1,7 @@
 package il2cpp
 
 import (
+	"context"
 	"fmt"
 	"os"
 )
@@ -28,6 +29,17 @@ type Result struct {
 // Run parses global-metadata.dat and the IL2CPP binary, resolves the
 // runtime registrations and writes dump.cs.
 func Run(opts Options) (*Result, error) {
+	return RunContext(context.Background(), opts)
+}
+
+// RunContext is Run with cancellation: ctx is checked between every phase
+// (metadata parse, ELF load, registration search, init, dump) and threaded
+// into the per-image / per-table / per-class loops those phases run, so a
+// Ctrl-C or API timeout aborts an in-flight dump at the next boundary.
+func RunContext(ctx context.Context, opts Options) (*Result, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if opts.Dump == (DumpOptions{}) {
 		opts.Dump = DefaultDumpOptions()
 	}
@@ -44,7 +56,7 @@ func Run(opts Options) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading metadata: %w", err)
 	}
-	metadata, err := NewMetadata(metadataBytes)
+	metadata, err := NewMetadataContext(ctx, metadataBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -54,8 +66,11 @@ func Run(opts Options) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading il2cpp binary: %w", err)
 	}
-	elf, err := newELF(libBytes)
+	elf, err := newELFContext(ctx, libBytes)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -74,12 +89,18 @@ func Run(opts Options) (*Result, error) {
 	typeDefsCount := int64(metadata.TypeDefCount())
 
 	logf("Searching for registrations...")
-	codeRegistration := ic.findCodeRegistration(imageCount)
+	codeRegistration := ic.findCodeRegistration(ctx, imageCount)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	codeRegistration, err = ic.autoPlusInit(codeRegistration)
 	if err != nil {
 		return nil, err
 	}
-	metadataRegistration := ic.findMetadataRegistration(typeDefsCount, imageCount)
+	metadataRegistration := ic.findMetadataRegistration(ctx, typeDefsCount, imageCount)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	if codeRegistration == 0 || metadataRegistration == 0 {
 		logf("Auto search incomplete, trying symbols...")
@@ -97,17 +118,17 @@ func Run(opts Options) (*Result, error) {
 	logf("MetadataRegistration: 0x%X", metadataRegistration)
 	logf("IL2CPP version: %.1f", ic.Version)
 
-	if err := ic.init(codeRegistration, metadataRegistration); err != nil {
+	if err := ic.init(ctx, codeRegistration, metadataRegistration); err != nil {
 		return nil, err
 	}
 	ic.CodeRegistration = codeRegistration
 	ic.MetadataRegistration = metadataRegistration
 
-	executor := NewExecutor(metadata, ic)
+	executor := NewExecutorContext(ctx, metadata, ic)
 	if err := executor.Err(); err != nil {
 		return nil, fmt.Errorf("initializing executor: %w", err)
 	}
-	if err := executor.DumpCS(opts.Dump); err != nil {
+	if err := executor.DumpCSContext(ctx, opts.Dump); err != nil {
 		return nil, err
 	}
 	if err := executor.Err(); err != nil {
@@ -116,6 +137,11 @@ func Run(opts Options) (*Result, error) {
 
 	methodCount := 0
 	for i := 0; i < metadata.MethodDefCount(); i++ {
+		if i&0xFFF == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		m := metadata.MethodDef(i)
 		if !m.has("methodIndex") || m.i32("methodIndex") >= 0 {
 			methodCount++

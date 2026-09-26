@@ -1,6 +1,7 @@
 package il2cpp
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 )
@@ -72,6 +73,16 @@ const (
 // newELF parses the ELF header and program headers. The caller hands
 // over ownership of data; relocations are applied in place.
 func newELF(data []byte) (*elfFile, error) {
+	return newELFContext(context.Background(), data)
+}
+
+// newELFContext is newELF with cancellation: ctx is checked between parse
+// phases and inside the symbol/relocation table scans, so a dump cancelled
+// while preparing the image stops at the next scan chunk.
+func newELFContext(ctx context.Context, data []byte) (*elfFile, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(data) < 64 || string(data[:4]) != "\x7fELF" {
 		return nil, fmt.Errorf("not an ELF file")
 	}
@@ -100,8 +111,17 @@ func newELF(data []byte) (*elfFile, error) {
 		return nil, fmt.Errorf("no program headers in ELF")
 	}
 	e.parseDynamic()
-	e.parseSymbols()
-	e.applyRelocations()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	e.parseSymbolsContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	e.applyRelocationsContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -220,11 +240,15 @@ func (e *elfFile) parseDynamic() {
 }
 
 func (e *elfFile) parseSymbols() {
+	e.parseSymbolsContext(context.Background())
+}
+
+func (e *elfFile) parseSymbolsContext(ctx context.Context) {
 	symtab, ok := e.dyn[dtSymtab]
 	if !ok {
 		return
 	}
-	count := e.symbolCount()
+	count := e.symbolCountContext(ctx)
 	syment := 24
 	if !e.is64 {
 		syment = 16
@@ -252,6 +276,9 @@ func (e *elfFile) parseSymbols() {
 		available = int(count)
 	}
 	for i := 0; i < available; i++ {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return
+		}
 		o := start + i*syment
 		var nameOff uint32
 		var sym elfSymbol
@@ -266,7 +293,7 @@ func (e *elfFile) parseSymbols() {
 		}
 		if strtab != 0 && nameOff != 0 {
 			if strtab <= ^uint64(0)-uint64(nameOff) {
-				sym.name = e.readCString(strtab + uint64(nameOff))
+				sym.name = e.readCStringContext(ctx, strtab+uint64(nameOff))
 			}
 		}
 		e.symbols = append(e.symbols, sym)
@@ -277,6 +304,11 @@ func (e *elfFile) parseSymbols() {
 // count computation, since stripped Android binaries carry no section
 // headers to derive it from.
 func (e *elfFile) symbolCount() uint64 {
+	return e.symbolCountContext(context.Background())
+}
+
+// symbolCountContext is symbolCount with cancellation.
+func (e *elfFile) symbolCountContext(ctx context.Context) uint64 {
 	if hash, ok := e.dyn[dtHash]; ok {
 		if off, ok := e.mapVATR(hash); ok {
 			if start, _, valid := byteRange(e.data, off, 8); valid {
@@ -313,6 +345,9 @@ func (e *elfFile) symbolCount() uint64 {
 	}
 	var last uint32
 	for i := 0; i < int(nbuckets); i++ {
+		if i&0xFFF == 0 && ctx.Err() != nil {
+			return 0
+		}
 		b := e.u32(bucketsOff + 4*i)
 		if b > last {
 			last = b
@@ -325,7 +360,12 @@ func (e *elfFile) symbolCount() uint64 {
 	if !ok {
 		return 0
 	}
+	scanned := 0
 	for pos <= len(e.data)-4 {
+		scanned++
+		if scanned&0xFFF == 0 && ctx.Err() != nil {
+			return 0
+		}
 		c := e.u32(pos)
 		pos += 4
 		last++
@@ -337,6 +377,12 @@ func (e *elfFile) symbolCount() uint64 {
 }
 
 func (e *elfFile) applyRelocations() {
+	e.applyRelocationsContext(context.Background())
+}
+
+// applyRelocationsContext is applyRelocations with cancellation: the
+// relocation entry walks poll ctx every 4096 entries.
+func (e *elfFile) applyRelocationsContext(ctx context.Context) {
 	if rela, ok := e.dyn[dtRela]; ok {
 		size := e.dyn[dtRelaSz]
 		ent := 24
@@ -355,6 +401,9 @@ func (e *elfFile) applyRelocations() {
 			start, _, valid := byteRange(e.data, off, size)
 			if valid {
 				for i := uint64(0); i < size/uint64(ent); i++ {
+					if i&0xFFF == 0 && ctx.Err() != nil {
+						return
+					}
 					o := start + int(i)*ent
 					e.applyRela64(o, ent)
 				}
@@ -376,6 +425,9 @@ func (e *elfFile) applyRelocations() {
 			start, _, valid := byteRange(e.data, off, size)
 			if valid {
 				for i := uint64(0); i < size/uint64(ent); i++ {
+					if i&0xFFF == 0 && ctx.Err() != nil {
+						return
+					}
 					o := start + int(i)*ent
 					e.applyRel32(o)
 				}
@@ -520,6 +572,12 @@ func (e *elfFile) readBytes(off, n int) []byte {
 
 // readCString reads a NUL-terminated string from a virtual address.
 func (e *elfFile) readCString(addr uint64) string {
+	return e.readCStringContext(context.Background(), addr)
+}
+
+// readCStringContext is readCString with cancellation: the terminator scan
+// polls ctx every 4096 bytes and returns "" once cancelled.
+func (e *elfFile) readCStringContext(ctx context.Context, addr uint64) string {
 	off, ok := e.mapVATR(addr)
 	if !ok {
 		return ""
@@ -529,6 +587,9 @@ func (e *elfFile) readCString(addr uint64) string {
 		return ""
 	}
 	for end < len(e.data) && e.data[end] != 0 {
+		if end&0xFFF == 0 && ctx.Err() != nil {
+			return ""
+		}
 		end++
 	}
 	return string(e.data[off:end])
@@ -594,18 +655,30 @@ func (e *elfFile) validSection(ph elfPhdr) bool {
 // holding one of the requested pointer values, in file order. This is
 // equivalent to calling Il2CppDumper's FindReference per target but
 // avoids re-scanning tens of megabytes for every lookup.
-func (e *elfFile) findReferences(targets map[uint64]struct{}) map[uint64][]uint64 {
+//
+// ctx is checked once per section and every 4096 bytes of each scan; a
+// cancelled scan returns the references collected so far and the caller
+// (which holds the same ctx) aborts before using them.
+func (e *elfFile) findReferences(ctx context.Context, targets map[uint64]struct{}) map[uint64][]uint64 {
 	out := make(map[uint64][]uint64)
 	if len(targets) == 0 {
 		return out
 	}
 	for _, sec := range e.dataSections() {
+		if ctx.Err() != nil {
+			return out
+		}
 		pos := sec.offset
 		end := sec.offsetEnd
 		if end > uint64(len(e.data)) {
 			end = uint64(len(e.data))
 		}
+		scanned := uint64(0)
 		for pos <= end && end-pos >= 8 {
+			scanned++
+			if scanned%512 == 0 && ctx.Err() != nil { // every 4096 bytes
+				return out
+			}
 			v := e.u64(int(pos))
 			if _, ok := targets[v]; ok {
 				out[v] = append(out[v], pos-sec.offset+sec.address)

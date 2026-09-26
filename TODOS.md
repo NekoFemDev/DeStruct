@@ -54,7 +54,7 @@
   - [ ] Follow-up: Capstone 6.0.0-Alpha10 implements `cs_option(CS_OPT_DETAIL)` as `handle->detail_opt |= value` (cs.c), so `CS_OPT_OFF` is a no-op and detail mode cannot be turned back off on a handle. Decide whether to keep detail permanently on after the first detailed call or use separate handles for detailed vs text-only disassembly.
 - [x] Add `context.Context` cancellation to long-running JAR/APK, ELF, Flutter, Hermes, and IL2CPP operations so Ctrl-C and API timeouts stop work cleanly.
   - [x] Pipeline-routed: JVM/APK/DEX/ELF/Flutter (`RunContext` + per-entry/per-function checks)
-  - [ ] Hermes/IL2CPP deep ctx threading (follow-up, separate session — currently boundary-only checks)
+  - [x] Hermes/IL2CPP deep ctx threading (done via *Context variants in hermes/{decompiler,disasm,hermesdec}.go and il2cpp/{il2cpp,dump,executor,metadata,registration,elf}.go)
 
 ### Maintainability and Tooling
 - [ ] Separate parsing, decompilation, rendering, and file-output responsibilities currently concentrated in `internal/pipeline/pipeline.go`.

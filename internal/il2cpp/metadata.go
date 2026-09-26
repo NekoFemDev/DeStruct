@@ -1,6 +1,7 @@
 package il2cpp
 
 import (
+	"context"
 	"fmt"
 )
 
@@ -255,6 +256,19 @@ var (
 
 // NewMetadata parses a global-metadata.dat image.
 func NewMetadata(data []byte) (*Metadata, error) {
+	return NewMetadataContext(context.Background(), data)
+}
+
+// NewMetadataContext is NewMetadata with cancellation. The parse is
+// mostly a bounded pass over the tables, but the nested per-image/
+// per-attribute-range scans in readTables and processMetadataUsage poll
+// ctx so that a dump cancelled while parsing a very large metadata file
+// stops at the next table boundary. The single-pass copiers (records,
+// readInt32Array, readUint32Array) run to completion without checks.
+func NewMetadataContext(ctx context.Context, data []byte) (*Metadata, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(data) < 8 {
 		return nil, fmt.Errorf("metadata file too small")
 	}
@@ -296,7 +310,9 @@ func NewMetadata(data []byte) (*Metadata, error) {
 	m.assemblyVersion = m.Version
 	m.imageDefs = records(data, m.Header.u32("imagesOffset"), m.Header.i32("imagesSize"), &layoutImageDefinition, m.Version)
 	m.versionDetect()
-	m.readTables()
+	if err := m.readTables(ctx); err != nil {
+		return nil, err
+	}
 	return m, nil
 }
 
@@ -346,7 +362,7 @@ func (m *Metadata) versionDetect() {
 	}
 }
 
-func (m *Metadata) readTables() {
+func (m *Metadata) readTables(ctx context.Context) error {
 	h := &m.Header
 	v := m.Version
 
@@ -362,13 +378,26 @@ func (m *Metadata) readTables() {
 	m.genericParams = records(m.Data, h.u32("genericParametersOffset"), h.i32("genericParametersSize"), &layoutGenericParameter, v)
 	m.fieldRefs = records(m.Data, h.u32("fieldRefsOffset"), h.i32("fieldRefsSize"), &layoutFieldRef, v)
 	m.stringLiterals = records(m.Data, h.u32("stringLiteralOffset"), h.i32("stringLiteralSize"), &layoutStringLiteral, v)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	m.fieldDefaultValues = make(map[int32]record)
-	for _, r := range records(m.Data, h.u32("fieldDefaultValuesOffset"), h.i32("fieldDefaultValuesSize"), &layoutFieldDefaultValue, v) {
+	for i, r := range records(m.Data, h.u32("fieldDefaultValuesOffset"), h.i32("fieldDefaultValuesSize"), &layoutFieldDefaultValue, v) {
+		if i%4096 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		m.fieldDefaultValues[r.i32("fieldIndex")] = r
 	}
 	m.parameterDefaultValues = make(map[int32]record)
-	for _, r := range records(m.Data, h.u32("parameterDefaultValuesOffset"), h.i32("parameterDefaultValuesSize"), &layoutParameterDefaultValue, v) {
+	for i, r := range records(m.Data, h.u32("parameterDefaultValuesOffset"), h.i32("parameterDefaultValuesSize"), &layoutParameterDefaultValue, v) {
+		if i%4096 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		m.parameterDefaultValues[r.i32("parameterIndex")] = r
 	}
 
@@ -386,6 +415,9 @@ func (m *Metadata) readTables() {
 	if v > 24 {
 		m.attributeRanges = make(map[int]map[uint32]int)
 		for i := range m.imageDefs {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			dic := make(map[uint32]int)
 			m.attributeRanges[i] = dic
 			start := int(m.imageDefs[i].i32("customAttributeStart"))
@@ -404,6 +436,11 @@ func (m *Metadata) readTables() {
 				count = uint64(limit - start)
 			}
 			for j := start; j < start+int(count); j++ {
+				if (j-start)%4096 == 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+				}
 				if v >= 29 {
 					if j < len(m.attributeDataRanges) {
 						dic[m.attributeDataRanges[j].u32("token")] = j
@@ -415,11 +452,14 @@ func (m *Metadata) readTables() {
 		}
 	}
 	if v > 16 && v < 27 {
-		m.processMetadataUsage()
+		if err := m.processMetadataUsage(ctx); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (m *Metadata) processMetadataUsage() {
+func (m *Metadata) processMetadataUsage(ctx context.Context) error {
 	h := &m.Header
 	lists := records(m.Data, h.u32("metadataUsageListsOffset"), h.i32("metadataUsageListsCount"), &layoutMetadataUsageList, m.Version)
 	pairs := records(m.Data, h.u32("metadataUsagePairsOffset"), h.i32("metadataUsagePairsCount"), &layoutMetadataUsagePair, m.Version)
@@ -428,6 +468,9 @@ func (m *Metadata) processMetadataUsage() {
 		m.metadataUsageDic[i] = make(map[uint32]uint32)
 	}
 	for _, l := range lists {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		start := l.u32("start")
 		count := l.u32("count")
 		if uint64(start) >= uint64(len(pairs)) {
@@ -438,6 +481,11 @@ func (m *Metadata) processMetadataUsage() {
 			end = uint64(len(pairs))
 		}
 		for off := uint64(start); off < end; off++ {
+			if (off-uint64(start))%4096 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			p := pairs[off]
 			usage := encodedIndexType(p.u32("encodedSourceIndex"))
 			decoded := m.DecodedMethodIndex(p.u32("encodedSourceIndex"))
@@ -445,14 +493,22 @@ func (m *Metadata) processMetadataUsage() {
 		}
 	}
 	var maxDest uint32
+	n := 0
 	for _, dic := range m.metadataUsageDic {
 		for dest := range dic {
+			n++
+			if n%4096 == 0 {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
 			if dest > maxDest {
 				maxDest = dest
 			}
 		}
 	}
 	m.MetadataUsagesCount = int64(maxDest) + 1
+	return nil
 }
 
 func encodedIndexType(index uint32) uint32 { return (index & 0xE0000000) >> 29 }
@@ -560,6 +616,10 @@ func (m *Metadata) NestedTypeIndex(offset int) int32 { return m.nestedTypeIndice
 
 func (m *Metadata) FieldRef(index int) record { return m.fieldRefs[index] }
 
+// readInt32Array/readUint32Array (and records in layout.go) are
+// single-pass table copiers: they run to completion and are not
+// interrupted mid-table; cancellation is observed at the readTables /
+// processMetadataUsage boundaries above.
 func readInt32Array(data []byte, off uint32, size int32) []int32 {
 	if off == 0 || size <= 0 || size%4 != 0 {
 		return nil

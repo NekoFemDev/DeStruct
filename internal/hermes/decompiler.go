@@ -1,6 +1,7 @@
 package hermes
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"sort"
@@ -162,14 +163,26 @@ func NewDecompiler(file *HBCFile) *DecompilerState {
 	}
 }
 
-// DecompileAll decompiles all functions
+// DecompileAll decompiles all functions.
 func (d *DecompilerState) DecompileAll(w io.Writer) {
+	_ = d.DecompileAllContext(context.Background(), w)
+}
+
+// DecompileAllContext is DecompileAll with cancellation: ctx is checked at
+// every function boundary and inside the per-instruction passes, so a
+// cancelled run stops at the next checkpoint instead of finishing the file.
+func (d *DecompilerState) DecompileAllContext(ctx context.Context, w io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	fmt.Fprintf(w, "// Hermes bytecode v%d\n", d.File.Header.Version)
 	fmt.Fprintf(w, "// %d functions, %d strings\n\n", d.File.Header.FunctionCount, d.File.Header.StringCount)
 
 	// Decompile global function
 	globalIdx := int(d.File.Header.GlobalCodeIndex)
-	d.decompileFunction(globalIdx, w)
+	if err := d.decompileFunction(ctx, globalIdx, w); err != nil {
+		return err
+	}
 	fmt.Fprintln(w)
 
 	// Decompile any calldirect functions
@@ -179,14 +192,20 @@ func (d *DecompilerState) DecompileAll(w io.Writer) {
 	}
 	sort.Ints(ids)
 	for _, id := range ids {
-		d.decompileFunction(id, w)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := d.decompileFunction(ctx, id, w); err != nil {
+			return err
+		}
 		fmt.Fprintln(w)
 	}
+	return nil
 }
 
-func (d *DecompilerState) decompileFunction(funcIdx int, w io.Writer) {
+func (d *DecompilerState) decompileFunction(ctx context.Context, funcIdx int, w io.Writer) error {
 	if funcIdx >= len(d.File.FunctionHeaders) {
-		return
+		return nil
 	}
 
 	hdr := &d.File.FunctionHeaders[funcIdx]
@@ -226,25 +245,32 @@ func (d *DecompilerState) decompileFunction(funcIdx int, w io.Writer) {
 		if !body.IsGlobal {
 			fmt.Fprintf(w, "function %s() {}\n", name)
 		}
-		return
+		return nil
 	}
 
 	// Pass 1: Build CFG
-	d.pass1BuildCFG(body, code)
+	if err := d.pass1BuildCFG(ctx, body, code); err != nil {
+		return err
+	}
 
 	// Pass 2: Transform instructions to tokens
-	d.pass2TransformCode(body, code)
+	if err := d.pass2TransformCode(ctx, body, code); err != nil {
+		return err
+	}
 
 	// Output
-	d.outputCode(body, w)
+	return d.outputCode(ctx, body, w)
 }
 
 // Pass 1: Build control flow graph
-func (d *DecompilerState) pass1BuildCFG(body *DecompiledBody, code []byte) {
+func (d *DecompilerState) pass1BuildCFG(ctx context.Context, body *DecompiledBody, code []byte) error {
 	// Scan all instructions to classify jump targets
 	var lastNextPos uint32
 	offset := uint32(0)
 	for offset < uint32(len(code)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		remaining := code[offset:]
 		pi := decodeInstruction(remaining, offset, d.Table)
 		if pi == nil {
@@ -331,6 +357,9 @@ func (d *DecompilerState) pass1BuildCFG(body *DecompiledBody, code []byte) {
 	mayFallThrough := false
 
 	for i := 1; i < len(sortedBounds); i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		startAddr := sortedBounds[i-1]
 		endAddr := sortedBounds[i]
 
@@ -404,6 +433,9 @@ func (d *DecompilerState) pass1BuildCFG(body *DecompiledBody, code []byte) {
 
 	// Link jump edges
 	for _, block := range body.BasicBlocks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		for _, target := range block.JumpTargets {
 			if targetBlock, ok := startToBlock[target]; ok {
 				if !containsBlock(targetBlock, block.Children) {
@@ -415,6 +447,7 @@ func (d *DecompilerState) pass1BuildCFG(body *DecompiledBody, code []byte) {
 			}
 		}
 	}
+	return nil
 }
 
 func containsBlock(b *BasicBlock, list []*BasicBlock) bool {
@@ -427,11 +460,14 @@ func containsBlock(b *BasicBlock, list []*BasicBlock) bool {
 }
 
 // Pass 2: Transform instructions to token strings
-func (d *DecompilerState) pass2TransformCode(body *DecompiledBody, code []byte) {
+func (d *DecompilerState) pass2TransformCode(ctx context.Context, body *DecompiledBody, code []byte) error {
 	body.Statements = make([]*TokenString, 0)
 
 	offset := uint32(0)
 	for offset < uint32(len(code)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		remaining := code[offset:]
 		pi := decodeInstruction(remaining, offset, d.Table)
 		if pi == nil {
@@ -445,6 +481,7 @@ func (d *DecompilerState) pass2TransformCode(body *DecompiledBody, code []byte) 
 
 		offset = pi.NextOffset
 	}
+	return nil
 }
 
 func (d *DecompilerState) translateInstruction(body *DecompiledBody, pi *ParsedInstruction) *TokenString {
@@ -1126,7 +1163,7 @@ func (d *DecompilerState) makeCallTokens(pi *ParsedInstruction, prefix string) [
 }
 
 // Output code
-func (d *DecompilerState) outputCode(body *DecompiledBody, w io.Writer) {
+func (d *DecompilerState) outputCode(ctx context.Context, body *DecompiledBody, w io.Writer) error {
 	indent := strings.Repeat("    ", body.IndentLevel)
 
 	// Function signature
@@ -1163,6 +1200,9 @@ func (d *DecompilerState) outputCode(body *DecompiledBody, w io.Writer) {
 
 	// Output statements
 	for _, ts := range body.Statements {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if ts.Assembly == nil {
 			continue
 		}
@@ -1224,6 +1264,7 @@ func (d *DecompilerState) outputCode(body *DecompiledBody, w io.Writer) {
 		indent = strings.Repeat("    ", body.IndentLevel)
 		fmt.Fprintf(w, "%s}\n", indent)
 	}
+	return nil
 }
 
 func (d *DecompilerState) outputJumpStatement(body *DecompiledBody, ts *TokenString, indent string, w io.Writer) {

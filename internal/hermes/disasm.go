@@ -1,6 +1,7 @@
 package hermes
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -21,8 +22,14 @@ func NewDisassembler(file *HBCFile) *Disassembler {
 }
 
 func (d *Disassembler) DisassembleFunction(funcIdx int, w io.Writer) {
+	_ = d.disassembleFunction(context.Background(), funcIdx, w)
+}
+
+// disassembleFunction is DisassembleFunction's ctx-aware core: it checks
+// ctx at every instruction boundary.
+func (d *Disassembler) disassembleFunction(ctx context.Context, funcIdx int, w io.Writer) error {
 	if funcIdx >= len(d.File.FunctionHeaders) {
-		return
+		return nil
 	}
 	hdr := d.File.FunctionHeaders[funcIdx]
 	name := "<unknown>"
@@ -36,11 +43,14 @@ func (d *Disassembler) DisassembleFunction(funcIdx int, w io.Writer) {
 	code := d.File.getCode(funcIdx)
 	if len(code) == 0 {
 		fmt.Fprintln(w, "; (empty)")
-		return
+		return nil
 	}
 
 	offset := uint32(0)
 	for offset < uint32(len(code)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		remaining := code[offset:]
 		pi := decodeInstruction(remaining, offset, d.Table)
 
@@ -76,13 +86,20 @@ func (d *Disassembler) DisassembleFunction(funcIdx int, w io.Writer) {
 		fmt.Fprintln(w)
 		offset = pi.NextOffset
 	}
+	return nil
 }
 
 // DisassembleFunctionHermesDec outputs in hermes-dec compatible format
 // Format: 00000000: <InstructionName>: <Type: value, ...>  # comments
 func (d *Disassembler) DisassembleFunctionHermesDec(funcIdx int, w io.Writer) {
+	_ = d.disassembleFunctionHermesDec(context.Background(), funcIdx, w)
+}
+
+// disassembleFunctionHermesDec is the ctx-aware core of
+// DisassembleFunctionHermesDec.
+func (d *Disassembler) disassembleFunctionHermesDec(ctx context.Context, funcIdx int, w io.Writer) error {
 	if funcIdx >= len(d.File.FunctionHeaders) {
-		return
+		return nil
 	}
 	hdr := d.File.FunctionHeaders[funcIdx]
 	name := "<unknown>"
@@ -97,11 +114,14 @@ func (d *Disassembler) DisassembleFunctionHermesDec(funcIdx int, w io.Writer) {
 	code := d.File.getCode(funcIdx)
 	if len(code) == 0 {
 		fmt.Fprintln(w, "(empty)")
-		return
+		return nil
 	}
 
 	offset := uint32(0)
 	for offset < uint32(len(code)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		remaining := code[offset:]
 		pi := decodeInstruction(remaining, offset, d.Table)
 
@@ -122,6 +142,7 @@ func (d *Disassembler) DisassembleFunctionHermesDec(funcIdx int, w io.Writer) {
 		fmt.Fprintln(w)
 		offset = pi.NextOffset
 	}
+	return nil
 }
 
 // formatOperandsHermesDec formats operands in hermes-dec style with types
@@ -209,8 +230,14 @@ func (d *Disassembler) commentForInstHermesDec(pi *ParsedInstruction) string {
 
 // DisassembleFunctionPatch outputs in a simplified format for manual patching
 func (d *Disassembler) DisassembleFunctionPatch(funcIdx int, w io.Writer) {
+	_ = d.disassembleFunctionPatch(context.Background(), funcIdx, w)
+}
+
+// disassembleFunctionPatch is the ctx-aware core of
+// DisassembleFunctionPatch.
+func (d *Disassembler) disassembleFunctionPatch(ctx context.Context, funcIdx int, w io.Writer) error {
 	if funcIdx >= len(d.File.FunctionHeaders) {
-		return
+		return nil
 	}
 	hdr := d.File.FunctionHeaders[funcIdx]
 	name := "<unknown>"
@@ -223,11 +250,14 @@ func (d *Disassembler) DisassembleFunctionPatch(funcIdx int, w io.Writer) {
 
 	code := d.File.getCode(funcIdx)
 	if len(code) == 0 {
-		return
+		return nil
 	}
 
 	offset := uint32(0)
 	for offset < uint32(len(code)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		remaining := code[offset:]
 		pi := decodeInstruction(remaining, offset, d.Table)
 
@@ -241,13 +271,19 @@ func (d *Disassembler) DisassembleFunctionPatch(funcIdx int, w io.Writer) {
 
 		offset = pi.NextOffset
 	}
+	return nil
 }
 
 // DisassembleFunctionHex outputs in hex-editor-friendly format with absolute file offsets
 // Format: 0x%08x: %02x %02x ...  instruction operands  ; comments
 func (d *Disassembler) DisassembleFunctionHex(funcIdx int, w io.Writer) {
+	_ = d.disassembleFunctionHex(context.Background(), funcIdx, w)
+}
+
+// disassembleFunctionHex is the ctx-aware core of DisassembleFunctionHex.
+func (d *Disassembler) disassembleFunctionHex(ctx context.Context, funcIdx int, w io.Writer) error {
 	if funcIdx >= len(d.File.FunctionHeaders) {
-		return
+		return nil
 	}
 	hdr := d.File.FunctionHeaders[funcIdx]
 	name := "<unknown>"
@@ -261,11 +297,14 @@ func (d *Disassembler) DisassembleFunctionHex(funcIdx int, w io.Writer) {
 	code := d.File.getCode(funcIdx)
 	if len(code) == 0 {
 		fmt.Fprintln(w, "; (empty)")
-		return
+		return nil
 	}
 
 	offset := uint32(0)
 	for offset < uint32(len(code)) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		remaining := code[offset:]
 		pi := decodeInstruction(remaining, offset, d.Table)
 
@@ -302,6 +341,7 @@ func (d *Disassembler) DisassembleFunctionHex(funcIdx int, w io.Writer) {
 		fmt.Fprintln(w)
 		offset = pi.NextOffset
 	}
+	return nil
 }
 
 // formatOperandsHex formats operands for hex-editor-friendly output
@@ -432,6 +472,13 @@ func (d *Disassembler) commentForInst(pi *ParsedInstruction) string {
 }
 
 func (d *Disassembler) DisassembleAll(w io.Writer) {
+	_ = d.DisassembleAllContext(context.Background(), w)
+}
+
+// DisassembleAllContext is DisassembleAll with cancellation: ctx is checked
+// per string-table row and per function, and the per-instruction loops stop
+// at the next instruction boundary.
+func (d *Disassembler) DisassembleAllContext(ctx context.Context, w io.Writer) error {
 	// Header
 	fmt.Fprintf(w, "; Hermes bytecode v%d\n", d.File.Header.Version)
 	fmt.Fprintf(w, "; %d functions, %d strings\n\n", d.File.Header.FunctionCount, d.File.Header.StringCount)
@@ -439,19 +486,33 @@ func (d *Disassembler) DisassembleAll(w io.Writer) {
 	// String table
 	fmt.Fprintln(w, "; ===== String Table =====")
 	for i, s := range d.File.Strings {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		fmt.Fprintf(w, "; [%d] %q\n", i, s)
 	}
 	fmt.Fprintln(w)
 
 	// Functions
 	for i := range d.File.FunctionHeaders {
-		d.DisassembleFunction(i, w)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := d.disassembleFunction(ctx, i, w); err != nil {
+			return err
+		}
 		fmt.Fprintln(w)
 	}
+	return nil
 }
 
 // DisassembleAllPatch outputs in simplified format for manual patching
 func (d *Disassembler) DisassembleAllPatch(w io.Writer) {
+	_ = d.DisassembleAllPatchContext(context.Background(), w)
+}
+
+// DisassembleAllPatchContext is DisassembleAllPatch with cancellation.
+func (d *Disassembler) DisassembleAllPatchContext(ctx context.Context, w io.Writer) error {
 	// Simple header
 	fmt.Fprintf(w, "# Hermes bytecode v%d\n", d.File.Header.Version)
 	fmt.Fprintf(w, "# %d functions, %d strings\n\n", d.File.Header.FunctionCount, d.File.Header.StringCount)
@@ -459,19 +520,33 @@ func (d *Disassembler) DisassembleAllPatch(w io.Writer) {
 	// String table as comment
 	fmt.Fprintln(w, "# String Table:")
 	for i, s := range d.File.Strings {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		fmt.Fprintf(w, "# [%d] %q\n", i, s)
 	}
 	fmt.Fprintln(w)
 
 	// Functions
 	for i := range d.File.FunctionHeaders {
-		d.DisassembleFunctionPatch(i, w)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := d.disassembleFunctionPatch(ctx, i, w); err != nil {
+			return err
+		}
 		fmt.Fprintln(w)
 	}
+	return nil
 }
 
 // DisassembleAllHex outputs all functions in hex-editor-friendly format
 func (d *Disassembler) DisassembleAllHex(w io.Writer) {
+	_ = d.DisassembleAllHexContext(context.Background(), w)
+}
+
+// DisassembleAllHexContext is DisassembleAllHex with cancellation.
+func (d *Disassembler) DisassembleAllHexContext(ctx context.Context, w io.Writer) error {
 	// Header with absolute offsets
 	fmt.Fprintf(w, "; Hermes bytecode v%d\n", d.File.Header.Version)
 	fmt.Fprintf(w, "; %d functions, %d strings\n", d.File.Header.FunctionCount, d.File.Header.StringCount)
@@ -481,19 +556,34 @@ func (d *Disassembler) DisassembleAllHex(w io.Writer) {
 	// String table as comment
 	fmt.Fprintln(w, "; String Table:")
 	for i, s := range d.File.Strings {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		fmt.Fprintf(w, "; [%d] %q\n", i, s)
 	}
 	fmt.Fprintln(w)
 
 	// Functions
 	for i := range d.File.FunctionHeaders {
-		d.DisassembleFunctionHex(i, w)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := d.disassembleFunctionHex(ctx, i, w); err != nil {
+			return err
+		}
 		fmt.Fprintln(w)
 	}
+	return nil
 }
 
 // DisassembleAllHermesDec outputs all functions in hermes-dec compatible format
 func (d *Disassembler) DisassembleAllHermesDec(w io.Writer) {
+	_ = d.DisassembleAllHermesDecContext(context.Background(), w)
+}
+
+// DisassembleAllHermesDecContext is DisassembleAllHermesDec with
+// cancellation.
+func (d *Disassembler) DisassembleAllHermesDecContext(ctx context.Context, w io.Writer) error {
 	// Header
 	fmt.Fprintf(w, "Hermes bytecode version %d\n", d.File.Header.Version)
 	fmt.Fprintf(w, "%d functions, %d strings\n\n", d.File.Header.FunctionCount, d.File.Header.StringCount)
@@ -501,15 +591,24 @@ func (d *Disassembler) DisassembleAllHermesDec(w io.Writer) {
 	// String table
 	fmt.Fprintln(w, "String table:")
 	for i, s := range d.File.Strings {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		fmt.Fprintf(w, "  [%d] %q\n", i, s)
 	}
 	fmt.Fprintln(w)
 
 	// Functions
 	for i := range d.File.FunctionHeaders {
-		d.DisassembleFunctionHermesDec(i, w)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := d.disassembleFunctionHermesDec(ctx, i, w); err != nil {
+			return err
+		}
 		fmt.Fprintln(w)
 	}
+	return nil
 }
 
 func (d *Disassembler) DisassembleFunctionByName(name string, w io.Writer) bool {
