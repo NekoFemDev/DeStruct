@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"time"
+
+	"github.com/destruct/destruct/internal/native"
 )
 
 // Options configures a session.
@@ -38,6 +40,13 @@ type Session struct {
 	cursor Addr
 
 	openSig fileSig
+
+	// dis is the Capstone handle shared by every disasm/decompile
+	// command in this session; opened lazily, closed by Close.
+	dis *native.Disassembler
+	// resolver is the lazily built ELF symbol resolver used for
+	// disassembly annotations (symbol headers, branch targets).
+	resolver func(uint64) (string, bool)
 }
 
 // Open maps path and starts a session. opts.Out defaults to os.Stdout.
@@ -65,6 +74,10 @@ func Open(path string, opts Options) (*Session, error) {
 // Close releases the mapping and any disassembler handle. It is
 // idempotent.
 func (s *Session) Close() error {
+	if s.dis != nil {
+		s.dis.Close()
+		s.dis = nil
+	}
 	if s.img == nil {
 		return nil
 	}
