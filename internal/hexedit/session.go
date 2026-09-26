@@ -75,6 +75,10 @@ type Session struct {
 	// resolver is the lazily built ELF symbol resolver used for
 	// disassembly annotations (symbol headers, branch targets).
 	resolver func(uint64) (string, bool)
+	// funcs is the lazily built function index used by decompile.
+	funcs      []Function
+	funcsBuilt bool
+	funcsErr   error
 }
 
 // Open maps path and starts a session. opts.Out defaults to os.Stdout

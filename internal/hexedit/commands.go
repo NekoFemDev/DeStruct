@@ -47,6 +47,8 @@ func (s *Session) Exec(ctx context.Context, line string) (quit bool, err error) 
 		return false, s.cmdRead(rest)
 	case "disasm":
 		return false, s.cmdDisasm(ctx, rest)
+	case "decompile":
+		return false, s.cmdDecompile(ctx, rest)
 	case "search":
 		return false, s.cmdSearch(ctx, rest)
 	case "patch":
@@ -237,6 +239,7 @@ func (s *Session) printHelp() {
 	s.printfln(`Commands:
   read [addr] [len]   hex dump (default: cursor, 256 bytes; max 65536)
   disasm [addr] [cnt] disassemble (default: cursor, 16; ELF only)
+  decompile <func|addr>  AArch64 ELF only; addr = containing function
   search <pattern>    bytes / ASCII / ?? wildcards (see below)
   goto <addr>         move the cursor
 
