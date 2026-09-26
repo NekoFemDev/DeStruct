@@ -50,7 +50,8 @@
 - [x] Fix temporary-file ownership in `internal/pipeline/pipeline.go:extractLibapp`. Return cleanup ownership or delete the extracted `/tmp/libapp-*.so` after processing so repeated runs do not leak files.
 - [x] Replace direct `os.Exit` calls in command handlers with `func run(args []string) error`; keep process termination only in `main`. This will improve CLI testing and library reuse.
 - [x] Normalize file extensions at the pipeline boundary and validate file signatures where possible. `.JAR`, `.APK`, and similarly cased inputs should behave consistently.
-- [ ] Replace unsafe Capstone structure pointer arithmetic in `internal/native/disasm.go` with a small, version-stable C helper API. Add lifecycle checks for nil/repeated `Close` and document thread-safety.
+- [x] Replace unsafe Capstone structure pointer arithmetic in `internal/native/disasm.go` with a small, version-stable C helper API. Add lifecycle checks for nil/repeated `Close` and document thread-safety.
+  - [ ] Follow-up: Capstone 6.0.0-Alpha10 implements `cs_option(CS_OPT_DETAIL)` as `handle->detail_opt |= value` (cs.c), so `CS_OPT_OFF` is a no-op and detail mode cannot be turned back off on a handle. Decide whether to keep detail permanently on after the first detailed call or use separate handles for detailed vs text-only disassembly.
 - [x] Add `context.Context` cancellation to long-running JAR/APK, ELF, Flutter, Hermes, and IL2CPP operations so Ctrl-C and API timeouts stop work cleanly.
   - [x] Pipeline-routed: JVM/APK/DEX/ELF/Flutter (`RunContext` + per-entry/per-function checks)
   - [ ] Hermes/IL2CPP deep ctx threading (follow-up, separate session — currently boundary-only checks)

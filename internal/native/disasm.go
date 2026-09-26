@@ -4,32 +4,234 @@ package native
 #cgo CFLAGS: -I${SRCDIR}/../../third_party/capstone/../../capstone-6.0.0-Alpha10/include -DCAPSTONE_AARCH64_COMPAT_HEADER
 #cgo LDFLAGS: -L${SRCDIR}/../../third_party/capstone/build -lcapstone
 #include <capstone/capstone.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
-// Helper to read one ARM64 operand out of a cs_insn's arch-specific union
-// (cgo can't easily index into anonymous unions/nested arrays directly).
-static cs_arm64_op arm64_get_operand(cs_insn *insn, int i) {
-    return insn->detail->arm64.operands[i];
+// Version-stable accessors around Capstone structs. Go never performs
+// arithmetic on cs_insn or indexes it; every read of a Capstone struct
+// happens here, compiled against whatever header libcapstone was built
+// from. If Capstone's layout changes, only this block changes - the
+// Go-visible ABI (scalars + ds_arm64_operand) stays fixed.
+//
+// All functions validate (insns != NULL, i < count) before touching memory.
+
+static bool ds_insn_address(const cs_insn *insns, size_t count, size_t i,
+                            uint64_t *out) {
+    if (!insns || i >= count || !out)
+        return false;
+    *out = insns[i].address;
+    return true;
 }
 
-// Helper to read the ARM64-specific detail struct itself (cs_detail's
-// arch info is also an anonymous union).
-static cs_arm64 arm64_get_detail(cs_insn *insn) {
-    return insn->detail->arm64;
+static bool ds_insn_size(const cs_insn *insns, size_t count, size_t i,
+                         uint16_t *out) {
+    if (!insns || i >= count || !out)
+        return false;
+    *out = insns[i].size;
+    return true;
+}
+
+// Bounded copy from a fixed-size char[] field; the copy is limited by both
+// the real field size (sizeof, evaluated here) and the caller's cap, and is
+// always NUL-terminated.
+static bool ds_copy_cstr(const char *src, size_t src_cap, char *out,
+                         size_t cap, size_t *out_len) {
+    size_t n;
+    if (!src || !out || cap == 0)
+        return false;
+    n = strnlen(src, src_cap);
+    if (n > cap - 1)
+        n = cap - 1;
+    memcpy(out, src, n);
+    out[n] = '\0';
+    if (out_len)
+        *out_len = n;
+    return true;
+}
+
+static bool ds_insn_mnemonic(const cs_insn *insns, size_t count, size_t i,
+                             char *out, size_t cap, size_t *out_len) {
+    if (!insns || i >= count)
+        return false;
+    return ds_copy_cstr(insns[i].mnemonic, sizeof(insns[i].mnemonic), out, cap,
+                        out_len);
+}
+
+static bool ds_insn_op_str(const cs_insn *insns, size_t count, size_t i,
+                           char *out, size_t cap, size_t *out_len) {
+    if (!insns || i >= count)
+        return false;
+    return ds_copy_cstr(insns[i].op_str, sizeof(insns[i].op_str), out, cap,
+                        out_len);
+}
+
+static bool ds_insn_bytes(const cs_insn *insns, size_t count, size_t i,
+                          uint8_t *out, size_t cap, size_t *out_len) {
+    size_t n;
+    if (!insns || i >= count || (!out && cap > 0))
+        return false;
+    n = insns[i].size;
+    if (n > sizeof(insns[i].bytes))
+        n = sizeof(insns[i].bytes);
+    if (n > cap)
+        n = cap;
+    if (n && out)
+        memcpy(out, insns[i].bytes, n);
+    if (out_len)
+        *out_len = n;
+    return true;
+}
+
+// ARM64 detail. The arch union member is named arm64 under Capstone's
+// AArch64 compatibility header and aarch64 otherwise; handle both so this
+// block does not depend on -DCAPSTONE_AARCH64_COMPAT_HEADER.
+#ifdef CAPSTONE_AARCH64_COMPAT_HEADER
+#define ds_arm64_detail(det) (&(det)->arm64)
+#else
+#define ds_arm64_detail(det) (&(det)->aarch64)
+#endif
+
+static bool ds_insn_has_detail(const cs_insn *insns, size_t count, size_t i,
+                               bool *out) {
+    if (!insns || i >= count || !out)
+        return false;
+    *out = insns[i].detail != NULL;
+    return true;
+}
+
+static bool ds_insn_arm64_update_flags(const cs_insn *insns, size_t count,
+                                       size_t i, bool *out) {
+    const cs_detail *det;
+    if (!insns || i >= count || !out)
+        return false;
+    det = insns[i].detail;
+    if (!det)
+        return false;
+    *out = ds_arm64_detail(det)->update_flags;
+    return true;
+}
+
+static bool ds_insn_arm64_op_count(const cs_insn *insns, size_t count,
+                                   size_t i, uint8_t *out) {
+    const cs_detail *det;
+    uint8_t n;
+    if (!insns || i >= count || !out)
+        return false;
+    det = insns[i].detail;
+    if (!det)
+        return false;
+    n = ds_arm64_detail(det)->op_count;
+    if (n > NUM_AARCH64_OPS)
+        n = NUM_AARCH64_OPS;
+    *out = n;
+    return true;
+}
+
+// Operand layout owned by DeStruct; independent of cs_arm64_op /
+// aarch64_op_mem and of cgo's generated representation of the anonymous
+// union (formerly reached as op.anon0 in Go).
+typedef struct ds_arm64_operand {
+    int32_t op_type;   // ARM64_OP_* discriminator (0 == invalid)
+    int32_t reg;       // ARM64_OP_REG
+    int64_t imm;       // ARM64_OP_IMM
+    double fp;         // ARM64_OP_FP
+    int32_t mem_base;  // ARM64_OP_MEM
+    int32_t mem_index; // ARM64_OP_MEM
+    int64_t mem_disp;  // ARM64_OP_MEM
+} ds_arm64_operand;
+
+static bool ds_insn_arm64_operand(const cs_insn *insns, size_t count,
+                                  size_t i, size_t j, ds_arm64_operand *out) {
+    const cs_detail *det;
+    const cs_aarch64 *a64;
+    const cs_aarch64_op *op;
+    if (!insns || i >= count || !out)
+        return false;
+    det = insns[i].detail;
+    if (!det)
+        return false;
+    a64 = ds_arm64_detail(det);
+    if (j >= (size_t)a64->op_count || j >= NUM_AARCH64_OPS)
+        return false;
+    op = &a64->operands[j];
+    memset(out, 0, sizeof(*out));
+    out->op_type = (int32_t)op->type;
+    switch (op->type) {
+    case AARCH64_OP_REG:
+        out->reg = (int32_t)op->reg;
+        break;
+    case AARCH64_OP_IMM:
+        out->imm = op->imm;
+        break;
+    case AARCH64_OP_FP:
+        out->fp = op->fp;
+        break;
+    case AARCH64_OP_MEM:
+        out->mem_base = (int32_t)op->mem.base;
+        out->mem_index = (int32_t)op->mem.index;
+        out->mem_disp = op->mem.disp;
+        break;
+    default:
+        break;
+    }
+    return true;
+}
+
+// Idempotent close: no-op for NULL or already-zeroed handles; forces
+// *handle back to 0 after cs_close so a stale handle can never reach a
+// freed struct. Callers serialize against concurrent use.
+static cs_err ds_close(csh *handle) {
+    cs_err err;
+    if (handle == NULL || *handle == 0)
+        return CS_ERR_OK;
+    err = cs_close(handle);
+    *handle = 0;
+    return err;
 }
 */
 import "C"
 import (
+	"errors"
 	"fmt"
+	"sync"
 	"unsafe"
 )
 
-// Disassembler wraps Capstone's disassembly engine
+// Buffer sizes for reading C strings/byte arrays out of a cs_insn. They are
+// deliberately larger than Capstone 6's fields (mnemonic 32, op_str 160,
+// bytes 24); the C helpers clamp to the real field size via sizeof and
+// return the exact byte count, so over-sized Go buffers are safe. If a
+// future Capstone grows a field past these, the copy truncates rather than
+// reading out of bounds.
+const (
+	maxMnemonicBytes  = 64
+	maxOpStrBytes     = 256
+	maxInstructionLen = 64
+)
+
+// errDisassemblerClosed is returned by Disassemble/DisassembleDetailed when
+// the underlying Capstone handle has already been released by Close.
+var errDisassemblerClosed = errors.New("native: disassembler is closed")
+
+// Disassembler wraps Capstone's disassembly engine.
+//
+// Thread safety: a single *Disassembler serializes Disassemble,
+// DisassembleDetailed and Close internally, so those methods may be called
+// from multiple goroutines without external locking. This is deliberate:
+// Capstone handles are not safe to share between threads - cs_disasm and
+// cs_option mutate per-handle state (last error, instruction cache, detail
+// flag), so the engine expects one handle per concurrent user. The internal
+// lock supplies that serialization. For parallel lifting, prefer one
+// Disassembler per goroutine over sharing one. Values returned by
+// Disassemble/DisassembleDetailed are Go copies and are safe to read
+// concurrently once returned.
 type Disassembler struct {
+	mu     sync.Mutex
 	handle C.csh
 	arch   int
 	mode   int
+	closed bool
 }
 
 // Instruction represents a disassembled instruction
@@ -107,13 +309,83 @@ func NewDisassembler(arch, mode int) (*Disassembler, error) {
 	}, nil
 }
 
-// Close releases the disassembler resources
+// Close releases the underlying Capstone handle. It is idempotent: calling
+// it more than once, on a zero-value Disassembler, or on a nil receiver is
+// safe and does nothing after the first call. Close serializes with
+// in-flight Disassemble/DisassembleDetailed calls, so once it returns no
+// further work is running on the handle.
 func (d *Disassembler) Close() {
-	C.cs_close(&d.handle)
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return
+	}
+	d.closed = true
+	C.ds_close(&d.handle)
+}
+
+// insnCommon holds the fields shared by Instruction and
+// DetailedInstruction, read through the version-stable C accessors.
+type insnCommon struct {
+	Address  uint64
+	Size     uint32
+	Mnemonic string
+	OpStr    string
+	Bytes    []byte
+}
+
+// readInsnCommon copies instruction i's text/bytes fields out of the
+// cs_disasm result. All bounds checks happen in C; a failure here means the
+// C helper rejected the index, which indicates a lost invariant rather than
+// bad input.
+func readInsnCommon(insns *C.cs_insn, count C.size_t, i C.size_t) (insnCommon, error) {
+	var (
+		addr C.uint64_t
+		size C.uint16_t
+		mnem [maxMnemonicBytes]C.char
+		op   [maxOpStrBytes]C.char
+		raw  [maxInstructionLen]C.uint8_t
+		mlen C.size_t
+		olen C.size_t
+		blen C.size_t
+	)
+	if !C.ds_insn_address(insns, count, i, &addr) {
+		return insnCommon{}, fmt.Errorf("disasm: address read failed at instruction %d", int(i))
+	}
+	if !C.ds_insn_size(insns, count, i, &size) {
+		return insnCommon{}, fmt.Errorf("disasm: size read failed at instruction %d", int(i))
+	}
+	if !C.ds_insn_mnemonic(insns, count, i, &mnem[0], C.size_t(len(mnem)), &mlen) {
+		return insnCommon{}, fmt.Errorf("disasm: mnemonic read failed at instruction %d", int(i))
+	}
+	if !C.ds_insn_op_str(insns, count, i, &op[0], C.size_t(len(op)), &olen) {
+		return insnCommon{}, fmt.Errorf("disasm: op_str read failed at instruction %d", int(i))
+	}
+	if !C.ds_insn_bytes(insns, count, i, &raw[0], C.size_t(len(raw)), &blen) {
+		return insnCommon{}, fmt.Errorf("disasm: bytes read failed at instruction %d", int(i))
+	}
+	return insnCommon{
+		Address:  uint64(addr),
+		Size:     uint32(size),
+		Mnemonic: C.GoStringN(&mnem[0], C.int(mlen)),
+		OpStr:    C.GoStringN(&op[0], C.int(olen)),
+		Bytes:    C.GoBytes(unsafe.Pointer(&raw[0]), C.int(blen)),
+	}, nil
 }
 
 // Disassemble disassembles the given code bytes
 func (d *Disassembler) Disassemble(code []byte, address uint64, count int) ([]Instruction, error) {
+	if d == nil {
+		return nil, errDisassemblerClosed
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return nil, errDisassemblerClosed
+	}
 	if len(code) == 0 {
 		return nil, nil
 	}
@@ -128,31 +400,42 @@ func (d *Disassembler) Disassemble(code []byte, address uint64, count int) ([]In
 		}
 		return nil, nil
 	}
+	defer C.cs_free(insn, n)
 
 	result := make([]Instruction, int(n))
 	for i := 0; i < int(n); i++ {
-		inst := (*C.cs_insn)(unsafe.Pointer(uintptr(unsafe.Pointer(insn)) + uintptr(i)*unsafe.Sizeof(*insn)))
+		common, err := readInsnCommon(insn, n, C.size_t(i))
+		if err != nil {
+			return nil, err
+		}
 		result[i] = Instruction{
-			Address:  uint64(inst.address),
-			Size:     uint32(inst.size),
-			Mnemonic: C.GoString(&inst.mnemonic[0]),
-			OpStr:    C.GoString(&inst.op_str[0]),
-			Bytes:    C.GoBytes(unsafe.Pointer(&inst.bytes[0]), C.int(inst.size)),
+			Address:  common.Address,
+			Size:     common.Size,
+			Mnemonic: common.Mnemonic,
+			OpStr:    common.OpStr,
+			Bytes:    common.Bytes,
 		}
 	}
-
-	C.cs_free(insn, C.size_t(n))
 	return result, nil
 }
 
 // DisassembleDetailed disassembles code with Capstone's detail mode
 // enabled, returning structured operands (register/immediate/memory)
 // instead of only text - what an actual instruction lifter needs.
-// Currently only implemented for ARM64 (the architecture's operand
-// union is read through the arm64_get_operand C helper above); calling
-// this on a Disassembler configured for another architecture returns an
-// error.
+// Currently only implemented for ARM64; calling this on a Disassembler
+// configured for another architecture returns an error.
+//
+// Like the other methods, it is serialized against Close and concurrent
+// disassembly on the same Disassembler.
 func (d *Disassembler) DisassembleDetailed(code []byte, address uint64) ([]DetailedInstruction, error) {
+	if d == nil {
+		return nil, errDisassemblerClosed
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return nil, errDisassemblerClosed
+	}
 	if len(code) == 0 {
 		return nil, nil
 	}
@@ -160,6 +443,10 @@ func (d *Disassembler) DisassembleDetailed(code []byte, address uint64) ([]Detai
 		return nil, fmt.Errorf("DisassembleDetailed: only ARM64 is currently supported")
 	}
 
+	// NOTE: Capstone 6.0.0-Alpha10 implements CS_OPT_DETAIL as
+	// `handle->detail_opt |= value` (cs.c), so CS_OPT_OFF (0) below is a
+	// no-op: once enabled, detail mode stays on for this handle. Kept as-is
+	// deliberately; decision tracked in TODOS.md.
 	if ret := C.cs_option(d.handle, C.CS_OPT_DETAIL, C.CS_OPT_ON); ret != C.CS_ERR_OK {
 		return nil, fmt.Errorf("cs_option(CS_OPT_DETAIL) failed: %v", C.GoString(C.cs_strerror(ret)))
 	}
@@ -175,27 +462,43 @@ func (d *Disassembler) DisassembleDetailed(code []byte, address uint64) ([]Detai
 		}
 		return nil, nil
 	}
-	defer C.cs_free(insn, C.size_t(n))
+	defer C.cs_free(insn, n)
 
 	result := make([]DetailedInstruction, int(n))
 	for i := 0; i < int(n); i++ {
-		inst := (*C.cs_insn)(unsafe.Pointer(uintptr(unsafe.Pointer(insn)) + uintptr(i)*unsafe.Sizeof(*insn)))
-
+		common, err := readInsnCommon(insn, n, C.size_t(i))
+		if err != nil {
+			return nil, err
+		}
 		di := DetailedInstruction{
-			Address:  uint64(inst.address),
-			Size:     uint32(inst.size),
-			Mnemonic: C.GoString(&inst.mnemonic[0]),
-			OpStr:    C.GoString(&inst.op_str[0]),
-			Bytes:    C.GoBytes(unsafe.Pointer(&inst.bytes[0]), C.int(inst.size)),
+			Address:  common.Address,
+			Size:     common.Size,
+			Mnemonic: common.Mnemonic,
+			OpStr:    common.OpStr,
+			Bytes:    common.Bytes,
 		}
 
-		if inst.detail != nil {
-			arm64Detail := C.arm64_get_detail(inst)
-			di.WritesFlags = bool(arm64Detail.update_flags)
-			opCount := int(arm64Detail.op_count)
-			di.Operands = make([]Operand, opCount)
-			for j := 0; j < opCount; j++ {
-				op := C.arm64_get_operand(inst, C.int(j))
+		var hasDetail C.bool
+		if !C.ds_insn_has_detail(insn, n, C.size_t(i), &hasDetail) {
+			return nil, fmt.Errorf("disasm: detail probe failed at instruction %d", i)
+		}
+		if bool(hasDetail) {
+			var updateFlags C.bool
+			if !C.ds_insn_arm64_update_flags(insn, n, C.size_t(i), &updateFlags) {
+				return nil, fmt.Errorf("disasm: update_flags read failed at instruction %d", i)
+			}
+			di.WritesFlags = bool(updateFlags)
+
+			var opCount C.uint8_t
+			if !C.ds_insn_arm64_op_count(insn, n, C.size_t(i), &opCount) {
+				return nil, fmt.Errorf("disasm: op_count read failed at instruction %d", i)
+			}
+			di.Operands = make([]Operand, int(opCount))
+			for j := 0; j < int(opCount); j++ {
+				var op C.ds_arm64_operand
+				if !C.ds_insn_arm64_operand(insn, n, C.size_t(i), C.size_t(j), &op) {
+					return nil, fmt.Errorf("disasm: operand %d read failed at instruction %d", j, i)
+				}
 				di.Operands[j] = convertARM64Operand(d.handle, op)
 			}
 		}
@@ -206,27 +509,24 @@ func (d *Disassembler) DisassembleDetailed(code []byte, address uint64) ([]Detai
 	return result, nil
 }
 
-// convertARM64Operand translates one Capstone cs_arm64_op into our
+// convertARM64Operand translates one ARM64 operand - already copied into our
+// version-stable ds_arm64_operand layout by ds_insn_arm64_operand - into the
 // architecture-neutral Operand type.
-func convertARM64Operand(handle C.csh, op C.cs_arm64_op) Operand {
-	switch op._type {
+func convertARM64Operand(handle C.csh, op C.ds_arm64_operand) Operand {
+	switch op.op_type {
 	case C.ARM64_OP_REG:
-		reg := *(*C.arm64_reg)(unsafe.Pointer(&op.anon0[0]))
-		return Operand{Type: OperandReg, Reg: regName(handle, C.uint(reg))}
+		return Operand{Type: OperandReg, Reg: regName(handle, C.uint(op.reg))}
 	case C.ARM64_OP_IMM:
-		imm := *(*C.int64_t)(unsafe.Pointer(&op.anon0[0]))
-		return Operand{Type: OperandImm, Imm: int64(imm)}
+		return Operand{Type: OperandImm, Imm: int64(op.imm)}
 	case C.ARM64_OP_FP:
-		fp := *(*C.double)(unsafe.Pointer(&op.anon0[0]))
-		return Operand{Type: OperandFP, FP: float64(fp)}
+		return Operand{Type: OperandFP, FP: float64(op.fp)}
 	case C.ARM64_OP_MEM:
-		mem := *(*C.arm64_op_mem)(unsafe.Pointer(&op.anon0[0]))
-		m := MemOperand{Disp: int32(mem.disp)}
-		if mem.base != C.ARM64_REG_INVALID {
-			m.Base = regName(handle, C.uint(mem.base))
+		m := MemOperand{Disp: int32(op.mem_disp)}
+		if op.mem_base != C.ARM64_REG_INVALID {
+			m.Base = regName(handle, C.uint(op.mem_base))
 		}
-		if mem.index != C.ARM64_REG_INVALID {
-			m.Index = regName(handle, C.uint(mem.index))
+		if op.mem_index != C.ARM64_REG_INVALID {
+			m.Index = regName(handle, C.uint(op.mem_index))
 		}
 		return Operand{Type: OperandMem, Mem: m}
 	default:
