@@ -148,27 +148,29 @@ func isHexPair(s string) bool {
 // ascending order plus the exact total count. ctx is checked once per
 // block so a cancelled search stops promptly.
 func (s *Session) search(ctx context.Context, pat searchPattern, limit int) ([]int64, int, error) {
-	data := s.img.Bytes()
 	if len(pat.data) == 0 {
 		return nil, 0, fmt.Errorf("empty search pattern")
 	}
 	var hits []int64
 	total := 0
 	carry := len(pat.data) - 1
+	size := s.img.Size
 
-	for start := 0; start < len(data); {
+	for start := int64(0); start < size; {
 		if err := ctx.Err(); err != nil {
 			return nil, 0, err
 		}
 		end := start + searchBlockBytes
-		if end > len(data) {
-			end = len(data)
+		if end > size {
+			end = size
 		}
-		scanEnd := end + carry
-		if scanEnd > len(data) {
-			scanEnd = len(data)
+		scanEnd := end + int64(carry)
+		if scanEnd > size {
+			scanEnd = size
 		}
-		block := data[start:scanEnd]
+		// The block is the merged view, so search finds staged bytes
+		// exactly as read/disasm show them.
+		block := s.view(start, int(scanEnd-start))
 
 		if !pat.hasWildcards() {
 			// Fast path: bytes.Index per literal.
@@ -178,30 +180,30 @@ func (s *Session) search(ctx context.Context, pat searchPattern, limit int) ([]i
 				if k < 0 {
 					break
 				}
-				pos := start + idx + k
+				pos := start + int64(idx+k)
 				if pos >= end {
 					break // starts in the next block; it will be found there
 				}
 				total++
 				if len(hits) < limit {
-					hits = append(hits, int64(pos))
+					hits = append(hits, pos)
 				}
 				idx += k + 1
 			}
 		} else {
 			for i := 0; i+len(pat.data) <= len(block); i++ {
-				if start+i >= end {
+				if start+int64(i) >= end {
 					break
 				}
 				if pat.matchesAt(block[i:]) {
 					total++
 					if len(hits) < limit {
-						hits = append(hits, int64(start+i))
+						hits = append(hits, start+int64(i))
 					}
 				}
 			}
 		}
-		if end == len(data) {
+		if end == size {
 			break
 		}
 		start = end
