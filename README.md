@@ -12,6 +12,7 @@ Multi-format decompiler: JVM `.class`/`.jar` → Java, Android `.dex`/`.apk` →
 - **IL2CPP** — Dump Unity `global-metadata.dat` + `libil2cpp.so` to `dump.cs` (images, types, fields, properties, methods with RVA/Offset/VA/Slot, default values, attributes).
 - **PE** — Disassemble Windows PE binaries (basic).
 - **ELF disassembly** — Capstone-based disassembler for ARM64, ARM32, x86, x86-64.
+- **Hex editor** — `destruct hex`: mmap-based interactive hex editor with staged patches, atomic apply/save, search, ELF disassembly, AArch64 decompilation, and `-c` batch scripting.
 
 ## Install
 
@@ -47,6 +48,7 @@ destruct <command> [options]
 | `elf` | Disassemble ELF binaries (ARM64/ARM32/x86/x64) |
 | `il2cpp` | Dump Unity IL2CPP metadata (`global-metadata.dat` + `libil2cpp.so`) to `dump.cs` |
 | `pe` | Disassemble PE binaries |
+| `hex` | Interactive hex editor (staged patching, ELF disasm/decompile) |
 | `version` | Show version |
 | `help` | Show usage |
 
@@ -77,6 +79,11 @@ destruct flutter libapp.so -o output/
 
 # IL2CPP
 destruct il2cpp libil2cpp.so global-metadata.dat -o output/
+
+# Hex editor
+destruct hex libil2cpp.so
+destruct hex libnative.so -c "info" -c "disasm 0x1000 32"
+destruct hex libnative.so -c "search \"UnityPlayer\"" -c "read 0x2000"
 ```
 
 ### Key Flags
