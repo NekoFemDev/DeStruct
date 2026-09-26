@@ -209,3 +209,37 @@ func (img *Image) CodeSectionAtFile(off uint64) (native.SectionHeader, bool) {
 	}
 	return native.SectionHeader{}, false
 }
+
+// SectionInfo is a resolved section view for the command layer.
+type SectionInfo struct {
+	Name   string
+	Addr   uint64
+	Offset uint64
+	Size   uint64
+	Flags  uint64
+}
+
+// SectionAtFile returns the file-backed section containing a file
+// offset, if any. Sections without file content (SHT_NOBITS, and the
+// zero-size null section) never match.
+func (img *Image) SectionAtFile(off uint64) (SectionInfo, bool) {
+	if img.elf == nil {
+		return SectionInfo{}, false
+	}
+	for i := range img.elf.Sections {
+		s := &img.elf.Sections[i]
+		if !fileBacked(s) {
+			continue
+		}
+		if off >= s.Offset && off-s.Offset < s.Size {
+			return SectionInfo{
+				Name:   img.elf.SectionName(*s),
+				Addr:   s.Addr,
+				Offset: s.Offset,
+				Size:   s.Size,
+				Flags:  s.Flags,
+			}, true
+		}
+	}
+	return SectionInfo{}, false
+}

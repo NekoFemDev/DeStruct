@@ -1120,6 +1120,14 @@ func (p *ELFParser) getSectionName(sec SectionHeader) string {
 	return string(p.Data[start : start+uint64(end)])
 }
 
+// SectionName returns a section's name, including the synthetic
+// ".text"/".data"/".eh_frame_hdr" names assigned when the section table
+// is stripped and sections are rebuilt from program headers. It returns
+// "" when the name cannot be resolved.
+func (p *ELFParser) SectionName(sec SectionHeader) string {
+	return p.getSectionName(sec)
+}
+
 // CodeSection represents a section containing code
 type CodeSection struct {
 	Name    string

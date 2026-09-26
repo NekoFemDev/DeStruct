@@ -95,3 +95,28 @@ func ParseAddr(expr string) (Addr, error) {
 	}
 	return Addr{Value: value, Space: space}, nil
 }
+
+// parseCount parses a byte/instruction count. Unlike addresses, counts
+// are decimal by default (xxd-style); use 0x for hex.
+func parseCount(expr string) (int, error) {
+	text := strings.TrimSpace(expr)
+	if text == "" {
+		return 0, fmt.Errorf("empty count")
+	}
+	base := 10
+	digits := text
+	switch {
+	case strings.HasPrefix(text, "0x") || strings.HasPrefix(text, "0X"):
+		base, digits = 16, text[2:]
+	case strings.HasPrefix(text, "0d") || strings.HasPrefix(text, "0D"):
+		digits = text[2:]
+	}
+	if digits == "" {
+		return 0, fmt.Errorf("invalid count %q", expr)
+	}
+	n, err := strconv.ParseUint(digits, base, 31)
+	if err != nil {
+		return 0, fmt.Errorf("invalid count %q (decimal, or 0x<hex>)", expr)
+	}
+	return int(n), nil
+}
