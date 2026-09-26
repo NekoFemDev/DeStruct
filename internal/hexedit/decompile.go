@@ -63,9 +63,12 @@ func formatSubcommandHint(f Format) string {
 }
 
 // functions returns the session's function index, building it on first
-// use: STT_FUNC symbols first, .eh_frame_hdr boundaries only when no
-// symbol yields a function. Zero sizes are inferred from the next
-// boundary and everything is capped at maxFunctionBytes.
+// use. STT_FUNC symbols provide names and real sizes; .eh_frame_hdr
+// boundaries are always merged in as well, because a stripped shared
+// library's .dynsym typically covers only the exported functions while
+// users point at arbitrary .text addresses. Duplicate addresses keep
+// the named entry; zero/oversized sizes are inferred from the next
+// boundary and capped at maxFunctionBytes.
 func (s *Session) functions(ctx context.Context) ([]Function, error) {
 	if s.funcsBuilt {
 		return s.funcs, s.funcsErr
@@ -94,12 +97,7 @@ func (s *Session) functions(ctx context.Context) ([]Function, error) {
 		funcs = append(funcs, Function{Addr: sym.Value, Size: size, Name: name})
 	}
 
-	if len(funcs) == 0 {
-		discovered, err := elf.DiscoverFunctionsContext(ctx)
-		if err != nil {
-			s.funcsErr = fmt.Errorf("no function information: no STT_FUNC symbols and .eh_frame_hdr discovery failed (%v)", err)
-			return nil, s.funcsErr
-		}
+	if discovered, err := elf.DiscoverFunctionsContext(ctx); err == nil {
 		for _, d := range discovered {
 			size := d.Size
 			if size > maxFunctionBytes {
@@ -107,17 +105,25 @@ func (s *Session) functions(ctx context.Context) ([]Function, error) {
 			}
 			funcs = append(funcs, Function{Addr: d.Addr, Size: size, Name: fmt.Sprintf("sub_%x", d.Addr)})
 		}
+	} else if len(funcs) == 0 {
+		s.funcsErr = fmt.Errorf("no function information: no STT_FUNC symbols and .eh_frame_hdr discovery failed (%v)", err)
+		return nil, s.funcsErr
 	}
 
 	sort.Slice(funcs, func(i, j int) bool {
 		if funcs[i].Addr != funcs[j].Addr {
 			return funcs[i].Addr < funcs[j].Addr
 		}
+		iSub := strings.HasPrefix(funcs[i].Name, "sub_")
+		jSub := strings.HasPrefix(funcs[j].Name, "sub_")
+		if iSub != jSub {
+			return !iSub // keep the named entry
+		}
 		return funcs[i].Name < funcs[j].Name
 	})
 
-	// Collapse duplicate addresses (aliases) and infer zero sizes from
-	// the next boundary.
+	// Collapse duplicate addresses (aliases, symbol/eh_frame overlap)
+	// and infer zero sizes from the next boundary.
 	out := funcs[:0]
 	for _, f := range funcs {
 		if n := len(out); n > 0 && out[n-1].Addr == f.Addr {

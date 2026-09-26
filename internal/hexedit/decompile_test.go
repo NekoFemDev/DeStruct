@@ -38,6 +38,23 @@ func TestFunctionsIndex(t *testing.T) {
 		t.Fatalf("containing lookup = %+v, %v", found, ok)
 	}
 
+	// .eh_frame_hdr boundaries must be merged in even when symbols
+	// exist, so arbitrary .text addresses (not just exports) resolve.
+	if elfSession.Image().ELF() != nil {
+		if _, derr := elfSession.Image().ELF().DiscoverFunctions(); derr == nil {
+			hasSub := false
+			for _, f := range funcs {
+				if strings.HasPrefix(f.Name, "sub_") {
+					hasSub = true
+					break
+				}
+			}
+			if !hasSub {
+				t.Error("eh_frame boundaries were not merged into the function index")
+			}
+		}
+	}
+
 	// The index is cached: repeated calls return the same slice.
 	again, err := elfSession.functions(context.Background())
 	if err != nil || len(again) != len(funcs) {
