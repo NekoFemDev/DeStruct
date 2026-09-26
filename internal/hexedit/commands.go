@@ -37,6 +37,8 @@ func (s *Session) Exec(ctx context.Context, line string) (quit bool, err error) 
 		return false, s.cmdGoto(rest)
 	case "read":
 		return false, s.cmdRead(rest)
+	case "search":
+		return false, s.cmdSearch(ctx, rest)
 	case "info", "i":
 		return false, s.cmdInfo(rest)
 	default:
@@ -212,6 +214,7 @@ func sectionFlags(flags uint64) string {
 func (s *Session) printHelp() {
 	s.printfln(`Commands:
   read [addr] [len]   hex dump (default: cursor, 256 bytes; max 65536)
+  search <pattern>    bytes / ASCII / ?? wildcards (see below)
   goto <addr>         move the cursor
   info                file format, architecture and section table
   help                this text
@@ -221,6 +224,9 @@ Addresses: numbers are hex by default.
   f:0x1234   file offset (default; patches write here)
   v:0x1234   virtual address (ELF only; shown when it differs)
 Counts are decimal unless written as 0x<hex>.
+
+Search patterns: "ASCII text" (quoted), 48 65 6c (hex byte pairs),
+48656c (contiguous hex), 48 ?? 6c (?? matches any byte).
 
 The file is mapped read-only. Nothing touches disk until an explicit
 apply or save.`)
