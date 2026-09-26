@@ -30,8 +30,10 @@ func sectionAnnotation(img *Image, start int64) string {
 
 // renderHexDump writes 16-byte rows of data, which must start at file
 // offset start in img. Short rows at EOF are padded so the ASCII column
-// stays aligned.
-func renderHexDump(w io.Writer, img *Image, start int64, data []byte) {
+// stays aligned. A row containing staged bytes is prefixed "~" (staged
+// is the per-byte mask from Session.stagedMask; nil when nothing in the
+// window is staged).
+func renderHexDump(w io.Writer, img *Image, start int64, data []byte, staged []bool) {
 	if ann := sectionAnnotation(img, start); ann != "" {
 		fmt.Fprintln(w, ann)
 	}
@@ -51,15 +53,23 @@ func renderHexDump(w io.Writer, img *Image, start int64, data []byte) {
 		}
 
 		var ascii strings.Builder
-		for _, b := range chunk {
+		stagedRow := false
+		for i, b := range chunk {
 			if b >= 0x20 && b <= 0x7e {
 				ascii.WriteByte(b)
 			} else {
 				ascii.WriteByte('.')
 			}
+			if staged != nil && row+i < len(staged) && staged[row+i] {
+				stagedRow = true
+			}
+		}
+		prefix := " "
+		if stagedRow {
+			prefix = "~"
 		}
 
-		fmt.Fprintf(w, "f:0x%08x  %-*s  |%s|\n",
-			start+int64(row), hexDumpRowBytes*3-1, hexPart.String(), ascii.String())
+		fmt.Fprintf(w, "%sf:0x%08x  %-*s  |%s|\n",
+			prefix, start+int64(row), hexDumpRowBytes*3-1, hexPart.String(), ascii.String())
 	}
 }

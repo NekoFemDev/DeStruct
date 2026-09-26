@@ -31,7 +31,15 @@ func (s *Session) Exec(ctx context.Context, line string) (quit bool, err error) 
 	case "help", "?":
 		s.printHelp()
 		return false, nil
-	case "exit", "quit", "q", "q!":
+	case "q!":
+		s.patches = nil
+		s.runs = nil
+		return true, nil
+	case "exit", "quit", "q":
+		if s.dirty() {
+			s.printfln("staged patches not applied; use 'apply' to write, 'q!' to discard, or 'drop'/'clear'")
+			return false, nil
+		}
 		return true, nil
 	case "goto", "g":
 		return false, s.cmdGoto(rest)
@@ -41,6 +49,18 @@ func (s *Session) Exec(ctx context.Context, line string) (quit bool, err error) 
 		return false, s.cmdDisasm(ctx, rest)
 	case "search":
 		return false, s.cmdSearch(ctx, rest)
+	case "patch":
+		return false, s.cmdPatch(rest)
+	case "diff":
+		return false, s.cmdDiff(rest)
+	case "drop":
+		return false, s.cmdDrop(rest)
+	case "clear":
+		return false, s.cmdClear(rest)
+	case "apply":
+		return false, s.cmdApply(rest)
+	case "save":
+		return false, s.cmdSave(rest)
 	case "info", "i":
 		return false, s.cmdInfo(rest)
 	default:
@@ -114,7 +134,7 @@ func (s *Session) cmdRead(rest string) error {
 	if err != nil {
 		return err
 	}
-	renderHexDump(s.out, s.img, aligned, data)
+	renderHexDump(s.out, s.img, aligned, data, s.stagedMask(aligned, len(data)))
 	return nil
 }
 
@@ -219,9 +239,18 @@ func (s *Session) printHelp() {
   disasm [addr] [cnt] disassemble (default: cursor, 16; ELF only)
   search <pattern>    bytes / ASCII / ?? wildcards (see below)
   goto <addr>         move the cursor
+
+  patch <addr> <hex>  stage a byte patch (no disk write yet)
+  diff                show staged patches with indices
+  drop <index>        discard one staged patch
+  clear               discard all staged patches
+  apply               write staged patches to the original file
+  save [path]         write staged patches to path (default: original)
+
   info                file format, architecture and section table
   help                this text
-  exit | quit | q     leave the session
+  exit | quit | q     leave (q refuses while patches are staged)
+  q!                  leave, discarding staged patches
 
 Addresses: numbers are hex by default.
   f:0x1234   file offset (default; patches write here)
@@ -231,6 +260,13 @@ Counts are decimal unless written as 0x<hex>.
 Search patterns: "ASCII text" (quoted), 48 65 6c (hex byte pairs),
 48656c (contiguous hex), 48 ?? 6c (?? matches any byte).
 
-The file is mapped read-only. Nothing touches disk until an explicit
-apply or save.`)
+apply replaces the original file atomically after a full diff and a
+confirmation prompt (--yes skips it in scripts); patch lengths can never
+change the file size. save writes to a different path and leaves the
+original untouched.
+
+The file is mapped read-only for the whole session. If another process
+truncates it while the session is open, touching pages past the new end
+can crash the process (SIGBUS); reopen the session after external
+changes.`)
 }

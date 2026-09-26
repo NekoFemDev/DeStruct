@@ -117,13 +117,14 @@ func (s *Session) cmdDisasm(ctx context.Context, rest string) error {
 	}
 
 	// Window: exactly enough bytes for count instructions, never past
-	// the section or EOF.
+	// the section or EOF. The merged view keeps disassembly consistent
+	// with staged patches.
 	remaining := int64(sec.Offset+sec.Size) - off
 	window := int64(count * maxInstructionBytes(s.img.Machine))
 	if window > remaining {
 		window = remaining
 	}
-	code := s.img.Bytes()[off : off+window]
+	code := s.view(off, int(window))
 
 	insns, err := d.DisassembleDetailed(code, va)
 	if err != nil {
