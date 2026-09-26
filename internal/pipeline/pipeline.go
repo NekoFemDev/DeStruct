@@ -562,7 +562,7 @@ func (p *Pipeline) disassembleELF(ctx context.Context) error {
 	}
 	defer f.Abort()
 
-	if err := native.DisassembleELFFile(p.opts.Input, f); err != nil {
+	if err := native.DisassembleELFFileContext(ctx, p.opts.Input, f); err != nil {
 		return fmt.Errorf("disassemble ELF: %w", err)
 	}
 	if err := f.Commit(); err != nil {
@@ -595,7 +595,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	}
 	fmt.Printf("Parsing ELF file: %s\n", p.opts.Input)
 
-	elf, err := native.NewELFParser(p.opts.Input)
+	elf, err := native.NewELFParserContext(ctx, p.opts.Input)
 	if err != nil {
 		return fmt.Errorf("parsing ELF: %w", err)
 	}
@@ -609,7 +609,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	}
 	defer d.Close()
 
-	resolver := elf.SymbolResolver()
+	resolver := elf.SymbolResolverContext(ctx)
 	strResolver := func(addr uint64) (string, bool) { return elf.ReadCString(addr) }
 	dataReader := elf.DataReader()
 
@@ -663,7 +663,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 		// comment for why that still works even here), naming each one
 		// "sub_<address>" - there's no real name to recover, only
 		// where it starts and how big it is.
-		if discovered, discErr := elf.DiscoverFunctions(); discErr == nil {
+		if discovered, discErr := elf.DiscoverFunctionsContext(ctx); discErr == nil {
 			var discoveredCandidates []funcCandidate
 			discoveredCandidates, resolver = withDiscoveredFunctions(discovered, resolver)
 			candidates = append(candidates, discoveredCandidates...)

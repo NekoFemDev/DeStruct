@@ -1,6 +1,7 @@
 package native
 
 import (
+	"context"
 	"encoding/binary"
 	"os"
 	"runtime"
@@ -77,17 +78,17 @@ func FuzzParseELF(f *testing.F) {
 			if err := p.parseHeader(); err != nil {
 				return
 			}
-			if err := p.parseSections(); err != nil {
+			if err := p.parseSections(context.Background()); err != nil {
 				return
 			}
 			if len(p.Sections) == 0 {
-				if err := p.parseProgramSections(); err != nil {
+				if err := p.parseProgramSections(context.Background()); err != nil {
 					return
 				}
 			}
 			// NewELFParser only warns when symbol parsing fails, so the
 			// post-parse accessors keep running either way.
-			_ = p.parseSymbols()
+			_ = p.parseSymbols(context.Background())
 			_ = p.GetCodeSections()
 			_ = p.SymbolResolver()
 			_ = p.DataReader()

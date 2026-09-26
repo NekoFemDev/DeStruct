@@ -1,6 +1,7 @@
 package native
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"sort"
@@ -55,8 +56,23 @@ const (
 // else returns an error rather than risk misreading unfamiliar encoded
 // pointer bytes as addresses.
 func (p *ELFParser) DiscoverFunctions() ([]DiscoveredFunction, error) {
+	return p.DiscoverFunctionsContext(context.Background())
+}
+
+// DiscoverFunctionsContext is DiscoverFunctions with cancellation: ctx is
+// checked per section while locating .eh_frame_hdr/.text and every 4096
+// bytes of the binary search table scan, so a fully stripped binary's
+// function recovery can be aborted mid-scan instead of running to
+// completion.
+func (p *ELFParser) DiscoverFunctionsContext(ctx context.Context) ([]DiscoveredFunction, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var hdrSec, textSec *SectionHeader
 	for i := range p.Sections {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		switch p.getSectionName(p.Sections[i]) {
 		case ".eh_frame_hdr":
 			hdrSec = &p.Sections[i]
@@ -98,12 +114,17 @@ func (p *ELFParser) DiscoverFunctions() ([]DiscoveredFunction, error) {
 	pos += uint64(n)
 
 	addrs := make([]uint64, 0, fdeCount)
+	scanned := uint64(0)
 	for i := uint64(0); i < fdeCount; i++ {
+		if scanned&0xFFF == 0 && ctx.Err() != nil { // every 4096 bytes
+			return nil, ctx.Err()
+		}
 		addr, n, err := readEncodedPtr(data, pos, tableEnc, vaddr(pos), hdrSec.Addr)
 		if err != nil {
 			return nil, fmt.Errorf("decoding table entry %d (initial_location): %w", i, err)
 		}
 		pos += uint64(n)
+		scanned += uint64(n)
 		// Skip the FDE pointer itself (the second value of the pair) -
 		// only the function's own start address is needed here.
 		_, n, err = readEncodedPtr(data, pos, tableEnc, vaddr(pos), hdrSec.Addr)
@@ -111,6 +132,7 @@ func (p *ELFParser) DiscoverFunctions() ([]DiscoveredFunction, error) {
 			return nil, fmt.Errorf("decoding table entry %d (fde ptr): %w", i, err)
 		}
 		pos += uint64(n)
+		scanned += uint64(n)
 		addrs = append(addrs, addr)
 	}
 	if len(addrs) == 0 {
@@ -125,6 +147,9 @@ func (p *ELFParser) DiscoverFunctions() ([]DiscoveredFunction, error) {
 
 	result := make([]DiscoveredFunction, 0, len(addrs))
 	for i, a := range addrs {
+		if i&0xFFF == 0 && ctx.Err() != nil { // every 4096 entries
+			return nil, ctx.Err()
+		}
 		var size uint64
 		switch {
 		case i+1 < len(addrs):

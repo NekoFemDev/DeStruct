@@ -2,6 +2,7 @@ package native
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -163,6 +164,18 @@ func (p *ELFParser) elfRange(off, size uint64) bool {
 
 // NewELFParser creates a new ELF parser
 func NewELFParser(path string) (*ELFParser, error) {
+	return NewELFParserContext(context.Background(), path)
+}
+
+// NewELFParserContext is NewELFParser with cancellation. ctx is checked
+// between parse phases and inside the section/program-header/symbol/
+// relocation scans (every 4096 entries or bytes), so a parse cancelled
+// partway stops at the next scan chunk instead of running to completion.
+func NewELFParserContext(ctx context.Context, path string) (*ELFParser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read file: %w", err)
@@ -184,7 +197,7 @@ func NewELFParser(path string) (*ELFParser, error) {
 		return nil, err
 	}
 
-	if err := p.parseSections(); err != nil {
+	if err := p.parseSections(ctx); err != nil {
 		return nil, err
 	}
 
@@ -197,14 +210,21 @@ func NewELFParser(path string) (*ELFParser, error) {
 		// PT_GNU_EH_FRAME so every later stage (symbol parsing,
 		// .eh_frame_hdr function discovery, code-section extraction,
 		// string/GOT resolution) keeps working.
-		if err := p.parseProgramSections(); err != nil {
+		if err := p.parseProgramSections(ctx); err != nil {
 			return nil, err
 		}
 	}
 
-	if err := p.parseSymbols(); err != nil {
+	if err := p.parseSymbols(ctx); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
 		// Symbols are optional
 		fmt.Fprintf(os.Stderr, "warning: could not parse symbols: %v\n", err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	return p, nil
@@ -294,7 +314,7 @@ func (p *ELFParser) parseHeader() error {
 	return nil
 }
 
-func (p *ELFParser) parseSections() error {
+func (p *ELFParser) parseSections(ctx context.Context) error {
 	if p.Header.ShOff == 0 || p.Header.ShNum == 0 {
 		return nil
 	}
@@ -323,6 +343,9 @@ func (p *ELFParser) parseSections() error {
 
 	for i := 0; i < int(p.Header.ShNum); i++ {
 		// The entire table was validated before allocating Sections.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
 		data := p.Data[offset:]
 		s := SectionHeader{}
@@ -362,7 +385,7 @@ func (p *ELFParser) parseSections() error {
 // headers map the file onto memory for the kernel's loader and carry
 // the dynamic linking metadata (PT_DYNAMIC, PT_GNU_EH_FRAME), so unlike
 // section headers they must survive in any runnable binary.
-func (p *ELFParser) parseProgramHeaders() ([]ProgramHeader, error) {
+func (p *ELFParser) parseProgramHeaders(ctx context.Context) ([]ProgramHeader, error) {
 	if p.Header.PhOff == 0 || p.Header.PhNum == 0 {
 		return nil, nil
 	}
@@ -397,6 +420,9 @@ func (p *ELFParser) parseProgramHeaders() ([]ProgramHeader, error) {
 	offset := p.Header.PhOff
 	for i := 0; i < int(p.Header.PhNum); i++ {
 		// The entire table was validated before allocating phdrs.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		data := p.Data[offset:]
 
 		ph := ProgramHeader{}
@@ -447,8 +473,8 @@ func (p *ELFParser) parseProgramHeaders() ([]ProgramHeader, error) {
 // The only thing genuinely lost is the finer .text/.rodata split that
 // real section headers normally provide; FromSegments marks that so
 // ReadCString can widen its search (see its own doc comment).
-func (p *ELFParser) parseProgramSections() error {
-	phdrs, err := p.parseProgramHeaders()
+func (p *ELFParser) parseProgramSections(ctx context.Context) error {
+	phdrs, err := p.parseProgramHeaders(ctx)
 	if err != nil {
 		return err
 	}
@@ -470,6 +496,9 @@ func (p *ELFParser) parseProgramSections() error {
 
 	var dynPh *ProgramHeader
 	for i := range phdrs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		ph := &phdrs[i]
 		switch ph.Type {
 		case PT_LOAD:
@@ -535,7 +564,10 @@ func (p *ELFParser) parseProgramSections() error {
 			return nil
 		}
 	}
-	dyn := p.parseDynamicEntries(dynOff, dynPh.FileSz)
+	dyn := p.parseDynamicEntries(ctx, dynOff, dynPh.FileSz)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	addSection := func(name string, typ uint32, addr, size, entSize uint64) int {
 		off, ok := vaddrToOffset(addr)
@@ -569,7 +601,7 @@ func (p *ELFParser) parseProgramSections() error {
 
 	dynsymIdx := -1
 	if symtab, ok := dyn[DT_SYMTAB]; ok && dynstrIdx >= 0 {
-		count := p.dynamicSymbolCount(dyn, syment, vaddrToOffset)
+		count := p.dynamicSymbolCount(ctx, dyn, syment, vaddrToOffset)
 		if syment > 0 && count <= uint64(len(p.Data))/syment {
 			dynsymIdx = addSection(".dynsym", SHT_DYNSYM, symtab, count*syment, syment)
 		}
@@ -606,7 +638,7 @@ func (p *ELFParser) parseProgramSections() error {
 // linkers also zero-pad afterwards, which the size bound alone would
 // otherwise misread as more DT_NULL entries - harmless since the map
 // only ever gets looked up by specific tags.
-func (p *ELFParser) parseDynamicEntries(off, size uint64) map[int64]uint64 {
+func (p *ELFParser) parseDynamicEntries(ctx context.Context, off, size uint64) map[int64]uint64 {
 	entries := make(map[int64]uint64)
 	if off >= uint64(len(p.Data)) {
 		return entries
@@ -622,6 +654,9 @@ func (p *ELFParser) parseDynamicEntries(off, size uint64) map[int64]uint64 {
 	end := off + size
 
 	for pos := off; pos+entSize <= end; pos += entSize {
+		if pos&0xFFF == 0 && ctx.Err() != nil { // every 4096 bytes
+			return entries
+		}
 		var tag int64
 		var val uint64
 		if p.IsEndian {
@@ -658,7 +693,7 @@ func (p *ELFParser) parseDynamicEntries(off, size uint64) map[int64]uint64 {
 // which case the pre-hash symbol count DT_GNU_HASH also stores is the
 // answer); if neither is present, fall back to the distance between
 // DT_SYMTAB and DT_STRTAB, which adjacent-table linkers make exact.
-func (p *ELFParser) dynamicSymbolCount(dyn map[int64]uint64, syment uint64, vaddrToOffset func(uint64) (uint64, bool)) uint64 {
+func (p *ELFParser) dynamicSymbolCount(ctx context.Context, dyn map[int64]uint64, syment uint64, vaddrToOffset func(uint64) (uint64, bool)) uint64 {
 	if hashAddr, ok := dyn[DT_HASH]; ok {
 		if off, ok := vaddrToOffset(hashAddr); ok && p.elfRange(off, 8) {
 			read32 := binary.LittleEndian.Uint32
@@ -674,7 +709,7 @@ func (p *ELFParser) dynamicSymbolCount(dyn map[int64]uint64, syment uint64, vadd
 
 	if ghAddr, ok := dyn[DT_GNU_HASH]; ok {
 		if off, ok := vaddrToOffset(ghAddr); ok {
-			if count, ok := p.gnuHashSymbolCount(off); ok && count > 0 {
+			if count, ok := p.gnuHashSymbolCount(ctx, off); ok && count > 0 {
 				return count
 			}
 		}
@@ -698,7 +733,7 @@ func (p *ELFParser) dynamicSymbolCount(dyn map[int64]uint64, syment uint64, vadd
 // symbol. Every bucket is a symbol index; the chain word belonging to a
 // bucket's last symbol has its low bit set, so walking the chains of
 // the highest bucket index gives the symbol table's end.
-func (p *ELFParser) gnuHashSymbolCount(off uint64) (uint64, bool) {
+func (p *ELFParser) gnuHashSymbolCount(ctx context.Context, off uint64) (uint64, bool) {
 	data := p.Data
 	if !p.elfRange(off, 16) {
 		return 0, false
@@ -727,6 +762,9 @@ func (p *ELFParser) gnuHashSymbolCount(off uint64) (uint64, bool) {
 
 	maxSym := uint32(0)
 	for i := uint32(0); i < nbuckets; i++ {
+		if i&0xFFF == 0 && ctx.Err() != nil { // every 4096 entries
+			return 0, false
+		}
 		b := read32(data[bucketsOff+uint64(i)*4 : bucketsOff+uint64(i)*4+4])
 		if b > maxSym {
 			maxSym = b
@@ -745,6 +783,9 @@ func (p *ELFParser) gnuHashSymbolCount(off uint64) (uint64, bool) {
 	chainsOff := bucketsOff + uint64(nbuckets)*4
 	idx := uint64(maxSym)
 	for {
+		if idx&0xFFF == 0 && ctx.Err() != nil { // every 4096 entries
+			return 0, false
+		}
 		if idx < uint64(symoffset) {
 			return 0, false
 		}
@@ -762,11 +803,11 @@ func (p *ELFParser) gnuHashSymbolCount(off uint64) (uint64, bool) {
 	return idx, true
 }
 
-func (p *ELFParser) parseSymbols() error {
+func (p *ELFParser) parseSymbols(ctx context.Context) error {
 	for _, s := range p.Sections {
 		if s.Type == SHT_SYMTAB {
 			p.SymStrTabNdx = uint16(s.Link)
-			return p.parseSymbolTable(s)
+			return p.parseSymbolTable(ctx, s)
 		}
 	}
 	// No .symtab (a stripped binary - the common case for a real-world
@@ -779,7 +820,7 @@ func (p *ELFParser) parseSymbols() error {
 	// internal symbols left - this is what lets an otherwise
 	// symbol-less binary still decompile at all (see
 	// ELFParser.SymbolResolver's own doc comment).
-	dynsyms, dynstrNdx, err := p.parseDynsym()
+	dynsyms, dynstrNdx, err := p.parseDynsym(ctx)
 	if err != nil {
 		return fmt.Errorf("no symbol table found (checked .symtab and .dynsym): %w", err)
 	}
@@ -788,7 +829,7 @@ func (p *ELFParser) parseSymbols() error {
 	return nil
 }
 
-func (p *ELFParser) parseSymbolTable(sec SectionHeader) error {
+func (p *ELFParser) parseSymbolTable(ctx context.Context, sec SectionHeader) error {
 	var readUint32 func([]byte) uint32
 	var readUint64 func([]byte) uint64
 
@@ -822,6 +863,9 @@ func (p *ELFParser) parseSymbolTable(sec SectionHeader) error {
 	offset := sec.Offset
 	for i := uint64(0); i < count; i++ {
 		// Validated the entire table before allocating Symbols.
+		if i&0xFFF == 0 && ctx.Err() != nil { // every 4096 entries
+			return ctx.Err()
+		}
 
 		data := p.Data[offset:]
 		sym := SymbolEntry{}
@@ -1082,7 +1126,15 @@ func DisassembleSection(section CodeSection, arch, mode int) ([]Instruction, err
 
 // DisassembleELFFile disassembles all code sections in an ELF file
 func DisassembleELFFile(path string, w io.Writer) error {
-	parser, err := NewELFParser(path)
+	return DisassembleELFFileContext(context.Background(), path, w)
+}
+
+// DisassembleELFFileContext is DisassembleELFFile with cancellation: the
+// parse runs under ctx and each code section is checked before it is
+// disassembled, so a Ctrl-C stops a multi-section dump at a section
+// boundary instead of after the whole file.
+func DisassembleELFFileContext(ctx context.Context, path string, w io.Writer) error {
+	parser, err := NewELFParserContext(ctx, path)
 	if err != nil {
 		return fmt.Errorf("parse ELF: %w", err)
 	}
@@ -1097,6 +1149,9 @@ func DisassembleELFFile(path string, w io.Writer) error {
 	fmt.Fprintf(w, "; %d code sections\n\n", len(sections))
 
 	for _, sec := range sections {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		fmt.Fprintf(w, "; ===== Section: %s @ 0x%x (%d bytes) =====\n",
 			sec.Name, sec.Address, sec.Size)
 
@@ -1163,7 +1218,7 @@ func (r RelaEntry) SymbolIndex() uint32 {
 // including the mandatory empty entry 0 and non-function symbols,
 // since RelaEntry.SymbolIndex() must be able to index directly into
 // the result.
-func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
+func (p *ELFParser) parseDynsym(ctx context.Context) ([]SymbolEntry, uint16, error) {
 	var dynsymSec *SectionHeader
 	for i := range p.Sections {
 		if p.Sections[i].Type == SHT_DYNSYM {
@@ -1205,6 +1260,9 @@ func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
 	offset := dynsymSec.Offset
 	for i := uint64(0); i < count; i++ {
 		// Validated the complete table before allocating syms.
+		if i&0xFFF == 0 && ctx.Err() != nil { // every 4096 entries
+			return nil, 0, ctx.Err()
+		}
 		data := p.Data[offset:]
 		sym := SymbolEntry{}
 		if p.Header.Class == ELFCLASS64 {
@@ -1231,7 +1289,7 @@ func (p *ELFParser) parseDynsym() ([]SymbolEntry, uint16, error) {
 
 // parseRelaSection parses any SHT_RELA section (.rela.plt or .rela.dyn)
 // into its individual relocation entries.
-func (p *ELFParser) parseRelaSection(sec SectionHeader) []RelaEntry {
+func (p *ELFParser) parseRelaSection(ctx context.Context, sec SectionHeader) []RelaEntry {
 	entSize := sec.EntSize
 	if entSize == 0 {
 		if p.Header.Class == ELFCLASS64 {
@@ -1263,6 +1321,9 @@ func (p *ELFParser) parseRelaSection(sec SectionHeader) []RelaEntry {
 	offset := sec.Offset
 	for i := uint64(0); i < count; i++ {
 		// Validated the complete table before allocating entries.
+		if i&0xFFF == 0 && ctx.Err() != nil { // every 4096 entries
+			return entries
+		}
 		data := p.Data[offset:]
 		if p.Header.Class == ELFCLASS64 {
 			entries = append(entries, RelaEntry{
@@ -1294,7 +1355,17 @@ func (p *ELFParser) parseRelaSection(sec SectionHeader) []RelaEntry {
 // resolve it to the real imported function's name instead of treating
 // it as an unknown/internal call.
 func (p *ELFParser) ResolvePLT() (map[uint64]string, error) {
-	dynsyms, dynstrNdx, err := p.parseDynsym()
+	return p.ResolvePLTContext(context.Background())
+}
+
+// ResolvePLTContext is ResolvePLT with cancellation: ctx is checked per
+// section and inside the .dynsym/.rela.plt scans (every 4096 entries), so
+// a resolution cancelled partway aborts at the next scan chunk.
+func (p *ELFParser) ResolvePLTContext(ctx context.Context) (map[uint64]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dynsyms, dynstrNdx, err := p.parseDynsym(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1319,10 +1390,13 @@ func (p *ELFParser) ResolvePLT() (map[uint64]string, error) {
 	// JUMP_SLOT relocations.
 	gotToName := make(map[uint64]string)
 	for _, sec := range p.Sections {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if sec.Type != SHT_RELA || p.getSectionName(sec) != ".rela.plt" {
 			continue
 		}
-		for _, rel := range p.parseRelaSection(sec) {
+		for _, rel := range p.parseRelaSection(ctx, sec) {
 			idx := rel.SymbolIndex()
 			if int(idx) >= len(dynsyms) {
 				continue
@@ -1331,6 +1405,9 @@ func (p *ELFParser) ResolvePLT() (map[uint64]string, error) {
 			if name != "" {
 				gotToName[rel.Offset] = name
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1436,7 +1513,16 @@ const (
 // from the result - callers should treat that the same as any other
 // unresolved address (fall back to a raw numeric value).
 func (p *ELFParser) ResolveGOT() (map[uint64]string, error) {
-	dynsyms, dynstrNdx, err := p.parseDynsym()
+	return p.ResolveGOTContext(context.Background())
+}
+
+// ResolveGOTContext is ResolveGOT with cancellation: ctx is checked per
+// section and inside the symbol / .rela.dyn scans (every 4096 entries).
+func (p *ELFParser) ResolveGOTContext(ctx context.Context) (map[uint64]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	dynsyms, dynstrNdx, err := p.parseDynsym(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1462,7 +1548,10 @@ func (p *ELFParser) ResolveGOT() (map[uint64]string, error) {
 	// either table depending on whether it's also exported) by its
 	// exact address, for RELATIVE relocations to look up by target.
 	byAddr := make(map[uint64]string)
-	for _, sym := range p.Symbols {
+	for i, sym := range p.Symbols {
+		if i&0xFFF == 0 && ctx.Err() != nil { // every 4096 entries
+			return nil, ctx.Err()
+		}
 		if sym.Value == 0 {
 			continue
 		}
@@ -1481,10 +1570,13 @@ func (p *ELFParser) ResolveGOT() (map[uint64]string, error) {
 
 	result := make(map[uint64]string)
 	for _, sec := range p.Sections {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if sec.Type != SHT_RELA || p.getSectionName(sec) != ".rela.dyn" {
 			continue
 		}
-		for _, rel := range p.parseRelaSection(sec) {
+		for _, rel := range p.parseRelaSection(ctx, sec) {
 			relType := rel.Info & 0xffffffff
 			switch relType {
 			case rAARCH64_RELATIVE:
@@ -1500,6 +1592,9 @@ func (p *ELFParser) ResolveGOT() (map[uint64]string, error) {
 					result[rel.Offset] = name
 				}
 			}
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -1562,8 +1657,15 @@ func (p *ELFParser) DataReader() func(addr uint64, n int) ([]byte, bool) {
 // than a real call), and "no name at all" would otherwise be
 // indistinguishable from that.
 func (p *ELFParser) SymbolResolver() func(addr uint64) (string, bool) {
-	plt, _ := p.ResolvePLT()
-	got, _ := p.ResolveGOT()
+	return p.SymbolResolverContext(context.Background())
+}
+
+// SymbolResolverContext is SymbolResolver with cancellation: the PLT/GOT
+// relocation scans it performs run under ctx, so a caller can abort a
+// resolver build partway (the returned lookup itself is just map reads).
+func (p *ELFParser) SymbolResolverContext(ctx context.Context) func(addr uint64) (string, bool) {
+	plt, _ := p.ResolvePLTContext(ctx)
+	got, _ := p.ResolveGOTContext(ctx)
 
 	const sttFunc = 2
 	symByAddr := make(map[uint64]string)

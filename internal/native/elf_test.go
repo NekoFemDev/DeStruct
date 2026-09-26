@@ -1,6 +1,7 @@
 package native
 
 import (
+	"context"
 	"encoding/binary"
 	"os"
 	"testing"
@@ -53,7 +54,7 @@ func TestMalformedELFSectionAccess(t *testing.T) {
 	if got := p.GetCodeSections(); len(got) != 0 {
 		t.Fatalf("unexpected code sections: %v", got)
 	}
-	if got := p.parseRelaSection(SectionHeader{Offset: ^uint64(0) - 4, Size: 24}); len(got) != 0 {
+	if got := p.parseRelaSection(context.Background(), SectionHeader{Offset: ^uint64(0) - 4, Size: 24}); len(got) != 0 {
 		t.Fatalf("unexpected relocations: %v", got)
 	}
 	p.Sections[0] = SectionHeader{Type: SHT_PROGBITS, Addr: ^uint64(0) - 3, Offset: 0, Size: 8}

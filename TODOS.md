@@ -55,7 +55,7 @@
 - [x] Add `context.Context` cancellation to long-running JAR/APK, ELF, Flutter, Hermes, and IL2CPP operations so Ctrl-C and API timeouts stop work cleanly.
   - [x] Pipeline-routed: JVM/APK/DEX/ELF/Flutter (`RunContext` + per-entry/per-function checks)
   - [x] Hermes/IL2CPP deep ctx threading (done via *Context variants in hermes/{decompiler,disasm,hermesdec}.go and il2cpp/{il2cpp,dump,executor,metadata,registration,elf}.go)
-- [ ] Add mid-scan ctx checks to internal/native/elf.go (the `elf` command parser). Phase/function boundaries are covered via pipeline.RunContext, but NewELFParser / DisassembleELFFile run to completion. Same treatment as il2cpp/elf.go: check per section + every 4096 bytes in symbol/relocation scans.
+- [x] Add mid-scan ctx checks to internal/native/elf.go (the `elf` command parser) and internal/native/ehframe.go (.eh_frame_hdr function discovery). NewELFParser / DisassembleELFFile / DiscoverFunctions now have `*Context` variants (originals kept as wrappers) that check per section + every 4096 bytes in the symbol/relocation/eh_frame scans. Same treatment as il2cpp/elf.go.
 
 ### Maintainability and Tooling
 - [ ] Separate parsing, decompilation, rendering, and file-output responsibilities currently concentrated in `internal/pipeline/pipeline.go`.
