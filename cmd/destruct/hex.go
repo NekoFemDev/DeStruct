@@ -191,8 +191,12 @@ func repl(sess *hexedit.Session, in io.Reader, out io.Writer) error {
 				}
 				return <-scanErrCh
 			}
-			if err := execInterruptible(sess, line, sigCh, out); err != nil {
+			quit, err := execInterruptible(sess, line, sigCh, out)
+			if err != nil {
 				fmt.Fprintf(out, "error: %v\n", err)
+			}
+			if quit {
+				return nil
 			}
 		case <-sigCh:
 			fmt.Fprintln(out)
@@ -204,29 +208,38 @@ func repl(sess *hexedit.Session, in io.Reader, out io.Writer) error {
 	}
 }
 
+// execResult is one command's outcome: quit reports that the session
+// should end (exit/quit/q, or q! discarding staging), err carries a
+// command error. Both fields must survive the interruptible wrapper -
+// dropping quit here is what made `exit` ignore the prompt.
+type execResult struct {
+	quit bool
+	err  error
+}
+
 // execInterruptible runs one command in its own goroutine so Ctrl-C can
 // cancel it without ending the session. If a command ignores
 // cancellation, the prompt waits for it to finish.
-func execInterruptible(sess *hexedit.Session, line string, sigCh <-chan os.Signal, out io.Writer) error {
+func execInterruptible(sess *hexedit.Session, line string, sigCh <-chan os.Signal, out io.Writer) (bool, error) {
 	cmdCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	done := make(chan error, 1)
+	done := make(chan execResult, 1)
 	go func() {
-		_, err := sess.Exec(cmdCtx, line)
-		done <- err
+		quit, err := sess.Exec(cmdCtx, line)
+		done <- execResult{quit: quit, err: err}
 	}()
 
 	select {
-	case err := <-done:
-		return err
+	case r := <-done:
+		return r.quit, r.err
 	case <-sigCh:
 		cancel()
-		err := <-done
+		r := <-done
 		fmt.Fprintln(out, "interrupted")
-		if err != nil && !errors.Is(err, context.Canceled) {
-			return err
+		if r.err != nil && !errors.Is(r.err, context.Canceled) {
+			return r.quit, r.err
 		}
-		return nil
+		return r.quit, nil
 	}
 }

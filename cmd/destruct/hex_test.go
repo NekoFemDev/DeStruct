@@ -116,12 +116,15 @@ func TestRunHexBatchApplyYesAndPrompt(t *testing.T) {
 	}
 }
 
-func TestReplInteractiveSession(t *testing.T) {
+// TestReplCommandsThenEOF covers the EOF termination path: the reader
+// runs out after the commands, so the loop returns via the scanner
+// channel closing. Quit-keyword coverage lives in the open-pipe tests.
+func TestReplCommandsThenEOF(t *testing.T) {
 	path := tempHexFile(t, []byte("0123456789"))
 	var out bytes.Buffer
 
 	err := runHex(context.Background(), hexOptions{path: path},
-		strings.NewReader("goto 0x2\nread 0x0 2\nexit\n"), &out)
+		strings.NewReader("goto 0x2\nread 0x0 2\n"), &out)
 	if err != nil {
 		t.Fatalf("repl: %v", err)
 	}
@@ -133,12 +136,15 @@ func TestReplInteractiveSession(t *testing.T) {
 	}
 }
 
-func TestReplApplyConfirmationSharesInput(t *testing.T) {
+// TestReplApplyConfirmationThenEOF exercises the shared input stream
+// (apply confirmations consume from the same channel as commands) and
+// terminates via EOF, not a quit keyword.
+func TestReplApplyConfirmationThenEOF(t *testing.T) {
 	path := tempHexFile(t, make([]byte, 4))
 	var out bytes.Buffer
 
 	err := runHex(context.Background(), hexOptions{path: path},
-		strings.NewReader("patch 0x1 aa\napply\ny\nexit\n"), &out)
+		strings.NewReader("patch 0x1 aa\napply\ny\n"), &out)
 	if err != nil {
 		t.Fatalf("repl apply: %v", err)
 	}
@@ -186,6 +192,108 @@ func (w *notifyWriter) Write(p []byte) (int, error) {
 	defer w.mu.Unlock()
 	w.once.Do(func() { close(w.ready) })
 	return w.buf.Write(p)
+}
+
+func (w *notifyWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// startOpenPipeRepl starts an interactive REPL whose stdin (an io.Pipe)
+// stays open for the whole test, so session termination can only come
+// from the command under test - EOF can no longer mask a broken exit
+// path the way a strings.Reader did.
+func startOpenPipeRepl(t *testing.T, path string) (*notifyWriter, *io.PipeWriter, chan error) {
+	t.Helper()
+	out := newNotifyWriter()
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.CloseWithError(io.EOF) })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runHex(context.Background(), hexOptions{path: path}, pr, out)
+	}()
+
+	waitForCount(t, out, "f:0x00000000> ", 1)
+	return out, pw, done
+}
+
+// waitForCount polls until want has appeared at least n times, or fails
+// after 2 seconds so a broken fix fails fast instead of hanging.
+func waitForCount(t *testing.T, out *notifyWriter, want string, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Count(out.String(), want) >= n {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d occurrence(s) of %q; output:\n%s", n, want, out.String())
+}
+
+func sendReplLine(t *testing.T, pw *io.PipeWriter, line string) {
+	t.Helper()
+	if _, err := io.WriteString(pw, line+"\n"); err != nil {
+		t.Fatalf("write %q to REPL: %v", line, err)
+	}
+}
+
+// expectReplExit asserts runHex returned nil within the timeout.
+func expectReplExit(t *testing.T, done chan error, what string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("REPL returned %v after %s", err, what)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("REPL did not exit on %s while stdin stayed open", what)
+	}
+}
+
+// TestReplQuitKeywordsExitWithOpenStdin is the regression test for the
+// dropped quit flag: exit/quit/q must end the session even though the
+// input stream never reaches EOF.
+func TestReplQuitKeywordsExitWithOpenStdin(t *testing.T) {
+	for _, kw := range []string{"exit", "quit", "q"} {
+		t.Run(kw, func(t *testing.T) {
+			path := tempHexFile(t, []byte("0123456789"))
+			_, pw, done := startOpenPipeRepl(t, path)
+			sendReplLine(t, pw, kw)
+			expectReplExit(t, done, kw)
+		})
+	}
+}
+
+// TestReplDirtyQuitRefusesThenQBangExits: q with staged patches must
+// keep the session alive after printing the refusal, and q! must then
+// exit without writing anything.
+func TestReplDirtyQuitRefusesThenQBangExits(t *testing.T) {
+	path := tempHexFile(t, make([]byte, 4))
+	out, pw, done := startOpenPipeRepl(t, path)
+
+	sendReplLine(t, pw, "patch 0x1 aa")
+	waitForCount(t, out, "#0 f:0x00000001", 1)
+
+	sendReplLine(t, pw, "q")
+	waitForCount(t, out, "staged patches not applied", 1)
+	// The third prompt proves the loop continued after the refusal:
+	// initial, after patch, after refused q. The cursor moved to
+	// f:0x1, so count the prompt suffix rather than a fixed address.
+	waitForCount(t, out, "> ", 3)
+	select {
+	case err := <-done:
+		t.Fatalf("REPL exited on dirty q: %v", err)
+	default:
+	}
+
+	sendReplLine(t, pw, "q!")
+	expectReplExit(t, done, "q!")
+	if data, _ := os.ReadFile(path); data[1] != 0 {
+		t.Fatal("q! wrote staged patches")
+	}
 }
 
 func TestReplCtrlCAtPromptExits(t *testing.T) {
