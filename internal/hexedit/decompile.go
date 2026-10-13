@@ -142,6 +142,26 @@ func (s *Session) functions(ctx context.Context) ([]Function, error) {
 		}
 	}
 
+	// A function's bytes never cross a section boundary. The inference
+	// above uses the next boundary in the whole binary, and a zero-size
+	// symbol at the end of .text would otherwise absorb everything up
+	// to the next indexed entry - e.g. the whole following .plt. Clamp
+	// each entry to the section it starts in so functionContaining can
+	// never match an address in the next section.
+	for i := range out {
+		off, ok := s.img.VAToFile(out[i].Addr)
+		if !ok {
+			continue
+		}
+		sec, ok := s.img.SectionAtFile(off)
+		if !ok {
+			continue
+		}
+		if end := sec.Addr + sec.Size; end > out[i].Addr && out[i].Addr+out[i].Size > end {
+			out[i].Size = end - out[i].Addr
+		}
+	}
+
 	s.funcs = out
 	return s.funcs, nil
 }
