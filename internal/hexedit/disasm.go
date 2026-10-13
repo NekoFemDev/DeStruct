@@ -138,12 +138,26 @@ func (s *Session) cmdDisasm(ctx context.Context, rest string) error {
 	if name == "" {
 		name = "<unnamed>"
 	}
-	s.printfln("; %s f:0x%08x v:0x%08x", name, off, va)
 
+	// A misaligned AArch64 request already got the warning above; bytes
+	// that are not on a 4-byte boundary are expected to decode to
+	// garbage or nothing, so that case keeps the historical no-decode
+	// row. At a naturally aligned address, however, an executable
+	// section that decodes to nothing is data (Flutter/Dart AOT
+	// snapshots embed their runtime snapshot in .text, packed binaries
+	// hide payloads there too) - capstone returning no instruction is a
+	// decode failure there, not an empty result, and must not exit 0.
 	if len(insns) == 0 {
-		s.printfln("; no instructions decoded")
-		return nil
+		if s.img.Machine == native.EM_AARCH64 && va%4 != 0 {
+			s.printfln("; %s f:0x%08x v:0x%08x", name, off, va)
+			s.printfln("; no instructions decoded")
+			return nil
+		}
+		return fmt.Errorf("no instructions decoded at %s f:0x%08x v:0x%08x: the bytes are not valid %s code (an executable section can still contain data)",
+			name, off, va, native.GetArchName(s.img.Arch))
 	}
+
+	s.printfln("; %s f:0x%08x v:0x%08x", name, off, va)
 
 	resolver := s.symbolResolver()
 	width := maxInstructionBytes(s.img.Machine)*3 - 1
