@@ -3,6 +3,8 @@ package hexedit
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -134,5 +136,54 @@ func TestExecDisasmErrors(t *testing.T) {
 	}
 	if _, err := execLine(t, s, "disasm 0xffffff00 1"); err == nil {
 		t.Fatal("out-of-range address: expected error")
+	}
+}
+
+// TestExecDisasmUndecodableData covers an executable section whose bytes
+// are data, not instructions (Flutter/Dart AOT snapshots keep their
+// runtime snapshot inside .text): Capstone decodes nothing, and disasm
+// must fail loudly instead of exiting 0 with a silent row.
+func TestExecDisasmUndecodableData(t *testing.T) {
+	src, err := os.ReadFile(elfFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elf, err := native.NewELFParserFromData(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sec *native.SectionHeader
+	for i := range elf.Sections {
+		s := &elf.Sections[i]
+		if s.Flags&native.SHF_EXECINSTR != 0 && s.Size >= 64 {
+			sec = s
+			break
+		}
+	}
+	if sec == nil {
+		t.Fatal("fixture has no executable section")
+	}
+
+	// The leading word of a Dart AOT snapshot, which Capstone does not
+	// decode as an AArch64 instruction.
+	copy(src[sec.Offset:sec.Offset+4], []byte{0x60, 0x6a, 0x01, 0x00})
+	path := filepath.Join(t.TempDir(), "snapshot.so")
+	if err := os.WriteFile(path, src, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	s, err := Open(path, Options{Out: &buf})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+
+	_, err = execLine(t, s, fmt.Sprintf("disasm f:0x%x 4", sec.Offset))
+	if err == nil || !strings.Contains(err.Error(), "no instructions decoded") {
+		t.Fatalf("undecodable data disasm error = %v", err)
+	}
+	if out := buf.String(); strings.Contains(out, "v:0x") {
+		t.Fatalf("undecodable data produced output:\n%s", out)
 	}
 }
