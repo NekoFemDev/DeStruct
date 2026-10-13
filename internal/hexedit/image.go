@@ -151,6 +151,18 @@ func fileBacked(s *native.SectionHeader) bool {
 	return s.Type == native.SHT_PROGBITS && s.Size > 0
 }
 
+// addressable reports whether a section can be the target of a virtual
+// address: it needs file content (fileBacked) and a real virtual
+// address - either the section is allocated (SHF_ALLOC), or it carries
+// a non-zero sh_addr despite the flag. Non-allocated sections
+// (.comment, .symtab, .debug_*, .shstrtab) have sh_addr == 0 by
+// definition and no address in the loaded image; treating those as VA
+// mappings makes v:0 - and any other value colliding with their zero
+// address - silently resolve to their file offset.
+func addressable(s *native.SectionHeader) bool {
+	return fileBacked(s) && (s.Flags&native.SHF_ALLOC != 0 || s.Addr != 0)
+}
+
 // FileToVA maps a file offset to a virtual address using the ELF section
 // table (or the synthesized PT_LOAD sections when the section table is
 // stripped). ok is false when the offset falls outside every file-backed
@@ -173,14 +185,18 @@ func (img *Image) FileToVA(off uint64) (uint64, bool) {
 }
 
 // VAToFile maps a virtual address back to a file offset. ok is false
-// when the address is not inside any file-backed section.
+// when the address is not inside any file-backed, allocated section:
+// virtual addresses only exist for allocated sections, so a section
+// whose sh_addr is 0 (as every non-allocated section's is) must never
+// match - v:0 would otherwise resolve to, e.g., .comment's file
+// offset.
 func (img *Image) VAToFile(va uint64) (uint64, bool) {
 	if img.elf == nil {
 		return 0, false
 	}
 	for i := range img.elf.Sections {
 		s := &img.elf.Sections[i]
-		if !fileBacked(s) {
+		if !addressable(s) {
 			continue
 		}
 		if va < s.Addr || va-s.Addr >= s.Size {
