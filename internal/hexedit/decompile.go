@@ -279,6 +279,33 @@ func functionsNamed(funcs []Function, q string) []Function {
 	return exact
 }
 
+// annotatedResolver wraps the session's ELF symbol resolver with a
+// section fallback for data addresses. The lifter resolves a load's
+// computed address with this resolver (see arm64lift's addrRegs/liftLdr);
+// when no symbol is known, it would otherwise render the adrp/adr page
+// constant as a bare decimal ("76861440.field_3592"). Naming the address
+// ".section+0x..." from the same section map `info` prints keeps GOT and
+// .rodata accesses traceable. Executable addresses are deliberately left
+// to the symbol resolver and the lifter's own func_<addr> placeholders,
+// so call and tail-call resolution is unchanged.
+func (s *Session) annotatedResolver() arm64lift.SymbolResolver {
+	base := s.symbolResolver()
+	return func(addr uint64) (string, bool) {
+		if name, ok := base(addr); ok {
+			return name, true
+		}
+		off, ok := s.img.VAToFile(addr)
+		if !ok {
+			return "", false
+		}
+		sec, ok := s.img.SectionAtFile(off)
+		if !ok || sec.Name == "" || sec.Flags&native.SHF_EXECINSTR != 0 {
+			return "", false
+		}
+		return fmt.Sprintf("%s+0x%x", sec.Name, addr-sec.Addr), true
+	}
+}
+
 // cmdDecompile lifts one function to C-like pseudocode. The argument is
 // an address (f:/v:, or a bare number, meaning the function CONTAINING
 // that address) or a function name.
@@ -394,7 +421,7 @@ func (s *Session) cmdDecompile(ctx context.Context, rest string) error {
 	}
 
 	elf := s.img.elf
-	resolver := s.symbolResolver()
+	resolver := s.annotatedResolver()
 	strResolver := func(addr uint64) (string, bool) { return elf.ReadCString(addr) }
 	dataReader := elf.DataReader()
 
