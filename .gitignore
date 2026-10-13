@@ -76,3 +76,6 @@ third_party/capstone/build/
 /global-metadata.dat
 # NestLoader release bundle + its extracted directory
 /NestLoader*
+
+# Per-bug reproduction/hypothesis logs (local working artifacts)
+/fix-logs/
