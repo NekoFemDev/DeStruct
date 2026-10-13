@@ -155,6 +155,81 @@ func functionContaining(funcs []Function, va uint64) (Function, bool) {
 	return Function{}, false
 }
 
+// functionAt resolves the entry to decompile for a virtual address: the
+// indexed function containing va, or a disasm-only pseudo-function
+// starting at va when executable instructions exist there but neither
+// the symbol table nor .eh_frame_hdr covers them (the ELF entry point,
+// .plt stubs, cold code between discovered boundaries). ok is false only
+// when va is not inside an executable section at all.
+//
+// A single-instruction unconditional-branch entry is followed to the
+// function indexed at addr+4 when there is one: that shape is a linker
+// veneer / trampoline symbol, and the fallthrough function is the body.
+func (s *Session) functionAt(funcs []Function, va uint64) (Function, bool) {
+	if found, ok := functionContaining(funcs, va); ok {
+		return s.followBranchStub(funcs, found), true
+	}
+	return s.pseudoFunction(funcs, va)
+}
+
+// pseudoFunction synthesizes the index entry for executable code both
+// discovery sources missed. The window runs from va to the next indexed
+// boundary (while that boundary is still inside the same section) or to
+// the containing section's end, capped like every other entry.
+func (s *Session) pseudoFunction(funcs []Function, va uint64) (Function, bool) {
+	off, ok := s.img.VAToFile(va)
+	if !ok {
+		return Function{}, false
+	}
+	sec, ok := s.img.CodeSectionAtFile(off)
+	if !ok {
+		return Function{}, false
+	}
+	end := sec.Addr + sec.Size
+	for _, f := range funcs {
+		if f.Addr > va {
+			if f.Addr < end {
+				end = f.Addr
+			}
+			break
+		}
+	}
+	if end <= va {
+		return Function{}, false
+	}
+	size := end - va
+	if size > maxFunctionBytes {
+		size = maxFunctionBytes
+	}
+	return Function{Addr: va, Size: size, Name: fmt.Sprintf("sub_%x", va)}, true
+}
+
+// followBranchStub redirects a 4-byte unconditional "b" entry to the
+// function indexed at addr+4 when one starts there and is larger: the
+// stub is a trampoline, not the body the user wants decompiled.
+func (s *Session) followBranchStub(funcs []Function, f Function) Function {
+	if f.Size > 4 {
+		return f
+	}
+	off, ok := s.img.VAToFile(f.Addr)
+	if !ok {
+		return f
+	}
+	d, err := s.disassembler()
+	if err != nil {
+		return f
+	}
+	insns, err := d.DisassembleDetailed(s.view(int64(off), int(f.Size)), f.Addr)
+	if err != nil || len(insns) != 1 || insns[0].Mnemonic != "b" {
+		return f
+	}
+	next, ok := functionContaining(funcs, f.Addr+4)
+	if !ok || next.Addr != f.Addr+4 || next.Size <= f.Size {
+		return f
+	}
+	return next
+}
+
 // functionsNamed returns functions whose name matches q: exact matches
 // first, then case-insensitive exact matches, then unique
 // namespace-suffix matches ("Bar" for "Foo::Bar").
@@ -229,9 +304,9 @@ func (s *Session) cmdDecompile(ctx context.Context, rest string) error {
 			va = mapped
 			s.SetCursor(Addr{Value: va, Space: SpaceVirtual})
 		}
-		found, ok := functionContaining(funcs, va)
+		found, ok := s.functionAt(funcs, va)
 		if !ok {
-			return fmt.Errorf("no function contains v:0x%08x (use 'info' or 'disasm' to find one)", va)
+			return fmt.Errorf("no function contains v:0x%08x and it is not inside an executable section (use 'info' or 'disasm' to find code)", va)
 		}
 		target = found
 	} else {
