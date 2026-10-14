@@ -181,6 +181,22 @@ func NewELFParserContext(ctx context.Context, path string) (*ELFParser, error) {
 		return nil, fmt.Errorf("read file: %w", err)
 	}
 
+	return newELFParserFromData(ctx, data)
+}
+
+// NewELFParserFromData parses an ELF image already resident in memory.
+// This is the entry point for callers that map a file themselves
+// (internal/hexedit maps read-only to avoid copying multi-hundred-
+// megabyte binaries into the Go heap): the parser keeps referencing
+// data for its entire lifetime, so the caller must keep it alive and
+// stable until it is done with the parser. data is never written to.
+func NewELFParserFromData(data []byte) (*ELFParser, error) {
+	return newELFParserFromData(context.Background(), data)
+}
+
+// newELFParserFromData is the shared parse body behind the path-based
+// and in-memory constructors.
+func newELFParserFromData(ctx context.Context, data []byte) (*ELFParser, error) {
 	if len(data) < 16 {
 		return nil, fmt.Errorf("file too small for ELF header")
 	}
@@ -1102,6 +1118,14 @@ func (p *ELFParser) getSectionName(sec SectionHeader) string {
 	}
 
 	return string(p.Data[start : start+uint64(end)])
+}
+
+// SectionName returns a section's name, including the synthetic
+// ".text"/".data"/".eh_frame_hdr" names assigned when the section table
+// is stripped and sections are rebuilt from program headers. It returns
+// "" when the name cannot be resolved.
+func (p *ELFParser) SectionName(sec SectionHeader) string {
+	return p.getSectionName(sec)
 }
 
 // CodeSection represents a section containing code
