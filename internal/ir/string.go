@@ -184,9 +184,28 @@ func (e *LocalVar) String() string {
 
 func (e *FieldAccess) String() string {
 	if e.Object != nil {
-		return fmt.Sprintf("%s.%s", e.Object, e.Name)
+		return fmt.Sprintf("%s.%s", fieldAccessObject(e.Object), e.Name)
 	}
 	return e.Name
+}
+
+// fieldAccessObject renders a FieldAccess's object expression,
+// parenthesizing anything that is not already atomic.  Without this a
+// compound object re-binds at "field_": "(a | b).field_0" would render
+// as the misleading "a | b.field_0" (the field access appears to apply
+// to just the last term), which real lifted ARM64 code produced in
+// bulk.  Atomic forms - literals, variables, other field accesses,
+// calls, array indexing, casts, this/super - never need parentheses;
+// everything else (binary/unary/ternary/new/lambda/...) is wrapped.
+func fieldAccessObject(obj Expr) string {
+	switch obj.(type) {
+	case *IntLit, *LongLit, *FloatLit, *DoubleLit, *StringLit, *BoolLit, *NullLit,
+		*LocalVar, *FieldAccess, *MethodCall, *StaticMethodCall, *IndirectCall,
+		*ThisExpr, *SuperExpr, *CastExpr, *ArrayAccess:
+		return fmt.Sprint(obj)
+	default:
+		return "(" + fmt.Sprint(obj) + ")"
+	}
 }
 
 func (e *MethodCall) String() string {

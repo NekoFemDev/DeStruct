@@ -2306,3 +2306,87 @@ func TestLiftFunction_SharedMergeLabelLiftedOnce(t *testing.T) {
 		}
 	}
 }
+
+// renderStmtsToString renders a lifted statement list the same way the
+// CLI does, for content assertions on the textual output.
+func renderStmtsToString(stmts []ir.Stmt) string {
+	var b strings.Builder
+	RenderStmts(&b, stmts, 0)
+	return b.String()
+}
+
+// TestLiftFunction_ZeroRegisterNeverDereferenced is the regression
+// test for the "xzr.field_N" lift: a load whose base register holds the
+// architectural zero register (`mov x2, xzr; ldr x0, [x2, #0x28]`, and
+// the merge-point state approximation that folds a base to zero the
+// same way) must never render a `.field_` access on `xzr`/`wzr` - that
+// is not valid C and misnames the real base register.  The base falls
+// back to the register name from the instruction (x2), and the zero
+// register itself renders as the constant 0.
+func TestLiftFunction_ZeroRegisterNeverDereferenced(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// mov x2, xzr
+		{Address: 0x0, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x2"},
+			{Type: native.OperandReg, Reg: "xzr"},
+		}},
+		// ldr x0, [x2, #0x28]
+		{Address: 0x4, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x2", Disp: 0x28}},
+		}},
+		// ret
+		{Address: 0x8, Size: 4, Mnemonic: "ret"},
+	}
+
+	out := renderStmtsToString(LiftFunction(insns, nil, nil, nil))
+	if strings.Contains(out, "xzr.") || strings.Contains(out, "wzr.") {
+		t.Errorf("output still dereferences the zero register:\n%s", out)
+	}
+	if !strings.Contains(out, "x2.field_40") {
+		t.Errorf("expected the load's real base register (x2.field_40), got:\n%s", out)
+	}
+}
+
+// TestLiftFunction_DereferenceThroughZeroRegister covers the literal
+// zero-register base form (`ldr x0, [xzr, #0x28]`): it must render the
+// named placeholder, not "xzr.field_" or "0.field_".
+func TestLiftFunction_DereferenceThroughZeroRegister(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		{Address: 0x0, Size: 4, Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "xzr", Disp: 0x28}},
+		}},
+		{Address: 0x4, Size: 4, Mnemonic: "ret"},
+	}
+
+	out := renderStmtsToString(LiftFunction(insns, nil, nil, nil))
+	if strings.Contains(out, "xzr.") || strings.Contains(out, "0.field_") {
+		t.Errorf("null-base dereference rendered as a constant/zero deref:\n%s", out)
+	}
+	if !strings.Contains(out, "null_ptr.field_40") {
+		t.Errorf("expected the null_ptr placeholder, got:\n%s", out)
+	}
+}
+
+// TestFieldAccessStringParenthesizesCompoundObjects is the renderer
+// regression test: a FieldAccess whose object is a compound expression
+// must parenthesize it, or the "." re-binds to the object's last term
+// ("(a + b).field_0" must not render as "a + b.field_0").
+func TestFieldAccessStringParenthesizesCompoundObjects(t *testing.T) {
+	compound := &ir.FieldAccess{
+		Object: &ir.BinaryExpr{
+			Op:    "+",
+			Left:  &ir.LocalVar{Name: "a"},
+			Right: &ir.LocalVar{Name: "b"},
+		},
+		Name: "field_0",
+	}
+	if got := compound.String(); got != "(a + b).field_0" {
+		t.Errorf("compound-object FieldAccess.String() = %q, want %q", got, "(a + b).field_0")
+	}
+	atomic := &ir.FieldAccess{Object: &ir.LocalVar{Name: "p"}, Name: "field_8"}
+	if got := atomic.String(); got != "p.field_8" {
+		t.Errorf("atomic-object FieldAccess.String() = %q, want %q", got, "p.field_8")
+	}
+}

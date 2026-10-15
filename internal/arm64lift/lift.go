@@ -2311,8 +2311,9 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 	// (embedded directly, not merely referenced), so - unlike
 	// liftLdr's own base handling - it's safe to consume here too: its
 	// text is guaranteed to appear in this unconditionally-returned
-	// statement.
-	base := l.regValue(dstOp.Mem.Base)
+	// statement. memBaseExpr (see its own doc comment) keeps a
+	// constant/zero base from rendering as a literal `.field_N`.
+	base := l.memBaseExpr(dstOp.Mem.Base)
 	l.consume(base)
 	l.consume(srcVal)
 	target := &ir.FieldAccess{Object: base, Name: fmt.Sprintf("field_%d", dstOp.Mem.Disp)}
@@ -2402,7 +2403,7 @@ func (l *lifter) liftLdr(inst native.DetailedInstruction) []ir.Stmt {
 	}
 
 	if srcOp.Mem.Base != "" {
-		val := &ir.FieldAccess{Object: l.regValue(srcOp.Mem.Base), Name: fmt.Sprintf("field_%d", srcOp.Mem.Disp)}
+		val := &ir.FieldAccess{Object: l.memBaseExpr(srcOp.Mem.Base), Name: fmt.Sprintf("field_%d", srcOp.Mem.Disp)}
 		return l.setReg(dstOp.Reg, val)
 	}
 
@@ -3088,10 +3089,49 @@ func (l *lifter) liftCmp(inst native.DetailedInstruction) {
 }
 
 func (l *lifter) regValue(reg string) ir.Expr {
+	// xzr/wzr are the architectural zero registers, not storage: a
+	// write to either is discarded and a read always yields the
+	// constant 0.  Without this they fell through to the placeholder
+	// LocalVar below, so every use rendered as a variable literally
+	// named "xzr"/"wzr" - including as the base of a struct access,
+	// which produced "xzr.field_N" (not valid C) and hid the real
+	// dereference.  See memBaseExpr's own doc comment for the memory-
+	// base half of this.
+	if reg == "xzr" || reg == "wzr" {
+		return &ir.IntLit{Value: 0}
+	}
 	if v, ok := l.regs[reg]; ok {
 		return v
 	}
 	return &ir.LocalVar{Name: reg}
+}
+
+// memBaseExpr returns the expression to use as the object of a
+// FieldAccess for a memory operand whose base register is `base`: the
+// register's tracked value, or - when that value has collapsed to a
+// constant literal (the zero register, a `mov Rd, #imm` pointer, or
+// the merge-point state approximation leaving a register at 0) - a
+// placeholder LocalVar named after the register itself.  A `.field_N`
+// access on a literal ("0.field_40", "xzr.field_40") is not valid C and
+// hides which register the real dereference went through; the
+// register-named placeholder matches what regValue already emits for a
+// register the lifter never assigned a value to (see its own doc
+// comment).
+func (l *lifter) memBaseExpr(base string) ir.Expr {
+	if base == "xzr" || base == "wzr" {
+		// A dereference THROUGH the zero register is a null dereference
+		// in the source (never emitted by a compiler in real code, but
+		// a valid encoding): render a named placeholder rather than
+		// either "0.field_N" (not valid C) or "xzr.field_N" (the exact
+		// wrong lift this whole path was fixed for).
+		return &ir.LocalVar{Name: "null_ptr"}
+	}
+	v := l.regValue(base)
+	switch v.(type) {
+	case *ir.IntLit, *ir.LongLit, *ir.FloatLit, *ir.DoubleLit, *ir.StringLit, *ir.BoolLit, *ir.NullLit:
+		return &ir.LocalVar{Name: base}
+	}
+	return v
 }
 
 // liftRet lifts "ret" into a return statement carrying whatever value
