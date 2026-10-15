@@ -2084,3 +2084,225 @@ func TestLiftFunction_IndirectTailCall(t *testing.T) {
 		t.Errorf("expected the forwarded argument to be local var \"obj\", got %#v", call.Args[0])
 	}
 }
+
+// countMethodCalls walks every statement (including nested if/while/do
+// bodies) and counts calls to the named method/function.
+func countMethodCalls(stmts []ir.Stmt, name string) int {
+	n := 0
+	var walk func([]ir.Stmt)
+	walk = func(list []ir.Stmt) {
+		for _, s := range list {
+			switch v := s.(type) {
+			case *ir.ExprStmt:
+				switch e := v.Expr.(type) {
+				case *ir.StaticMethodCall:
+					if e.Method == name {
+						n++
+					}
+				case *ir.MethodCall:
+					if e.Name == name {
+						n++
+					}
+				}
+			case *ir.ReturnStmt:
+				if call, ok := v.Value.(*ir.StaticMethodCall); ok && call.Method == name {
+					n++
+				} else if call, ok := v.Value.(*ir.MethodCall); ok && call.Name == name {
+					n++
+				}
+			case *ir.IfStmt:
+				if v.Then != nil {
+					walk(v.Then.Statements)
+				}
+				if v.Else != nil {
+					walk(v.Else.Statements)
+				}
+			case *ir.WhileStmt:
+				if v.Body != nil {
+					walk(v.Body.Statements)
+				}
+			case *ir.DoWhileStmt:
+				if v.Body != nil {
+					walk(v.Body.Statements)
+				}
+			}
+		}
+	}
+	walk(stmts)
+	return n
+}
+
+// TestLiftFunction_SecondExitJoinsAtPostLoopContinuation is the
+// regression test for the loop-unroll explosion: a while loop whose
+// body has a SECOND exit edge (not the head's own branch target) that
+// falls into the same post-loop continuation as the primary exit. The
+// join handling (see loopCtx.joinAddr) must route the second exit to a
+// label at the loop's continuation instead of letting it walk out of
+// the loop with loop context and lift the whole post-loop tail INLINE
+// inside the while body - which duplicated every downstream statement
+// once per exiting path (the reported function carried 48 textually
+// identical copies of a 2-call-site sequence).
+func TestLiftFunction_SecondExitJoinsAtPostLoopContinuation(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// mov w2, #0
+		{Address: 0x0, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"}, {Type: native.OperandImm, Imm: 0},
+		}},
+		// head @ 0x4: cmp w2, w0
+		{Address: 0x4, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"}, {Type: native.OperandReg, Reg: "w0"},
+		}},
+		// b.ge exitA(0x1c)
+		{Address: 0x8, Size: 4, Mnemonic: "b.ge", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x1c},
+		}},
+		// body @ 0xc: bl step(0x100)
+		{Address: 0xc, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// cmp w2, #4
+		{Address: 0x10, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"}, {Type: native.OperandImm, Imm: 4},
+		}},
+		// b.eq exitB(0x24)      -- the second exit edge
+		{Address: 0x14, Size: 4, Mnemonic: "b.eq", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x24},
+		}},
+		// b head(0x4)           -- back edge
+		{Address: 0x18, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x4},
+		}},
+		// exitA @ 0x1c: b join(0x28)
+		{Address: 0x1c, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x28},
+		}},
+		// exitB @ 0x24: mov w4, #2  (falls through to the join)
+		{Address: 0x24, Size: 4, Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w4"}, {Type: native.OperandImm, Imm: 2},
+		}},
+		// join @ 0x28: bl tail(0x200)
+		{Address: 0x28, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x200},
+		}},
+		// ret
+		{Address: 0x2c, Size: 4, Mnemonic: "ret"},
+	}
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "step", true
+		case 0x200:
+			return "tail", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, []string{"n"}, resolver, nil)
+
+	whiles := 0
+	for _, s := range stmts {
+		if _, ok := s.(*ir.WhileStmt); ok {
+			whiles++
+		}
+	}
+	if whiles != 1 {
+		t.Fatalf("expected exactly 1 WhileStmt, got %d (%v)", whiles, stmts)
+	}
+	if got := countMethodCalls(stmts, "step"); got != 1 {
+		t.Errorf("expected step() exactly once, got %d copies", got)
+	}
+	if got := countMethodCalls(stmts, "tail"); got != 1 {
+		t.Errorf("expected tail() exactly once (second exit must join, not re-lift the tail), got %d copies", got)
+	}
+}
+
+// TestLiftFunction_SharedMergeLabelLiftedOnce is the regression test
+// for merge-label sharing: two sequential splits whose arms all
+// reconverge on the SAME merge block. The first split to commit claims
+// the label and lifts the merge continuation; the second must simply
+// jump to that same label instead of minting its own label and lifting
+// a second copy of the continuation (real -O0 dispatchers produced
+// 1356 identical copies of one continuation).
+func TestLiftFunction_SharedMergeLabelLiftedOnce(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// cmp w0, #0
+		{Address: 0x0, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"}, {Type: native.OperandImm, Imm: 0},
+		}},
+		// b.eq merge(0x18)     -- split 1, taken arm IS the merge
+		{Address: 0x4, Size: 4, Mnemonic: "b.eq", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x18},
+		}},
+		// cmp w1, #0           -- split 2 inside split 1's fallthrough arm
+		{Address: 0x8, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"}, {Type: native.OperandImm, Imm: 0},
+		}},
+		// b.eq merge(0x18)
+		{Address: 0xc, Size: 4, Mnemonic: "b.eq", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x18},
+		}},
+		// bl step2(0x100)
+		{Address: 0x10, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// b merge(0x18)
+		{Address: 0x14, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x18},
+		}},
+		// merge @ 0x18: bl tail(0x200)
+		{Address: 0x18, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x200},
+		}},
+		// ret
+		{Address: 0x1c, Size: 4, Mnemonic: "ret"},
+	}
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "step2", true
+		case 0x200:
+			return "tail", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, []string{"a", "b"}, resolver, nil)
+
+	if got := countMethodCalls(stmts, "step2"); got != 1 {
+		t.Errorf("expected step2() exactly once, got %d copies", got)
+	}
+	if got := countMethodCalls(stmts, "tail"); got != 1 {
+		t.Errorf("expected tail() exactly once (shared merge continuation must be lifted once), got %d copies", got)
+	}
+	labels := map[string]int{}
+	var collect func([]ir.Stmt)
+	collect = func(list []ir.Stmt) {
+		for _, s := range list {
+			switch v := s.(type) {
+			case *ir.LabelStmt:
+				labels[v.Name]++
+			case *ir.IfStmt:
+				if v.Then != nil {
+					collect(v.Then.Statements)
+				}
+				if v.Else != nil {
+					collect(v.Else.Statements)
+				}
+			case *ir.WhileStmt:
+				if v.Body != nil {
+					collect(v.Body.Statements)
+				}
+			case *ir.DoWhileStmt:
+				if v.Body != nil {
+					collect(v.Body.Statements)
+				}
+			}
+		}
+	}
+	collect(stmts)
+	for name, n := range labels {
+		if n != 1 {
+			t.Errorf("label %s defined %d times, want exactly 1", name, n)
+		}
+	}
+}

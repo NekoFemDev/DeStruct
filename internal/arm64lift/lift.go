@@ -243,6 +243,7 @@ func LiftFunctionWithData(instructions []native.DetailedInstruction, paramNames 
 		searchBudget: &searchBudget,
 		dataReader:   dataReader,
 		labelSeq:     &labelSeq,
+		mergeLabels:  make(map[mergeShareKey]string),
 	}
 	l.seedParams()
 
@@ -293,6 +294,19 @@ type loopCtx struct {
 	// starts. See liftDoWhileTail's own doc comment for how reaching
 	// headAddr is handled differently in this case.
 	doWhileTail *doWhileTailState
+	// joinAddr/joinLabel, when set, identify the block every path out of
+	// this loop must eventually reach (its immediate post-dominator,
+	// from cfgAnalysis.ipdom) and the label emitted in front of its
+	// continuation. A walk still in this loop's context that reaches
+	// joinAddr is leaving the loop by a route that is NOT the primary
+	// exitAddr (a second exit edge, or a split arm whose merge lies past
+	// the loop): it must jump to joinLabel - the continuation after the
+	// loop - instead of lifting the loop's tail inline or walking on
+	// with loop context, either of which duplicated entire downstream
+	// regions (see tryLiftIfElseMerge's own note on why a merge outside
+	// the loop must not be accepted as an if/else merge point).
+	joinAddr  uint64
+	joinLabel string
 }
 
 // doWhileTailState is shared (via the same *doWhileTailState pointer)
@@ -341,6 +355,14 @@ func (l *lifter) liftBlockGraph(b *BasicBlock, byAddr map[uint64]*BasicBlock, vi
 		}
 		stmts := l.flushRemaining()
 		return append(stmts, &ir.GotoStmt{Label: label})
+	}
+	// Leaving the current loop through its join block (see
+	// loopCtx.joinAddr's own doc comment): jump to the continuation
+	// after the loop, exactly like a stop above - and checked before
+	// the already-visited case for the same reason stops are.
+	if loop != nil && loop.joinAddr != 0 && b.StartAddr == loop.joinAddr {
+		stmts := l.flushRemaining()
+		return append(stmts, &ir.GotoStmt{Label: loop.joinLabel})
 	}
 	if visited[b.StartAddr] {
 		// Reaching an already-visited block via the plain
@@ -670,6 +692,12 @@ func (l *lifter) liftLoopEdge(addr uint64, byAddr map[uint64]*BasicBlock, visite
 		return []ir.Stmt{&ir.GotoStmt{Label: label}}
 	}
 	if loop != nil {
+		if addr == loop.joinAddr && loop.joinAddr != 0 {
+			// Same leaving-the-loop case liftBlockGraph's own join check
+			// handles - see loopCtx.joinAddr's doc comment - just reached
+			// directly as one arm of a conditional split.
+			return []ir.Stmt{&ir.GotoStmt{Label: loop.joinLabel}}
+		}
 		if addr == loop.headAddr {
 			if loop.doWhileTail != nil {
 				// See liftDoWhileTail's own doc comment: this arm's own
@@ -755,12 +783,51 @@ func (l *lifter) tryLiftIfElseMerge(b *BasicBlock, cond ir.Expr, thenAddr, elseA
 			merge = loop.headAddr
 		}
 	}
+	// Real -O0 if/else-if chains - inside a loop OR at the top level -
+	// have a case the two post-dominator analyses above cannot express:
+	// each arm eventually exits or loops back instead of reconverging,
+	// so the only standard post-dominator is some far-away join (or
+	// none at all), even though the split's real shared continuation is
+	// a plain nearby block (the next test link, an increment tail, ...).
+	// findSharedMerge looks for that block directly - see its own doc
+	// comment for why any genuinely shared reachable block is a sound
+	// merge point. Do-while loops get the same treatment, EXCEPT that
+	// their own tail (the condition check at the end of the body) stays
+	// the preferred merge whenever it is still available: it is what
+	// liftDoWhileTail needs to capture the loop's displayed condition,
+	// so it is never overridden for anything else (only rescued when an
+	// enclosing stop already owns it, in which case this split needs a
+	// different shared block or the ordinary fallback).
+	{
+		_, stopOwned := l.stops[merge]
+		mergeOwned := merge == 0 || l.cfg.preds[merge] < 2 || stopOwned
+		if loop != nil && !(loop.doWhileTail != nil && merge == loop.headAddr && !stopOwned) {
+			mergeOwned = mergeOwned ||
+				merge == loop.headAddr || merge == loop.exitAddr ||
+				(loop.joinAddr != 0 && merge == loop.joinAddr)
+		}
+		if mergeOwned {
+			if m := l.findSharedMerge(thenAddr, elseAddr, byAddr, loop); m != 0 {
+				merge = m
+			}
+		}
+	}
 	if merge == 0 || l.cfg.preds[merge] < 2 {
 		return nil, false
 	}
-	if merge == thenAddr || merge == elseAddr {
-		return nil, false
-	}
+	// A merge that IS one of the two successors needs no special case:
+	// ipdom/partialIPDom already guarantee that both arms reach it (the
+	// arm starting at the merge itself is trivially there), liftLoopEdge
+	// turns that arm into a single "goto <label>", and the merge and its
+	// continuation are then lifted exactly once after the label. The one
+	// visible cost is a redundant "else { goto L; }" when merge ==
+	// elseAddr - still linear output, where falling back to the plain
+	// if/else path would lift the ENTIRE downstream continuation
+	// independently for BOTH arms (the duplication this whole merge
+	// mechanism exists to prevent; on real code an early branch whose
+	// merge is its fallthrough arm is extremely common, e.g. a function
+	// whose prologue tests a flag and the not-taken side is the main
+	// body).
 	// If the merge is already owned by an ENCLOSING split's own stop
 	// (same address), that outer label is where this continuation
 	// belongs: nesting a new label+goto pair here would emit
@@ -783,12 +850,30 @@ func (l *lifter) tryLiftIfElseMerge(b *BasicBlock, cond ir.Expr, thenAddr, elseA
 	if !isTail && loop != nil && (merge == loop.headAddr || merge == loop.exitAddr) {
 		return nil, false
 	}
+	// The enclosing loop's own join block is not a valid if/else merge
+	// point either: accepting it would emit the label (and lift the
+	// entire post-loop continuation) INSIDE the loop body, with loop
+	// context still active for everything after it - the two arms
+	// instead leave via liftLoopEdge/liftBlockGraph's own join checks,
+	// each emitting `goto <join label>`. See loopCtx.joinAddr's own doc
+	// comment.
+	if loop != nil && loop.joinAddr != 0 && merge == loop.joinAddr {
+		return nil, false
+	}
 	mergeBlk, ok := byAddr[merge]
 	if !ok {
 		return nil, false
 	}
 
-	label := fmt.Sprintf("L_%x_%d", merge, l.nextLabel())
+	key := mergeShareKey{addr: merge}
+	if loop != nil {
+		key.loopHead = loop.headAddr
+	}
+	label, shared := l.mergeLabels[key]
+	if !shared {
+		label = fmt.Sprintf("L_%x_%d", merge, l.nextLabel())
+		l.mergeLabels[key] = label
+	}
 	used := false
 	// Inherit any enclosing stops (see liftBlockGraph's own stop check)
 	// and add this split's own merge - an arm that hits an enclosing
@@ -806,7 +891,12 @@ func (l *lifter) tryLiftIfElseMerge(b *BasicBlock, cond ir.Expr, thenAddr, elseA
 		// continuation to lift, and the ordinary if/else handles the
 		// arms identically. The forked arm lifters above are discarded
 		// untouched - fork() only copies state, so l itself is
-		// unaffected (apart from the shared budget).
+		// unaffected (apart from the shared budget). A claim this call
+		// made itself is released again so a later split that does
+		// reach the merge can own the label.
+		if !shared {
+			delete(l.mergeLabels, key)
+		}
 		return nil, false
 	}
 
@@ -815,6 +905,14 @@ func (l *lifter) tryLiftIfElseMerge(b *BasicBlock, cond ir.Expr, thenAddr, elseA
 		Then: &ir.Block{Statements: thenStmts},
 		Else: &ir.Block{Statements: elseStmts},
 	}}
+	if shared {
+		// An earlier split already claimed this merge: it emitted the
+		// label and lifted the shared continuation exactly once, and
+		// both arms above simply jump there. Emitting a second label
+		// and a second copy of the continuation here is precisely the
+		// per-split tail duplication mergeLabels exists to prevent.
+		return stmts, true
+	}
 	stmts = append(stmts, &ir.LabelStmt{Name: label})
 	if isTail {
 		stmts = append(stmts, l.liftDoWhileTail(loop, byAddr)...)
@@ -907,6 +1005,101 @@ func (l *lifter) reachesAddr(startAddr, target uint64, byAddr map[uint64]*BasicB
 		}
 	}
 	return false
+}
+
+// bfsShared returns each block address reachable from start without
+// crossing out of the current split region, mapped to its BFS depth
+// from start (minimum successor-edge count). A region boundary is
+// either the enclosing loop's own head/exit/join (see loopCtx.joinAddr)
+// or any block an enclosing split already owns as a stop (l.stops):
+// paths crossing those have left the region by definition, and the
+// boundary block itself is included in the result (a caller can see an
+// arm terminates there) but never expanded past. loop may be nil (a
+// split outside any loop), in which case only the stop boundaries
+// apply. Draws from l.searchBudget like every other speculative search
+// in this file; exhaustion simply returns a partial map, always safe
+// for the same reason (see reachesAddr's doc comment).
+func (l *lifter) bfsShared(start uint64, byAddr map[uint64]*BasicBlock, loop *loopCtx) map[uint64]int {
+	depth := map[uint64]int{}
+	queue := []uint64{start}
+	depth[start] = 0
+	for len(queue) > 0 {
+		if *l.searchBudget <= 0 {
+			return depth
+		}
+		*l.searchBudget--
+		addr := queue[0]
+		queue = queue[1:]
+		if loop != nil && (addr == loop.headAddr || addr == loop.exitAddr || (loop.joinAddr != 0 && addr == loop.joinAddr)) {
+			continue
+		}
+		if _, owned := l.stops[addr]; owned {
+			continue
+		}
+		blk, ok := byAddr[addr]
+		if !ok {
+			continue
+		}
+		for _, s := range blk.Succs {
+			if _, seen := depth[s]; !seen {
+				depth[s] = depth[addr] + 1
+				queue = append(queue, s)
+			}
+		}
+	}
+	return depth
+}
+
+// findSharedMerge finds the nearest block both arms of a split can
+// reach WITHOUT crossing out of the current split region (see
+// bfsShared): the common block with the smallest summed BFS depth from
+// thenAddr and elseAddr. Unlike standard post-dominance (or
+// partial-post-dominance) this deliberately treats reaching the
+// enclosing loop's own head/exit/join, or an enclosing split's stop,
+// as "left the region, not a coincidence": the two arms of an ordinary
+// compiled if/else-if chain very often share only a plain continuation
+// block (the increment tail, the next test link) because some arm
+// eventually exits or loops back instead, which is exactly the case
+// ipdom resolves to a far-away join (or nothing at all) and cannot
+// tell apart from a genuine outer merge.
+//
+// Soundness does not depend on the pick being the *immediate*
+// post-dominator: tryLiftIfElseMerge's label/goto form is correct for
+// ANY block both arms actually reach - each arm simply stops there, and
+// a path that instead hits an enclosing loop's own head/exit/join or an
+// enclosing stop is intercepted by that boundary's own handling first.
+// The nearest shared block just keeps the emitted continuation as small
+// as possible.
+func (l *lifter) findSharedMerge(thenAddr, elseAddr uint64, byAddr map[uint64]*BasicBlock, loop *loopCtx) uint64 {
+	thenDepth := l.bfsShared(thenAddr, byAddr, loop)
+	elseDepth := l.bfsShared(elseAddr, byAddr, loop)
+	if len(thenDepth) == 0 || len(elseDepth) == 0 {
+		return 0
+	}
+	best, bestScore := uint64(0), 0
+	for addr, dt := range thenDepth {
+		de, ok := elseDepth[addr]
+		if !ok {
+			continue
+		}
+		if loop != nil && (addr == loop.headAddr || addr == loop.exitAddr || (loop.joinAddr != 0 && addr == loop.joinAddr)) {
+			continue
+		}
+		if _, owned := l.stops[addr]; owned {
+			continue
+		}
+		if _, exists := byAddr[addr]; !exists {
+			continue
+		}
+		if l.cfg != nil && l.cfg.preds[addr] < 2 {
+			continue
+		}
+		score := dt + de
+		if best == 0 || score < bestScore || (score == bestScore && addr < best) {
+			best, bestScore = addr, score
+		}
+	}
+	return best
 }
 
 // isPlainConditionLink reports whether blk has the exact minimal shape
@@ -1079,6 +1272,28 @@ func (l *lifter) tryLiftWhileLoop(head *BasicBlock, cond ir.Expr, thenAddr, else
 		return nil, false
 	}
 
+	// Identify the loop's post-exit join: the block the CFG says EVERY
+	// path from the head must eventually reach (cfgAnalysis.ipdom) -
+	// where all of the loop's exits, not just the primary exitAddr,
+	// reconverge. A walk still inside the loop that reaches it is
+	// leaving the loop by some other route (a second exit edge, or a
+	// split arm whose merge lies past the loop); without treating it as
+	// a stop, such a walk lifts the whole post-loop continuation inline
+	// INSIDE the loop body, and every fork repeats that - the exact
+	// duplicated-output blowup loopCtx.joinAddr's own doc comment
+	// describes. joinAddr == 0 (no join, e.g. no reconvergence, or an
+	// enclosing split already owns that block as its own stop) just
+	// disables the mechanism and keeps the historical behavior.
+	joinAddr, joinLabel := uint64(0), ""
+	if l.cfg != nil {
+		if j := l.cfg.ipdom[head.StartAddr]; j != 0 && j != head.StartAddr && j != bodyAddr && j != exitAddr && l.cfg.preds[j] >= 2 {
+			if _, owned := l.stops[j]; !owned {
+				joinAddr = j
+				joinLabel = fmt.Sprintf("L_%x_%d", j, l.nextLabel())
+			}
+		}
+	}
+
 	// The body is lifted with its own forked lifter, exactly like an
 	// if/else branch (see liftBlockGraph's own reasoning): its
 	// register writes are per-iteration state that must not leak into
@@ -1093,7 +1308,7 @@ func (l *lifter) tryLiftWhileLoop(head *BasicBlock, cond ir.Expr, thenAddr, else
 	// into a continue/break instead of ordinary (or blocked-by-
 	// visited) control flow.
 	bodyLifter := l.fork()
-	bodyStmts := bodyLifter.liftBlockGraph(bodyBlock, byAddr, cloneVisited(visited), &loopCtx{headAddr: head.StartAddr, exitAddr: exitAddr})
+	bodyStmts := bodyLifter.liftBlockGraph(bodyBlock, byAddr, cloneVisited(visited), &loopCtx{headAddr: head.StartAddr, exitAddr: exitAddr, joinAddr: joinAddr, joinLabel: joinLabel})
 	// The body's natural end (reaching head again via the plain
 	// single-successor path - see liftBlockGraph's own note on why
 	// that's implicit, unlike an explicit continue) is NOT treated as
@@ -1111,7 +1326,29 @@ func (l *lifter) tryLiftWhileLoop(head *BasicBlock, cond ir.Expr, thenAddr, else
 
 	stmts := []ir.Stmt{&ir.WhileStmt{Cond: whileCond, Body: &ir.Block{Statements: bodyStmts}}}
 	if exitBlock, ok := byAddr[exitAddr]; ok {
-		stmts = append(stmts, l.liftBlockGraph(exitBlock, byAddr, visited, outerLoop)...)
+		if joinAddr != 0 {
+			// Lift the primary exit path with the join active so it
+			// itself stops (goto) at the join instead of walking
+			// through it; the join block's continuation is then lifted
+			// exactly once, after the label, in the OUTER context -
+			// never the loop's own (see loopCtx.joinAddr's doc
+			// comment). The outer context is preserved because the
+			// primary exit path may still resolve to an enclosing
+			// loop's continue/break.
+			contCtx := &loopCtx{}
+			if outerLoop != nil {
+				*contCtx = *outerLoop
+			}
+			contCtx.joinAddr = joinAddr
+			contCtx.joinLabel = joinLabel
+			stmts = append(stmts, l.liftBlockGraph(exitBlock, byAddr, visited, contCtx)...)
+			stmts = append(stmts, &ir.LabelStmt{Name: joinLabel})
+			if joinBlk, ok := byAddr[joinAddr]; ok {
+				stmts = append(stmts, l.liftBlockGraph(joinBlk, byAddr, visited, outerLoop)...)
+			}
+		} else {
+			stmts = append(stmts, l.liftBlockGraph(exitBlock, byAddr, visited, outerLoop)...)
+		}
 	}
 	return stmts, true
 }
@@ -1347,7 +1584,7 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.addrRegs {
 		addrRegs[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq}
+	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1603,6 +1840,31 @@ type lifter struct {
 	// rendered C/LLVM would contain duplicate labels inside one
 	// function.
 	labelSeq *int
+
+	// mergeLabels, shared across every fork (a map is a reference type),
+	// records the label already claimed or emitted for a merge block,
+	// keyed by the merge address AND the innermost loop head active
+	// where the claim happened (a merge reached from a different loop
+	// context must not share a label: the continuation was lifted under
+	// its own loop's continue/break/join semantics). When a later split
+	// resolves to a merge point some earlier split already owned, its
+	// arms simply jump to the existing label instead of minting a new
+	// one and lifting the whole continuation a second time. Without
+	// this, a dispatcher whose condition chain funnels every arm into
+	// one shared tail re-lifts that tail once per split - real -O0 code
+	// produced 1356 identical copies of the same continuation label in
+	// one function, and the whole-binary output stayed in the hundreds
+	// of megabytes even with loops correctly recognized.
+	mergeLabels map[mergeShareKey]string
+}
+
+// mergeShareKey identifies one merge-label sharing scope: the merge
+// block itself, plus the innermost enclosing loop head (0 at the top
+// level) whose continue/break/join semantics its continuation was
+// lifted under.
+type mergeShareKey struct {
+	addr     uint64
+	loopHead uint64
 }
 
 // nextLabel returns the next merge-label serial number for this
