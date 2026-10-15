@@ -1,6 +1,7 @@
 package arm64lift
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -150,6 +151,166 @@ func TestLiftFunction_BudgetCapsExponentialBlowup(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("LiftFunction did not return within 5s - the block-visit budget cap appears not to be working")
+	}
+}
+
+// TestLiftFunction_LargeFunctionNotTruncatedBySearchBudget is the
+// regression test for the "large function silently truncated after an
+// empty-body while loop" bug. The speculative CFG searches reachesAddr
+// and findDoWhileTail used to draw from the SAME budget pointer as
+// liftBlockGraph itself; on a function with enough blocks their
+// O(blocks^2) walking consumed the shared 20000-unit cap before the
+// structural lift got far, so every remaining block - the empty-if
+// arms inside the loop and all the real work after it - lifted to
+// nothing (see lifter.searchBudget's own doc comment).
+//
+// The stream below is a chain of 200 if/else links - each link a head
+// conditionally branching to two one-instruction arms that both join
+// at a merge block, the shape tryLiftIfElseMerge lifts once instead of
+// duplicating - followed by exactly the reported shape: a while whose
+// body is a single empty if, and then real trailing work, a call to a
+// resolver-known symbol. Under the shared-budget bug the trailing call
+// never made it into the lifted statements; the test requires it.
+func TestLiftFunction_LargeFunctionNotTruncatedBySearchBudget(t *testing.T) {
+	const links = 200
+	const markerAddr = 0xdead4
+
+	reg := func(name string) native.Operand {
+		return native.Operand{Type: native.OperandReg, Reg: name}
+	}
+	imm := func(v uint64) native.Operand {
+		return native.Operand{Type: native.OperandImm, Imm: int64(v)}
+	}
+
+	var insns []native.DetailedInstruction
+	addr := uint64(0x1000)
+	emit := func(mnemonic string, ops ...native.Operand) uint64 {
+		a := addr
+		insns = append(insns, native.DetailedInstruction{
+			Address: a, Size: 4, Mnemonic: mnemonic, Operands: ops,
+		})
+		addr += 4
+		return a
+	}
+
+	// Each link is 6 instructions:
+	//   L+0x00: cmp w0, #i     head condition
+	//   L+0x04: b.eq L+0x10    taken -> then arm
+	//   L+0x08: mov w3, #i     fallthrough -> else arm
+	//   L+0x0c: b L+0x18       else arm -> merge
+	//   L+0x10: mov w4, #i     then arm
+	//   L+0x14: b L+0x18       then arm -> merge
+	//   L+0x18:                 next link
+	for i := 0; i < links; i++ {
+		base := addr
+		emit("cmp", reg("w0"), imm(uint64(i)))
+		emit("b.eq", imm(base+0x10))
+		emit("mov", reg("w3"), imm(uint64(i)))
+		emit("b", imm(base+0x18))
+		emit("mov", reg("w4"), imm(uint64(i)))
+		emit("b", imm(base+0x18))
+	}
+
+	// The reported shape: while (w2 > 0) { if (w1 < 2) {} } - the
+	// while's body is exactly one empty if (whose conditional branch
+	// targets its own fallthrough, so both arms reconverge there), and
+	// the block after the loop is real, reachable work.
+	loopHead := addr
+	emit("cmp", reg("w2"), imm(0))
+	branchToExit := len(insns) // "b.le loopExit", patched below
+	emit("b.le", imm(0))
+	emit("cmp", reg("w1"), imm(2))
+	branchToEndIf := len(insns) // "b.lt endIf", patched below
+	emit("b.lt", imm(0))
+	endIf := addr
+	emit("b", imm(loopHead))
+	loopExit := addr
+	emit("bl", imm(markerAddr))
+	emit("ret")
+
+	insns[branchToExit].Operands[0].Imm = int64(loopExit)
+	// Empty then: the "skip the body" target IS the fallthrough block.
+	insns[branchToEndIf].Operands[0].Imm = int64(endIf)
+
+	resolver := func(a uint64) (string, bool) {
+		if a == markerAddr {
+			return "tail_marker", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunctionWithData(insns, nil, resolver, nil, nil, false)
+
+	// The trailing call can sit at the top level or inside whatever
+	// structure the chain recovery produced; walk the whole statement
+	// tree looking for it.
+	var found bool
+	var walkExpr func(e ir.Expr)
+	var walk func(list []ir.Stmt)
+	walkExpr = func(e ir.Expr) {
+		if c, ok := e.(*ir.StaticMethodCall); ok && c.Method == "tail_marker" {
+			found = true
+		}
+	}
+	walk = func(list []ir.Stmt) {
+		for _, s := range list {
+			switch v := s.(type) {
+			case *ir.ExprStmt:
+				walkExpr(v.Expr)
+			case *ir.ReturnStmt:
+				walkExpr(v.Value)
+			case *ir.IfStmt:
+				if v.Then != nil {
+					walk(v.Then.Statements)
+				}
+				if v.Else != nil {
+					walk(v.Else.Statements)
+				}
+			case *ir.WhileStmt:
+				if v.Body != nil {
+					walk(v.Body.Statements)
+				}
+			case *ir.DoWhileStmt:
+				if v.Body != nil {
+					walk(v.Body.Statements)
+				}
+			case *ir.SwitchStmt:
+				for _, c := range v.Cases {
+					if c.Body != nil {
+						walk(c.Body.Statements)
+					}
+				}
+				if v.Default != nil {
+					walk(v.Default.Statements)
+				}
+			case *ir.TryStmt:
+				if v.Body != nil {
+					walk(v.Body.Statements)
+				}
+				for _, c := range v.Catches {
+					if c.Body != nil {
+						walk(c.Body.Statements)
+					}
+				}
+				if v.Finally != nil {
+					walk(v.Finally.Statements)
+				}
+			case *ir.BlockStmt:
+				if v.Block != nil {
+					walk(v.Block.Statements)
+				}
+			}
+		}
+	}
+	walk(stmts)
+	if !found {
+		var b strings.Builder
+		RenderStmts(&b, stmts, 0)
+		out := b.String()
+		if len(out) > 3000 {
+			out = out[len(out)-3000:]
+		}
+		t.Fatalf("tail_marker() after the empty-body while loop was dropped: the lift truncated (%d top-level statements lifted)\n--- tail ---\n%s", len(stmts), out)
 	}
 }
 
