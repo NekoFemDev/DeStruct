@@ -228,19 +228,21 @@ func LiftFunction(instructions []native.DetailedInstruction, paramNames []string
 // non-nil it enables jump-table switch statement detection.
 func LiftFunctionWithData(instructions []native.DetailedInstruction, paramNames []string, resolver SymbolResolver, strResolver StringResolver, dataReader func(uint64, int) ([]byte, bool), simplify bool) []ir.Stmt {
 	budget := blockVisitBudget
+	searchBudget := searchVisitBudget
 	labelSeq := 0
 	l := &lifter{
-		regs:       make(map[string]ir.Expr),
-		stack:      make(map[int32]string),
-		params:     paramNames,
-		resolver:   resolver,
-		strings:    strResolver,
-		addrRegs:   make(map[string]uint64),
-		consumed:   make(map[ir.Expr]bool),
-		resultRegs: make(map[string]bool),
-		budget:     &budget,
-		dataReader: dataReader,
-		labelSeq:   &labelSeq,
+		regs:         make(map[string]ir.Expr),
+		stack:        make(map[int32]string),
+		params:       paramNames,
+		resolver:     resolver,
+		strings:      strResolver,
+		addrRegs:     make(map[string]uint64),
+		consumed:     make(map[ir.Expr]bool),
+		resultRegs:   make(map[string]bool),
+		budget:       &budget,
+		searchBudget: &searchBudget,
+		dataReader:   dataReader,
+		labelSeq:     &labelSeq,
 	}
 	l.seedParams()
 
@@ -860,12 +862,13 @@ func (l *lifter) liftDoWhileTail(loop *loopCtx, byAddr map[uint64]*BasicBlock) [
 // following successor edges through byAddr - a plain breadth-first
 // search over the CFG, used only to answer "does this path loop back
 // to the block we started from" (see tryLiftWhileLoop), not to lift
-// anything. Shares l.budget with liftBlockGraph's own visit count (see
-// its doc comment): a function whose if/else nesting is already eating
-// into the budget shouldn't ALSO get an unbounded amount of extra work
+// anything. The search draws from l.searchBudget (see its own doc
+// comment): a function shouldn't get an unbounded amount of extra work
 // from every candidate loop shape trying two of these - exhausting the
-// budget here simply answers false (safe: the caller falls back to
-// treating the block as an ordinary if/else, never a crash or a hang).
+// search budget here simply answers false (safe: the caller falls back to
+// treating the block as an ordinary if/else, never a crash or a hang,
+// and never a truncated lift - the lift budget is a separate counter
+// precisely so searches cannot starve it).
 //
 // boundary, when non-nil, is the loop context ALREADY active where
 // this search began (tryLiftWhileLoop's own outerLoop) - reaching
@@ -883,10 +886,10 @@ func (l *lifter) reachesAddr(startAddr, target uint64, byAddr map[uint64]*BasicB
 	seen := map[uint64]bool{}
 	queue := []uint64{startAddr}
 	for len(queue) > 0 {
-		if *l.budget <= 0 {
+		if *l.searchBudget <= 0 {
 			return false
 		}
-		*l.budget--
+		*l.searchBudget--
 		addr := queue[0]
 		queue = queue[1:]
 		if addr == target {
@@ -966,7 +969,7 @@ func isPlainConditionLink(blk *BasicBlock) bool {
 // candidate address after this one fails is never working with a
 // partially-mutated l. No explicit recursion-depth limit: an
 // arbitrarily long real "a || b || c || ..." chain is just as valid to
-// recognize as a short one, and l.budget (shared with every other
+// recognize as a short one, and l.searchBudget (shared with every other
 // speculative search in this file - see reachesAddr's own doc comment)
 // already bounds the total work regardless of how deep this goes.
 func (l *lifter) tryOrChainLink(headAddr, addr uint64, byAddr map[uint64]*BasicBlock, outerLoop *loopCtx) (cond ir.Expr, bodyAddr, exitAddr uint64, ok bool) {
@@ -1245,10 +1248,11 @@ func (l *lifter) tryLiftDoWhileLoop(b *BasicBlock, byAddr map[uint64]*BasicBlock
 // it for tryLiftWhileLoop/liftLoopEdge to correctly recognize as an
 // ordinary nested continue instead.
 //
-// Shares l.budget with liftBlockGraph's own visit count and
-// reachesAddr's own BFS (see their doc comments): exhausting it here
-// simply answers ok=false, safe for the same reason - the caller falls
-// back to lifting b as an ordinary block, never a crash or a hang.
+// Draws from l.searchBudget, the counter shared with reachesAddr's own
+// BFS and deliberately separate from liftBlockGraph's lift budget (see
+// searchBudget's own doc comment): exhausting it here simply answers
+// ok=false, safe for the same reason - the caller falls back to lifting
+// b as an ordinary block, never a crash, a hang, or a truncated lift.
 // outerLoop is passed through to reachesAddr as its own boundary
 // parameter, for the same reason tryLiftWhileLoop passes it to its own
 // reachesAddr calls (see reachesAddr's own doc comment).
@@ -1270,10 +1274,10 @@ func (l *lifter) findDoWhileTail(bodyStart uint64, byAddr map[uint64]*BasicBlock
 	seen := map[uint64]bool{}
 	queue := []uint64{bodyStart}
 	for len(queue) > 0 {
-		if *l.budget <= 0 {
+		if *l.searchBudget <= 0 {
 			return 0, 0, false
 		}
-		*l.budget--
+		*l.searchBudget--
 		addr := queue[0]
 		queue = queue[1:]
 		if seen[addr] {
@@ -1343,7 +1347,7 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.addrRegs {
 		addrRegs[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq}
+	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1553,6 +1557,22 @@ type lifter struct {
 	// large -O0 function.
 	budget *int
 
+	// searchBudget bounds the total work the speculative CFG searches
+	// (reachesAddr, findDoWhileTail) may do across this whole
+	// LiftFunction call, shared by pointer across forks exactly like
+	// budget. It is deliberately SEPARATE from budget: those searches
+	// run once (or twice) per block and may walk the entire reachable
+	// graph each time, O(blocks^2) over a full lift, while the
+	// structural lift itself needs only O(blocks) visits - charging the
+	// searches to the shared lift budget starved liftBlockGraph on
+	// large functions and silently dropped every block after the
+	// budget ran out (see searchVisitBudget). Search failure is always
+	// safe - loop recognition degrades to the ordinary if/else path,
+	// which still lifts every block - so this counter existing only
+	// reduces structural prettiness on a pathological input, never
+	// completeness.
+	searchBudget *int
+
 	// dataReader reads bytes from the original binary by virtual
 	// address. Non-nil when switch-statement detection wants to read
 	// jump-table entries from rodata.
@@ -1607,6 +1627,18 @@ type cmpOperands struct {
 // count (typically at most a few hundred) while still keeping even a
 // worst-case pathological blowup bounded to a fraction of a second.
 const blockVisitBudget = 20000
+
+// searchVisitBudget is the total number of BFS pops reachesAddr and
+// findDoWhileTail may spend across one entire LiftFunction call - see
+// the lifter.searchBudget field's own doc comment for why the
+// speculative searches get their own counter instead of sharing
+// blockVisitBudget (sharing it starved the structural lift on large
+// functions and silently truncated their output). A few-hundred-block
+// real function needs on the order of 10^5 pops to walk fully; 1<<20
+// leaves ample headroom while still bounding any input's search work
+// to well under a second, and exhaustion only degrades loop
+// recognition to plain if/else lifting.
+const searchVisitBudget = 1 << 20
 
 // aapcs64IntArgRegs lists the integer/pointer argument registers in
 // AAPCS64 (ARM64 procedure call standard) order - the Nth entry is
