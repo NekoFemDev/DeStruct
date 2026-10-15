@@ -1,6 +1,7 @@
 package arm64lift
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -2388,5 +2389,147 @@ func TestFieldAccessStringParenthesizesCompoundObjects(t *testing.T) {
 	atomic := &ir.FieldAccess{Object: &ir.LocalVar{Name: "p"}, Name: "field_8"}
 	if got := atomic.String(); got != "p.field_8" {
 		t.Errorf("atomic-object FieldAccess.String() = %q, want %q", got, "p.field_8")
+	}
+}
+
+// TestLiftFunction_CbnzOfCsetDoesNotChainComparison is the regression
+// test for the "a == b != 0" rendering: a cset value installed from
+// "cmp x0, x1" and then tested by cbnz must lift the comparison
+// directly, not rewrap it as "(x0 == x1) != 0" (which renders as the
+// chained comparison the bug reports).
+func TestLiftFunction_CbnzOfCsetDoesNotChainComparison(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// cmp x0, x1
+		{Address: 0x0, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandReg, Reg: "x1"},
+		}},
+		// cset w2, eq
+		{Address: 0x4, Size: 4, Mnemonic: "cset", OpStr: "w2, eq", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+		}},
+		// cbnz w2, then(0x14)
+		{Address: 0x8, Size: 4, Mnemonic: "cbnz", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 0x14},
+		}},
+		// bl step1(0x100)
+		{Address: 0xc, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// b merge(0x20)
+		{Address: 0x10, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x20},
+		}},
+		// then: bl step2(0x200)
+		{Address: 0x14, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x200},
+		}},
+		// b merge(0x20)
+		{Address: 0x18, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x20},
+		}},
+		// merge: nop filler @0x1c (unreachable, keeps addresses aligned)
+		{Address: 0x1c, Size: 4, Mnemonic: "nop"},
+		// ret
+		{Address: 0x20, Size: 4, Mnemonic: "ret"},
+	}
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "step1", true
+		case 0x200:
+			return "step2", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+	var condText string
+	var findIf func([]ir.Stmt)
+	findIf = func(list []ir.Stmt) {
+		for _, s := range list {
+			if v, ok := s.(*ir.IfStmt); ok && condText == "" {
+				condText = fmt.Sprint(v.Cond)
+			}
+		}
+	}
+	findIf(stmts)
+	if condText == "" {
+		t.Fatalf("no IfStmt lifted:\n%s", renderStmtsToString(stmts))
+	}
+	if strings.Contains(condText, "!= 0") || strings.Contains(condText, "== 0") {
+		t.Errorf("cbnz of a cset value kept the redundant zero test: %q", condText)
+	}
+	if !strings.Contains(condText, "x0 == x1") {
+		t.Errorf("expected the underlying comparison x0 == x1, got %q", condText)
+	}
+}
+
+// TestLiftFunction_CcmpFoldsConjunction is the regression test for
+// ccmp handling: "cmp x0, x1; ccmp w2, #0, #0, ne; b.eq" tests
+// "(x0 != x1) && (w2 == 0)" - the previous comparison evaluated at the
+// ccmp's own condition ANDed with the second comparison.  Before this
+// change the ccmp was ignored entirely and the branch tested only the
+// stale first comparison.
+func TestLiftFunction_CcmpFoldsConjunction(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		// cmp x0, x1
+		{Address: 0x0, Size: 4, Mnemonic: "cmp", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandReg, Reg: "x1"},
+		}},
+		// ccmp w2, #0, #0, ne
+		{Address: 0x4, Size: 4, Mnemonic: "ccmp", OpStr: "w2, #0, #0, ne", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w2"},
+			{Type: native.OperandImm, Imm: 0},
+			{Type: native.OperandImm, Imm: 0},
+		}},
+		// b.eq then(0x14)
+		{Address: 0x8, Size: 4, Mnemonic: "b.eq", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x14},
+		}},
+		// bl step1(0x100)
+		{Address: 0xc, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x100},
+		}},
+		// b merge(0x20)
+		{Address: 0x10, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x20},
+		}},
+		// then: bl step2(0x200)
+		{Address: 0x14, Size: 4, Mnemonic: "bl", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x200},
+		}},
+		// b merge(0x20)
+		{Address: 0x18, Size: 4, Mnemonic: "b", Operands: []native.Operand{
+			{Type: native.OperandImm, Imm: 0x20},
+		}},
+		{Address: 0x1c, Size: 4, Mnemonic: "nop"},
+		{Address: 0x20, Size: 4, Mnemonic: "ret"},
+	}
+	resolver := func(addr uint64) (string, bool) {
+		switch addr {
+		case 0x100:
+			return "step1", true
+		case 0x200:
+			return "step2", true
+		}
+		return "", false
+	}
+
+	stmts := LiftFunction(insns, nil, resolver, nil)
+	var condText string
+	for _, s := range stmts {
+		if v, ok := s.(*ir.IfStmt); ok && condText == "" {
+			condText = fmt.Sprint(v.Cond)
+		}
+	}
+	if condText == "" {
+		t.Fatalf("no IfStmt lifted:\n%s", renderStmtsToString(stmts))
+	}
+	want := "x0 != x1 && w2 == 0"
+	if condText != want {
+		t.Errorf("ccmp+b.eq condition = %q, want %q", condText, want)
 	}
 }

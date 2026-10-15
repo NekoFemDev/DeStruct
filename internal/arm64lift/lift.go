@@ -1611,6 +1611,19 @@ func (l *lifter) liftCondition(inst native.DetailedInstruction) ir.Expr {
 		}
 		val := l.regValue(inst.Operands[0].Reg)
 		l.consume(val)
+		// A value that is itself already a boolean expression (a
+		// comparison installed by cset/ccmp, a logical combination, a
+		// negation) is nonzero exactly when true, so testing it is the
+		// expression directly (cbnz) or its negation (cbz). Rewrapping
+		// as "<expr> != 0" / "<expr> == 0" is redundant and, for a
+		// comparison-valued register, renders as the misleading chained
+		// "a == b != 0" this whole case exists to avoid.
+		if isBooleanExpr(val) {
+			if inst.Mnemonic == "cbnz" {
+				return val
+			}
+			return &ir.UnaryExpr{Op: "!", Expr: val}
+		}
 		op := "=="
 		if inst.Mnemonic == "cbnz" {
 			op = "!="
@@ -1653,7 +1666,31 @@ func (l *lifter) liftCondition(inst native.DetailedInstruction) ir.Expr {
 		// guessing operands that would be actively wrong.
 		return &ir.LocalVar{Name: "cond"}
 	}
-	return &ir.BinaryExpr{Op: op, Left: l.lastCmp.lhs, Right: l.lastCmp.rhs}
+	cmp := &ir.BinaryExpr{Op: op, Left: l.lastCmp.lhs, Right: l.lastCmp.rhs}
+	if l.lastCmp.combine != nil {
+		// A ccmp chain left a conditional-comparison composition behind
+		// - see cmpOperands.combine and liftCcmp's own doc comment.
+		return l.lastCmp.combine(op, cmp)
+	}
+	return cmp
+}
+
+// isBooleanExpr reports whether e is already a 0/1-valued boolean
+// expression - a comparison, a logical AND/OR, or a negation - rather
+// than an arbitrary integer value. Such an expression never needs the
+// redundant "!= 0" / "== 0" wrapper a cbz/cbnz over a plain register
+// gets (see liftCondition).
+func isBooleanExpr(e ir.Expr) bool {
+	switch v := e.(type) {
+	case *ir.BinaryExpr:
+		switch v.Op {
+		case "==", "!=", "<", "<=", ">", ">=", "&&", "||":
+			return true
+		}
+	case *ir.UnaryExpr:
+		return v.Op == "!"
+	}
+	return false
 }
 
 // condOpFromMnemonic maps an ARM64 b.cond mnemonic's condition suffix
@@ -1880,6 +1917,15 @@ func (l *lifter) nextLabel() int {
 // this same left-to-right order.
 type cmpOperands struct {
 	lhs, rhs ir.Expr
+	// combine, when non-nil, rewrites the plain comparison a b.cond
+	// would build from lhs/rhs into the full flag condition left behind
+	// by a preceding "ccmp" chain: a ccmp compares only
+	// CONDITIONALLY (its own comparison applies when the previous flags
+	// satisfy its condition; otherwise the flags become its constant
+	// NZCV immediate), so the branch's real condition is a conjunction
+	// or disjunction of the previous comparison with this one - see
+	// liftCcmp's own doc comment.
+	combine func(op string, cmp ir.Expr) ir.Expr
 }
 
 // blockVisitBudget is the total number of liftBlockGraph calls allowed
@@ -2129,7 +2175,7 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			stmts = append(stmts, l.liftStr(inst)...)
 		case "ldr":
 			stmts = append(stmts, l.liftLdr(inst)...)
-		case "cmp":
+		case "cmp", "ccmp":
 			l.liftCmp(inst)
 		case "bl":
 			stmts = append(stmts, l.liftCall(inst)...)
@@ -3068,6 +3114,10 @@ func (l *lifter) flushRemaining() []ir.Stmt {
 // itself), but into l.lastCmp, for a following b.cond to build its
 // actual condition expression from (see liftCondition).
 func (l *lifter) liftCmp(inst native.DetailedInstruction) {
+	if inst.Mnemonic == "ccmp" {
+		l.liftCcmp(inst)
+		return
+	}
 	if len(inst.Operands) != 2 {
 		return
 	}
@@ -3086,6 +3136,118 @@ func (l *lifter) liftCmp(inst native.DetailedInstruction) {
 	case native.OperandImm:
 		l.lastCmp = &cmpOperands{lhs: lhs, rhs: &ir.IntLit{Value: rhsOp.Imm}}
 	}
+}
+
+// liftCcmp lifts "ccmp Rn, <Rm|#imm>, #nzcv, <cond>" - a CONDITIONAL
+// comparison chained onto the previous flag-setting instruction.  Its
+// exact semantics: if the previous flags satisfy <cond>, this behaves
+// as "cmp Rn, <Rm|#imm>" (setting new flags from that comparison);
+// otherwise the flags become the literal NZCV bits in #nzcv.  A
+// following b.cond therefore tests
+//
+//	P ? cmp(Rn, <Rm|#imm>) : K
+//
+// where P is the PREVIOUS comparison evaluated at <cond> and K is the
+// branch's own test evaluated on the constant nzcv bits - which is
+// exactly the "a && b" / "a || b" conjunction real ccmp code expresses
+// (e.g. "cmp x8, x23; ccmp w9, #0, #0, ne" followed by "b.ne" tests
+// "(x8 != x23) && (w9 != 0)").  cmpOperands.combine carries this
+// composition forward to liftCondition, which applies it to the
+// branch's own comparison operator.
+//
+// Anything unexpected (no previous comparison, no parsable condition
+// suffix, malformed operands) CLEARS lastCmp rather than leaving the
+// previous comparison in place: a b.cond after a ccmp tests the ccmp's
+// result, so keeping the stale operands would emit an actively wrong
+// condition instead of an honest placeholder.
+func (l *lifter) liftCcmp(inst native.DetailedInstruction) {
+	ops := inst.Operands
+	if len(ops) != 3 || ops[0].Type != native.OperandReg || ops[2].Type != native.OperandImm || l.lastCmp == nil {
+		l.lastCmp = nil
+		return
+	}
+	condSuffix := inst.OpStr
+	if idx := strings.LastIndex(condSuffix, ", "); idx >= 0 {
+		condSuffix = condSuffix[idx+2:]
+	}
+	condOp := condOpFromMnemonic("b." + condSuffix)
+	if condOp == "" {
+		l.lastCmp = nil
+		return
+	}
+	// Evaluate the PREVIOUS flags' condition at the ccmp's own suffix
+	// before overwriting lastCmp.
+	prev := l.lastCmp
+	var prevPred ir.Expr = &ir.BinaryExpr{Op: condOp, Left: prev.lhs, Right: prev.rhs}
+	if prev.combine != nil {
+		prevPred = prev.combine(condOp, prevPred)
+	}
+
+	lhs := l.regValue(ops[0].Reg)
+	l.consume(lhs)
+	var rhs ir.Expr
+	switch ops[1].Type {
+	case native.OperandReg:
+		rhs = l.regValue(ops[1].Reg)
+		l.consume(rhs)
+	case native.OperandImm:
+		rhs = &ir.IntLit{Value: ops[1].Imm}
+	default:
+		l.lastCmp = nil
+		return
+	}
+	nzcv := int(ops[2].Imm) & 0xf
+	l.lastCmp = &cmpOperands{lhs: lhs, rhs: rhs, combine: func(op string, cmp ir.Expr) ir.Expr {
+		return combineCcmp(prevPred, op, cmp, nzcv)
+	}}
+}
+
+// combineCcmp builds the full branch condition left behind by a ccmp:
+// P ? cmp : K, where P is the previous flags' condition, cmp is the
+// ccmp comparison tested with the branch's operator, and K is that same
+// test evaluated on the constant nzcv bits.  K is always a known
+// constant for the comparison operators this lifter produces, so the
+// ternary collapses to a plain conjunction (K false: "P && cmp") or
+// disjunction (K true: "!P || cmp") - the forms real ccmp-chained
+// source wrote.
+func combineCcmp(prev ir.Expr, op string, cmp ir.Expr, nzcv int) ir.Expr {
+	k, known := testOnNzcv(op, nzcv)
+	if !known {
+		return cmp
+	}
+	if k {
+		return &ir.BinaryExpr{Op: "||", Left: &ir.UnaryExpr{Op: "!", Expr: prev}, Right: cmp}
+	}
+	return &ir.BinaryExpr{Op: "&&", Left: prev, Right: cmp}
+}
+
+// testOnNzcv evaluates a b.cond-style comparison operator against the
+// constant flags encoded in a ccmp's #nzcv immediate (bit 3 N, bit 2
+// Z, bit 1 C, bit 0 V), returning whether the test holds and whether
+// the operator is one of the six flags testable this way.  The
+// unsigned-only codes (hs/lo/hi/ls) never reach here as such:
+// condOpFromMnemonic already folds them onto the signed comparison
+// operators, which is why the carry bit itself needs no case of its
+// own.
+func testOnNzcv(op string, nzcv int) (result, known bool) {
+	n := nzcv>>3&1 == 1
+	z := nzcv>>2&1 == 1
+	v := nzcv&1 == 1
+	switch op {
+	case "==":
+		return z, true
+	case "!=":
+		return !z, true
+	case "<":
+		return n != v, true
+	case "<=":
+		return z || n != v, true
+	case ">":
+		return !z && n == v, true
+	case ">=":
+		return n == v, true
+	}
+	return false, false
 }
 
 func (l *lifter) regValue(reg string) ir.Expr {
