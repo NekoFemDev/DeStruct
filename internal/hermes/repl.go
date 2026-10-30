@@ -2,50 +2,64 @@ package hermes
 
 import (
 	"bufio"
+	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/destruct/destruct/internal/hermes/asm"
+	"github.com/destruct/destruct/internal/hermes/disasm"
+	"github.com/destruct/destruct/internal/hermes/ir"
+	"github.com/destruct/destruct/internal/hermes/parser"
 )
 
 // =============================================================================
 // Repl is an interactive, radare2-inspired command shell for patching a
-// .hbc/.bundle file: seek to a position, view it as hex or as hermes-dec-
-// exact disassembly, and write changes either as raw bytes (fixed-size,
-// byte-for-byte - like radare2's own `wx`) or as one instruction's text
-// (goes through the same address-aware, size-change-capable assembler as
-// AssembleAndPatch/hermesdec_assembler.go's file-based path - see `wi`
-// below).
+// .hbc/.bundle file, rebuilt on the parser/disasm/asm packages:
 //
-// All edits accumulate in memory (the underlying *HBCFile's own byte
-// buffer, which the rest of this package already treats as the single
-// source of truth); nothing touches disk until an explicit `w`/`wq`
-// command.
+//   - the working file bytes (Data) are the source of truth; every write
+//     re-parses them into an ir.Module so all views stay consistent;
+//   - `wx` overwrites raw bytes in place (fixed size, no recalculation),
+//     like radare2's own wx;
+//   - `wi` replaces one instruction through the full assembler pipeline
+//     (address recalculation, Addr8->*Long promotion, header/SHA1
+//     bookkeeping) by reassembling a partial disassembly of the function
+//     the cursor is in;
+//   - nothing touches disk until an explicit `w`/`wq`.
 // =============================================================================
 
 // Repl holds one interactive patching session's state.
 type Repl struct {
-	File   *HBCFile
-	Asm    *HermesDecAssembler
-	Dis    *Disassembler
-	Cursor uint32 // absolute file offset
-	Path   string // path this session was opened from (default save target for `w`)
-	Dirty  bool   // true if any write command has been applied since the last save
+	File   *ir.Module // parsed view of Data (may lag after a raw `wx`)
+	Data   []byte     // working file bytes
+	Cursor uint32     // absolute file offset
+	Path   string     // path this session was opened from (default save target for `w`)
+	Dirty  bool       // true if any write command has been applied since the last save
 
 	out io.Writer
 }
 
-// NewRepl creates a patching session bound to an already-parsed file.
-func NewRepl(file *HBCFile, path string, out io.Writer) *Repl {
+// NewRepl creates a patching session over the given file bytes. path is
+// the default save target for `w`. The SHA1 footer is verified on open,
+// the same as a plain parse.
+func NewRepl(hbcData []byte, path string, out io.Writer) (*Repl, error) {
+	m, err := parser.Parse(hbcData)
+	if err != nil {
+		return nil, err
+	}
+	if err := parser.Decode(m); err != nil {
+		return nil, err
+	}
 	return &Repl{
-		File: file,
-		Asm:  NewHermesDecAssembler(file),
-		Dis:  NewDisassembler(file),
+		File: m,
+		Data: append([]byte(nil), hbcData...),
 		Path: path,
 		out:  out,
-	}
+	}, nil
 }
 
 // Run reads commands from in, one per line, until `q`/`quit`/EOF, printing
@@ -130,14 +144,12 @@ func (r *Repl) Exec(line string) (quit bool, err error) {
 		return false, r.cmdSave(r.Path)
 
 	case "wq":
+		path := r.Path
 		if len(args) > 0 {
-			if err := r.cmdSave(args[0]); err != nil {
-				return false, err
-			}
-		} else {
-			if err := r.cmdSave(r.Path); err != nil {
-				return false, err
-			}
+			path = args[0]
+		}
+		if err := r.cmdSave(path); err != nil {
+			return false, err
 		}
 		return true, nil
 
@@ -157,8 +169,9 @@ func (r *Repl) printHelp() {
   pd [n]                disassemble n instructions from the cursor, hermes-dec format (default 10)
   wx <hex bytes>        write raw bytes at the cursor (fixed size, no address recalculation - e.g. wx 9096)
   wi <instruction text>  write one instruction via the assembler at the cursor's instruction
-                         (e.g. wi LoadConstFalse Reg8: 4 - goes through full address recalculation,
-                         can change the instruction's size)
+                         (e.g. wi LoadConstFalse Reg8: 4 - goes through full address recalculation
+                         and can change the instruction's size; Addr8 branches are promoted
+                         to their *Long form automatically)
   w                     save changes to the file this session was opened from
   wq [path]             save (to path if given, else the original file) and quit
   q                     quit (warns if there are unsaved changes)
@@ -170,10 +183,10 @@ func (r *Repl) printHelp() {
 func (r *Repl) cmdInfo() error {
 	f := r.File
 	fmt.Fprintf(r.out, "path: %s\n", r.Path)
-	fmt.Fprintf(r.out, "bytecode version: %d\n", f.Header.Version)
-	fmt.Fprintf(r.out, "functions: %d\n", len(f.FunctionHeaders))
+	fmt.Fprintf(r.out, "bytecode version: %d\n", f.Version)
+	fmt.Fprintf(r.out, "functions: %d\n", len(f.Functions))
 	fmt.Fprintf(r.out, "strings: %d\n", len(f.Strings))
-	fmt.Fprintf(r.out, "file size: %d bytes\n", len(f.rawData))
+	fmt.Fprintf(r.out, "file size: %d bytes\n", len(r.Data))
 	if r.Dirty {
 		fmt.Fprintln(r.out, "status: unsaved changes")
 	} else {
@@ -201,8 +214,8 @@ func (r *Repl) cmdSeek(args []string) error {
 	if err != nil {
 		return err
 	}
-	if int64(addr) >= int64(len(r.File.rawData)) {
-		return fmt.Errorf("address 0x%x is past the end of the file (0x%x bytes)", addr, len(r.File.rawData))
+	if int64(addr) >= int64(len(r.Data)) {
+		return fmt.Errorf("address 0x%x is past the end of the file (0x%x bytes)", addr, len(r.Data))
 	}
 	r.Cursor = addr
 	return nil
@@ -222,13 +235,13 @@ func (r *Repl) cmdHexdump(args []string) error {
 	}
 	start := int64(r.Cursor)
 	end := start + int64(n)
-	if end > int64(len(r.File.rawData)) {
-		end = int64(len(r.File.rawData))
+	if end > int64(len(r.Data)) {
+		end = int64(len(r.Data))
 	}
 	if start >= end {
 		return fmt.Errorf("nothing to show at 0x%x", r.Cursor)
 	}
-	data := r.File.rawData[start:end]
+	data := r.Data[start:end]
 
 	for i := 0; i < len(data); i += 16 {
 		row := data[i:]
@@ -264,7 +277,8 @@ func (r *Repl) cmdHexdump(args []string) error {
 // Returns (-1, 0) if the offset doesn't fall within any function's
 // current bytecode range.
 func (r *Repl) funcAtOffset(addr uint32) (funcIdx int, funcRelOffset uint32) {
-	for i, h := range r.File.FunctionHeaders {
+	for i := range r.File.Functions {
+		h := &r.File.Functions[i]
 		if addr >= h.Offset && addr < h.Offset+h.BytecodeSizeInBytes {
 			return i, addr - h.Offset
 		}
@@ -285,28 +299,37 @@ func (r *Repl) cmdDisasm(args []string) error {
 		return fmt.Errorf("instruction count must be positive")
 	}
 
-	funcIdx, _ := r.funcAtOffset(r.Cursor)
+	funcIdx, relOff := r.funcAtOffset(r.Cursor)
 	if funcIdx < 0 {
 		return fmt.Errorf("0x%x is not inside any function's bytecode - use 'sf' to seek to a function first", r.Cursor)
 	}
-	hdr := r.File.FunctionHeaders[funcIdx]
-	code := r.File.getCode(funcIdx)
+	f := &r.File.Functions[funcIdx]
 
-	offset := r.Cursor - hdr.Offset
-	for i := 0; i < n && offset < uint32(len(code)); i++ {
-		pi := decodeInstructionFull(code, offset, r.Dis.Table, r.File.rawData, hdr.Offset)
-		if pi == nil || pi.Inst == nil {
+	// Start from the instruction containing the cursor (the cursor may
+	// sit mid-instruction).
+	start := -1
+	for i := range f.Instructions {
+		in := &f.Instructions[i]
+		if in.Offset <= relOff && relOff < in.Offset+uint32(in.Size()) {
+			start = i
 			break
+		}
+	}
+	if start < 0 {
+		return fmt.Errorf("0x%x is not within any decoded instruction of function #%d", r.Cursor, funcIdx)
+	}
+
+	for i := start; i < len(f.Instructions) && i < start+n; i++ {
+		in := &f.Instructions[i]
+		text, err := disasm.FormatInstruction(r.File, in)
+		if err != nil {
+			return err
 		}
 		marker := "  "
-		if hdr.Offset+offset == r.Cursor {
+		if f.Offset+in.Offset == r.Cursor {
 			marker = "->"
 		}
-		fmt.Fprintf(r.out, "%s func#%d %s\n", marker, funcIdx, r.Dis.FormatHermesDec(pi))
-		if pi.NextOffset <= offset {
-			break
-		}
-		offset = pi.NextOffset
+		fmt.Fprintf(r.out, "%s func#%d %s\n", marker, funcIdx, text)
 	}
 	return nil
 }
@@ -316,15 +339,11 @@ func (r *Repl) cmdFuncInfo() error {
 	if funcIdx < 0 {
 		return fmt.Errorf("0x%x is not inside any function's bytecode", r.Cursor)
 	}
-	hdr := r.File.FunctionHeaders[funcIdx]
-	name := "<unknown>"
-	if int(hdr.FunctionName) < len(r.File.Strings) {
-		name = r.File.Strings[hdr.FunctionName]
-	}
-	fmt.Fprintf(r.out, "function #%d %q\n", funcIdx, name)
-	fmt.Fprintf(r.out, "  file offset: 0x%08x, size: %d bytes\n", hdr.Offset, hdr.BytecodeSizeInBytes)
+	h := &r.File.Functions[funcIdx]
+	fmt.Fprintf(r.out, "function #%d %q\n", funcIdx, h.Name)
+	fmt.Fprintf(r.out, "  file offset: 0x%08x, size: %d bytes\n", h.Offset, h.BytecodeSizeInBytes)
 	fmt.Fprintf(r.out, "  cursor is at instruction-stream offset 0x%x within this function\n", relOff)
-	fmt.Fprintf(r.out, "  params: %d, frame size: %d, strict: %v\n", hdr.ParamCount, hdr.FrameSize, hdr.StrictMode)
+	fmt.Fprintf(r.out, "  params: %d, frame size: %d, strict: %v\n", h.ParamCount, h.FrameSize, h.StrictMode)
 	return nil
 }
 
@@ -334,15 +353,12 @@ func (r *Repl) cmdListFunctions(args []string) error {
 		filter = strings.ToLower(args[0])
 	}
 	count := 0
-	for i, h := range r.File.FunctionHeaders {
-		name := "<unknown>"
-		if int(h.FunctionName) < len(r.File.Strings) {
-			name = r.File.Strings[h.FunctionName]
-		}
-		if filter != "" && !strings.Contains(strings.ToLower(name), filter) {
+	for i := range r.File.Functions {
+		h := &r.File.Functions[i]
+		if filter != "" && !strings.Contains(strings.ToLower(h.Name), filter) {
 			continue
 		}
-		fmt.Fprintf(r.out, "#%-6d 0x%08x  %6d bytes  %s\n", i, h.Offset, h.BytecodeSizeInBytes, name)
+		fmt.Fprintf(r.out, "#%-6d 0x%08x  %6d bytes  %s\n", i, h.Offset, h.BytecodeSizeInBytes, h.Name)
 		count++
 		if count >= 200 {
 			fmt.Fprintln(r.out, "... (200 shown, refine your filter for more)")
@@ -363,20 +379,17 @@ func (r *Repl) cmdSeekFunction(args []string) error {
 		if err != nil {
 			return fmt.Errorf("invalid function index %q: %w", target, err)
 		}
-		if idx < 0 || idx >= len(r.File.FunctionHeaders) {
-			return fmt.Errorf("function index %d out of range (file has %d functions)", idx, len(r.File.FunctionHeaders))
+		if idx < 0 || idx >= len(r.File.Functions) {
+			return fmt.Errorf("function index %d out of range (file has %d functions)", idx, len(r.File.Functions))
 		}
-		r.Cursor = r.File.FunctionHeaders[idx].Offset
+		r.Cursor = r.File.Functions[idx].Offset
 		return nil
 	}
 
 	lower := strings.ToLower(target)
 	var matches []int
-	for i, h := range r.File.FunctionHeaders {
-		if int(h.FunctionName) >= len(r.File.Strings) {
-			continue
-		}
-		if strings.ToLower(r.File.Strings[h.FunctionName]) == lower {
+	for i := range r.File.Functions {
+		if strings.ToLower(r.File.Functions[i].Name) == lower {
 			matches = append(matches, i)
 		}
 	}
@@ -394,7 +407,21 @@ func (r *Repl) cmdSeekFunction(args []string) error {
 		}
 		fmt.Fprintln(r.out)
 	}
-	r.Cursor = r.File.FunctionHeaders[matches[0]].Offset
+	r.Cursor = r.File.Functions[matches[0]].Offset
+	return nil
+}
+
+// reparse refreshes the parsed view from the working bytes without the
+// SHA1 check (the footer is stale between an edit and the next save).
+func (r *Repl) reparse() error {
+	m, err := parser.ParseWithOptions(r.Data, parser.Options{SkipHashCheck: true})
+	if err != nil {
+		return err
+	}
+	if err := parser.Decode(m); err != nil {
+		return err
+	}
+	r.File = m
 	return nil
 }
 
@@ -417,12 +444,21 @@ func (r *Repl) cmdWriteBytes(args []string) error {
 
 	start := int64(r.Cursor)
 	end := start + int64(len(data))
-	if end > int64(len(r.File.rawData)) {
-		return fmt.Errorf("writing %d bytes at 0x%x would go past the end of the file (0x%x bytes) - wx never changes file size, only overwrites in place", len(data), r.Cursor, len(r.File.rawData))
+	if end > int64(len(r.Data)) {
+		return fmt.Errorf("writing %d bytes at 0x%x would go past the end of the file (0x%x bytes) - wx never changes file size, only overwrites in place", len(data), r.Cursor, len(r.Data))
 	}
 
-	copy(r.File.rawData[start:end], data)
+	copy(r.Data[start:end], data)
 	r.Dirty = true
+
+	// Refresh the parsed view so pd/pf see the new bytes. A raw write
+	// can land mid-instruction and make the file undecodable; in that
+	// case the bytes are kept but the parsed view stays on the last
+	// good state (a warning tells the user).
+	if err := r.reparse(); err != nil {
+		fmt.Fprintf(r.out, "wrote %d bytes at 0x%08x (warning: file no longer parses: %v)\n", len(data), r.Cursor, err)
+		return nil
+	}
 	fmt.Fprintf(r.out, "wrote %d bytes at 0x%08x\n", len(data), r.Cursor)
 	return nil
 }
@@ -430,9 +466,9 @@ func (r *Repl) cmdWriteBytes(args []string) error {
 func (r *Repl) cmdWriteInstruction(line string) error {
 	// Everything after "wi " is the instruction text, e.g.
 	// "LoadConstFalse Reg8: 4" or "Jmp Addr8: 20". Reformat it into one
-	// hermes-dec-exact instruction line so it can go through the same
-	// parser the file-based assembler uses - no separate parsing logic
-	// to keep in sync.
+	// hermes-dec-exact instruction line and push the whole function
+	// through the same parse+diff+patch pipeline the file-based
+	// assembler uses - no separate parsing logic to keep in sync.
 	rest := strings.TrimSpace(strings.TrimPrefix(line, "wi"))
 	if rest == "" {
 		return fmt.Errorf("usage: wi <Name> [Type: value, Type: value, ...] (e.g. wi LoadConstFalse Reg8: 4)")
@@ -446,45 +482,32 @@ func (r *Repl) cmdWriteInstruction(line string) error {
 		return fmt.Errorf("0x%x is not inside any function's bytecode - use 'sf' to seek to a function first", r.Cursor)
 	}
 
-	// Which instruction index (within the function) is the cursor
-	// currently on? Walk the function's current instructions to find it,
-	// the same way `pd`/`sf` present them.
-	instIdx, err := r.instructionIndexAt(funcIdx, relOff)
-	if err != nil {
+	f := &r.File.Functions[funcIdx]
+	if _, err := instructionIndexAt(f, relOff); err != nil {
 		return err
 	}
 
-	// Build this function's current text, replace just that one
-	// instruction line, and hand the whole thing to the same
-	// parse+diff+patch pipeline the file-based assembler uses.
-	var buf strings.Builder
-	r.Dis.DisassembleFunctionExact(funcIdx, &buf)
-	lines := strings.Split(buf.String(), "\n")
+	text, err := disasm.Function(r.File, funcIdx)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(text, "\n")
 
-	targetLineIdx := -1
-	count := -1
+	// Replace the instruction line whose offset matches the cursor.
+	targetLine := fmt.Sprintf("==> %08x:", relOff)
+	replaced := false
 	for i, l := range lines {
-		if instLineRe.MatchString(l) {
-			count++
-			if count == instIdx {
-				targetLineIdx = i
-				break
-			}
+		if strings.HasPrefix(l, targetLine) {
+			lines[i] = fmt.Sprintf("==> %08x: <%s>: <%s>", relOff, name, operandsText)
+			replaced = true
+			break
 		}
 	}
-	if targetLineIdx < 0 {
-		return fmt.Errorf("internal error: could not locate instruction %d in function #%d's text (please report this as a bug)", instIdx, funcIdx)
+	if !replaced {
+		return fmt.Errorf("internal error: could not locate instruction at 0x%x in function #%d's text (please report this as a bug)", relOff, funcIdx)
 	}
 
-	newLine := fmt.Sprintf("==> %08x: <%s>: <%s>", relOff, name, operandsText)
-	lines[targetLineIdx] = newLine
-
-	hasmFuncs, err := parseHermesDecHASM(strings.NewReader(strings.Join(lines, "\n")))
-	if err != nil {
-		return fmt.Errorf("parsing edited instruction: %w", err)
-	}
-
-	result, err := r.Asm.assembleAndPatchFuncs(hasmFuncs)
+	result, err := asm.Assemble(r.File, strings.Join(lines, "\n"))
 	if err != nil {
 		return fmt.Errorf("assembling: %w", err)
 	}
@@ -493,47 +516,56 @@ func (r *Repl) cmdWriteInstruction(line string) error {
 		return nil
 	}
 
+	// Adopt the patched bytes and refresh the parsed view so offsets,
+	// sizes and instruction boundaries reflect the edit.
+	r.Data = result.Data
 	r.Dirty = true
-	// Refresh the disassembler's view (function offsets/sizes may have
-	// shifted for this or later functions).
-	r.Dis = NewDisassembler(r.File)
+	if err := r.reparse(); err != nil {
+		return fmt.Errorf("re-parsing the patched file: %w", err)
+	}
 	fmt.Fprintf(r.out, "patched function #%d (size change: %+d bytes)\n", funcIdx, result.SizeDelta)
 	return nil
 }
 
-// instructionIndexAt returns the 0-based index, among funcIdx's current
+// instructionIndexAt returns the 0-based index, among f's current
 // instructions, of the one starting exactly at relOff (function-relative
 // byte offset). Errors if relOff isn't the start of any instruction.
-func (r *Repl) instructionIndexAt(funcIdx int, relOff uint32) (int, error) {
-	hdr := r.File.FunctionHeaders[funcIdx]
-	code := r.File.getCode(funcIdx)
-	offset := uint32(0)
-	idx := 0
-	for offset < uint32(len(code)) {
-		pi := decodeInstructionFull(code, offset, r.Dis.Table, r.File.rawData, hdr.Offset)
-		if pi == nil || pi.Inst == nil {
-			break
+func instructionIndexAt(f *ir.Function, relOff uint32) (int, error) {
+	for i := range f.Instructions {
+		if f.Instructions[i].Offset == relOff {
+			return i, nil
 		}
-		if offset == relOff {
-			return idx, nil
-		}
-		if pi.NextOffset <= offset {
-			break
-		}
-		offset = pi.NextOffset
-		idx++
 	}
-	return 0, fmt.Errorf("0x%x is not the start of an instruction in function #%d - use 'pd' to see valid instruction boundaries", r.Cursor, funcIdx)
+	return 0, fmt.Errorf("0x%x is not the start of an instruction in function #%d - use 'pd' to see valid instruction boundaries", f.Offset+relOff, f.Index)
 }
 
 func (r *Repl) cmdSave(path string) error {
 	if path == "" {
 		return fmt.Errorf("no path to save to (this session wasn't opened from a file path)")
 	}
-	if err := r.File.Write(path); err != nil {
+	if err := r.refreshSHA1(); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, r.Data, 0o644); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	r.Dirty = false
 	fmt.Fprintf(r.out, "saved to %s\n", path)
+	return nil
+}
+
+// refreshSHA1 recomputes the SHA1 footer over the working bytes. The
+// footer lives at FileLength-20 within the file (FileLength includes it).
+func (r *Repl) refreshSHA1() error {
+	h := r.File.Header
+	if h.Version < 75 {
+		return nil
+	}
+	fileLength := int(h.FileLength)
+	if fileLength < 20 || fileLength > len(r.Data) {
+		return fmt.Errorf("file length %d in the header is not consistent with the %d-byte buffer", fileLength, len(r.Data))
+	}
+	sum := sha1.Sum(r.Data[:fileLength-20])
+	copy(r.Data[fileLength-20:fileLength], sum[:])
 	return nil
 }

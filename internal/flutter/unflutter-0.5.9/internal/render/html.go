@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/destruct/destruct/internal/flutter/unflutter-0.5.9/internal/disasm"
+	"github.com/destruct/destruct/internal/flutter/unflutter-0.5.9/internal/output"
 )
 
 // WriteIndexHTML writes a small HTML page summarizing the disasm output.
@@ -250,23 +251,9 @@ func htmlEscape(s string) string {
 }
 
 // safeFuncNameHTML converts a function name to a safe filename.
-// Must match sanitizeFilename in cmd/unflutter/disasm.go.
+// It delegates to output.SanitizeFileName (the same transform the disasm
+// writer and the CFG generator use) so links always resolve to the files
+// that were actually written.
 func safeFuncNameHTML(name string) string {
-	r := strings.NewReplacer(
-		"/", "_",
-		"\\", "_",
-		":", "_",
-		"*", "_",
-		"?", "_",
-		"\"", "_",
-		"<", "_",
-		">", "_",
-		"|", "_",
-		" ", "_",
-	)
-	s := r.Replace(name)
-	if len(s) > 200 {
-		s = s[:200]
-	}
-	return s
+	return output.SanitizeFileName(name)
 }

@@ -28,6 +28,47 @@ Or directly:
 go build -o destruct ./cmd/destruct
 ```
 
+### Termux (Android)
+
+`install-termux.sh` handles the whole chain — `pkg` dependencies, the
+Capstone fetch + static-lib build, the cgo build, and installing to
+`$PREFIX/bin`:
+
+```bash
+# fresh shell
+curl -fsSL https://raw.githubusercontent.com/NekoFemDev/DeStruct/main/install-termux.sh | bash
+
+# or from a clone
+./install-termux.sh            # installs to $PREFIX/bin/destruct
+./install-termux.sh --update   # fast-forward the checkout, then reinstall
+./install-termux.sh --uninstall
+make install-termux INSTALL_ARGS="--update --clean"
+```
+
+Termux-specific details the script handles:
+
+- **Interpreter** — Termux has no `/usr/bin/env` and `/bin/sh` is Android's
+  mksh, so the script names `$PREFIX/bin/bash` directly. `bash install-termux.sh`
+  works from any shell.
+- **`GOTOOLCHAIN=local`** — if `go.mod` asks for a newer Go than the Termux
+  `golang` package ships, the go command's default auto-download pulls
+  `golang.org/toolchain@…linux-arm64`, which is a Linux ELF and cannot exec on
+  Android. Pinning to `local` turns that into a clear version message, and the
+  script will `pkg upgrade golang` for you before giving up.
+- **Toolchain** — `CC`/`AR` are passed to the Capstone sub-make on the command
+  line, since its `CC ?= gcc` / `AR ?= ar` defaults are not present on a stock
+  Termux install.
+- **`-j` capped at 4** — Capstone's `AArch64Disassembler.c` is a ~2 MB
+  translation unit and `-O3` on it peaks around half a gig per process. Raise it
+  with `--jobs N` if the device has headroom.
+- **Network** — `git` and the Capstone tarball download retry with backoff over
+  HTTP/1.1; mobile links routinely reset HTTP/2 streams mid-clone.
+- **No runtime deps** — Capstone is linked statically, so the installed binary
+  is self-contained.
+
+Keep `-o` targets under `$HOME`; Android scoped storage blocks `/sdcard`
+unless you have run `termux-setup-storage`.
+
 ## Usage
 
 ```
@@ -40,9 +81,8 @@ destruct <command> [options]
 |---------|-------------|
 | `jvm` | Decompile `.class`/`.jar` → Java source |
 | `dex` | Decompile Android `.dex`/`.apk` → Java source |
-| `hermes` | Disassemble/decompile Hermes `.hbc` bytecode |
-| `assemble` | Assemble `.hasm` back to `.hbc` (with address recalculation) |
-| `patch` | Search/patch Hermes bytecode strings |
+| `hermes` | Disassemble Hermes `.hbc` bytecode (hermes-dec exact format) |
+| `assemble` | Assemble an edited `.hasm` back into a patched `.hbc` |
 | `interactive` | Interactive radare2-style REPL for `.hbc` patching |
 | `flutter` | Disassemble Flutter `libapp.so` to Dart bytecode |
 | `elf` | Disassemble ELF binaries (ARM64/ARM32/x86/x64) |
@@ -64,8 +104,10 @@ destruct dex classes.dex -o output/
 destruct dex app.apk -o output/
 
 # Hermes
-destruct hermes index.android.bundle -o output/ --decompile
-destruct hermes index.android.bundle -o output/ -p   # patching format
+destruct hermes index.android.bundle -o output/
+# Edit output/index.android.bundle.hasm, then reassemble (only changed
+# functions are rebuilt; Addr8 branches auto-promote to their *Long form):
+destruct assemble output/index.android.bundle.hasm -i index.android.bundle -o patched.hbc
 
 # ARM64 ELF
 destruct elf libnative.so -o output/ --decompile
@@ -98,9 +140,7 @@ destruct hex libnative.so -c "search \"UnityPlayer\"" -c "read 0x2000"
 | `--simplify-cfg` | CFG simplification / unreachable block removal (ELF, experimental) |
 | `--emit-llvm` | Export lifted IR to LLVM IR `<name>.decompiled.ll` (ELF, implies `--decompile`) |
 | `--no-enhance` | Disable enhanced comments (ELF) |
-| `--hex` | Hex-editor-friendly disassembly (Hermes) |
-| `--patch-map` | Per-operand file offset map (Hermes) |
-| `--hermes-dec` | hermes-dec-exact format (default for Hermes) |
+| `--hermes-dec` | Accepted no-op alias: the hermes-dec exact format is always used for Hermes disassembly and assembly |
 
 ## Testing
 
@@ -117,7 +157,12 @@ internal/
   pipeline/         Orchestration: format detection, streaming, enhancements
   jvm/              JVM bytecode parser, decompiler, control flow recovery
   dex/              DEX parser, Dalvik instruction decoder, IR converter, control flow recovery
-  hermes/           Hermes bytecode parser, disassembler, decompiler, assembler, REPL
+  hermes/           Hermes bytecode: parser/, ir/, opcodes/, disasm/, asm/ (+ frozen decompiler)
+  hermes/parser/    .hbc -> ir.Module (version detection, container, instruction decode)
+  hermes/ir/        version-agnostic intermediate representation
+  hermes/opcodes/   per-version opcode tables (generated) + registry
+  hermes/disasm/    ir.Module -> hermes-dec exact .hasm
+  hermes/asm/       .hasm + original .hbc -> patched .hbc (jump relaxation)
   arm64lift/        ARM64 instruction lifter → IR → C-like pseudocode
   native/           ELF parser, Capstone disassembler, PLT/GOT resolution
   java/             Java source generator from IR

@@ -1,0 +1,44 @@
+DeStruct
+Copyright (c) 2026 NekoFemDev
+
+================================================================================
+Third-party notices
+================================================================================
+
+Kirlif/HBC-Tool — Apache License 2.0
+------------------------------------
+
+Parts of the Hermes bytecode support in this repository are derived from
+HBC-Tool, Copyright 2026 github.com/Kirlif, licensed under the Apache
+License, Version 2.0:
+
+  * internal/hermes/opcodes/data/hbcNN.json — per-version opcode tables
+    converted from HBC-Tool's hbc/hbcNN/data/opcode.json tables
+    (see internal/hermes/opcodes/data/build_data.py for the exact
+    provenance and the corrections applied).
+  * internal/hermes/opcodes/hbcNN/opcodes.go — generated Go tables
+    produced from the JSON files above by internal/hermes/opcodes/gen.
+
+A copy of the Apache License, Version 2.0 is included in this repository
+at third_party/hbctool/LICENSE.Apache-2.0, and is also available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+facebook/hermes — MIT License
+-----------------------------
+
+The bytecode container and instruction-format definitions that this
+implementation follows are defined by the Hermes JavaScript engine,
+Copyright (c) Meta Platforms, Inc. and affiliates, licensed under the
+MIT License. Version-specific layouts, opcode annotations and builtin
+function name lists were derived from / verified against the Hermes
+source (BytecodeFileFormat.h, BytecodeList.def, BytecodeVersion.h,
+FrontEndDefs/Builtins.def) at the commits recorded in
+internal/hermes/opcodes/data/build_data.py and
+internal/hermes/opcodes/data/build_builtins.py.

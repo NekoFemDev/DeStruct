@@ -1,7 +1,7 @@
 package native
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../third_party/capstone/../../capstone-6.0.0-Alpha10/include -DCAPSTONE_AARCH64_COMPAT_HEADER
+#cgo CFLAGS: -I${SRCDIR}/../../capstone-src/include -DCAPSTONE_AARCH64_COMPAT_HEADER
 #cgo LDFLAGS: -L${SRCDIR}/../../third_party/capstone/build -lcapstone
 #include <capstone/capstone.h>
 #include <stdbool.h>
@@ -443,7 +443,7 @@ func (d *Disassembler) DisassembleDetailed(code []byte, address uint64) ([]Detai
 		return nil, fmt.Errorf("DisassembleDetailed: only ARM64 is currently supported")
 	}
 
-	// NOTE: Capstone 6.0.0-Alpha10 implements CS_OPT_DETAIL as
+	// NOTE: Capstone 6.0.0-Alpha11 implements CS_OPT_DETAIL as
 	// `handle->detail_opt |= value` (cs.c), so CS_OPT_OFF (0) below is a
 	// no-op: once enabled, detail mode stays on for this handle. Kept as-is
 	// deliberately; decision tracked in TODOS.md.

@@ -1,339 +1,413 @@
-# DeStruct — справочник команд
+# DeStruct — Command Reference
 
-Все команды запускаются через собранный бинарник `destruct` (`make build` → `./destruct <command> ...`), кроме `lifttest`, который собирается отдельно из `cmd/lifttest/`.
+All commands run through the built binary `destruct` (`make build` → `./destruct <command> ...`),
+except `lifttest`, which is built separately from `cmd/lifttest/`.
 
 ---
 
-## `destruct jvm` — декомпиляция JVM `.class`/`.jar` → Java
+## `destruct jvm` — decompile JVM `.class`/`.jar` → Java
 
 ```
+
 destruct jvm input.jar -o output/
 destruct jvm SomeClass.class -o output/
+
 ```
 
-Принимает `.class` (один файл) или `.jar` (весь архив, включая streaming-режим для больших файлов). На выходе — дерево `.java`-файлов с восстановленной структурой пакетов.
+Accepts `.class` (single file) or `.jar` (full archive, including streaming mode
+for large files). Output is a tree of `.java` files with reconstructed package
+structure.
 
 ---
 
-## `destruct dex` — декомпиляция Android `.dex`/`.apk` → Java
+## `destruct dex` — decompile Android `.dex`/`.apk` → Java
 
 ```
+
 destruct dex classes.dex -o output/
 destruct dex app.apk -o output/
+
 ```
 
-Принимает `.dex` (в т.ч. multidex-файлы по отдельности) или `.apk` (все `classes*.dex` внутри архива; дубликаты классов из multidex пропускаются). На выходе — дерево `.java`-файлов с восстановленной структурой пакетов, полями, методами и структурированным control flow (`if`/`else`, `while`, `do-while`, `switch`).
+Accepts `.dex` (including individual multidex files) or `.apk` (all `classes*.dex`
+inside the archive; duplicate classes across multidex are skipped). Output is a
+tree of `.java` files with reconstructed package structure, fields, methods, and
+structured control flow (`if`/`else`, `while`, `do-while`, `switch`).
 
-Поддерживаются стандартные DEX 035–039, включая строки MUTF-8, switch/fill-array-data payload'ы и компактное 4-байтовое кодирование 23x-инструкций, которое встречается в защищённых приложениях.
+Supports standard DEX 035–039, including MUTF-8 strings, switch/fill-array-data
+payloads, and the compact 4-byte 23x instruction encoding found in protected apps.
 
-Ограничения текущей версии: `try`/`catch`/`finally` и `synchronized`-блоки восстанавливаются частично (код обработчиков исключений может опускаться), имена регистров остаются `vN`, типы локальных переменных не выводятся, а нестандартные опкоды упаковщиков пропускаются.
+Current limitations: `try`/`catch`/`finally` and `synchronized` blocks are
+partially reconstructed (exception handler code may be dropped); register names
+stay as `vN`; local variable types are not inferred; non-standard packer opcodes
+are skipped.
 
 ---
 
-## `destruct hermes` — дизассемблирование/декомпиляция Hermes `.hbc` (React Native)
+## `destruct hermes` — disassemble Hermes `.hbc` (React Native)
 
 ```
-destruct hermes index.android.bundle -o output/                # exact hermes-dec формат (.hasm)
-destruct hermes index.android.bundle -o output/ --decompile     # декомпиляция в читаемый JS
-destruct hermes index.android.bundle -o output/ -p              # упрощённый формат для ручного патчинга
-destruct hermes index.android.bundle -o output/ --patch-map     # + точные file-offset'ы по-операндно
-destruct hermes index.android.bundle -o output/ --hex           # hex-editor-friendly, абсолютные offset'ы
+
+destruct hermes index.android.bundle -o output/   # exact hermes-dec format (.hasm)
+
 ```
 
-**Флаги:**
-- `--decompile` — вывод `.js` вместо ассемблера.
-- `--hermes-dec` — (по умолчанию включён) точный hermes-dec-формат; без него — старый упрощённый.
-- `-p, --patch` — упрощённый формат специально для ручного патчинга.
-- `--patch-map` — тот же точный формат + карта offset'ов каждого операнда.
-- `--hex` — абсолютные file-offset'ы вместо относительных.
+**Flags:**
+- `--hermes-dec` — accepted no-op alias: the hermes-dec exact format is always
+  used for disassembly (and for assembly).
+- `--decompile` — disabled for Hermes during the current refactor; the command
+  returns an explicit error instead of emitting `.js`.
 
-**Workflow для мелких правок того же размера (без переассемблирования):**
-```
-destruct hermes file.hbc -o output/ --patch-map
-# найти байты в hex-редакторе, поправить на месте — offset'ы абсолютные, реассемблирование не нужно
+**Workflow for structural edits (add/remove/reorder instructions):**
 ```
 
-**Workflow для структурных правок (добавить/убрать/переставить инструкции):**
-```
 destruct hermes file.hbc -o output/
-# отредактировать output/file.hbc.hasm текстовым редактором
-destruct assemble output/file.hbc.hasm -i file.hbc -o patched.hbc --hermes-dec
+
+edit output/file.hbc.hasm in a text editor
+
+destruct assemble output/file.hbc.hasm -i file.hbc -o patched.hbc
+
 ```
+
+For same-size edits you can also patch the raw bytes directly with
+`destruct hex`/any hex editor: every instruction's function-relative offset is
+shown in the `.hasm`, and function bytecode offsets are available via the
+`interactive` session (`disasm` / `info` commands).
 
 ---
 
-## `destruct assemble` — сборка `.hasm` обратно в `.hbc`
+## `destruct assemble` — reassemble edited `.hasm` back to `.hbc`
 
 ```
-destruct assemble output/file.hbc.hasm -i file.hbc -o patched.hbc --hermes-dec
-destruct assemble output/file.hbc.hasm -i file.hbc -o patched.hbc   # упрощённый формат
+
+destruct assemble output/file.hbc.hasm -i file.hbc -o patched.hbc
+
 ```
 
-**Обязательно:** `-i` с оригинальным `.hbc`/`.bundle` — текст `.hasm` ссылается на его таблицы строк/функций, сам по себе не самодостаточен.
+**Required:** `-i` with the original `.hbc`/`.bundle` — the `.hasm` text refers to
+its string/function tables and is not self-contained.
 
-С `--hermes-dec` пересобираются только реально изменившиеся функции; адреса пересчитываются автоматически (включая промоцию `Addr8`→`Addr8Long`, если правка вытолкнула цель прыжка за пределы диапазона байта).
+Only functions whose text actually changed are reassembled. Addresses are
+recomputed automatically, including `Addr8` → `*Long` promotion when an edit
+pushes a jump target out of the signed byte range; switch jump tables are
+re-placed out of line and their `arg2` offsets recomputed. All affected
+function headers, the debug-info offset and the SHA1 footer are rewritten.
 
 ---
 
-## `destruct patch` — быстрый точечный патч Hermes-байткода
+## `destruct interactive` (or `destruct repl`) — interactive radare2-like patcher
 
 ```
-destruct patch file.hbc -t "isPro" --check-only   # патчит только CHECK-инструкции (безопасно)
-destruct patch file.hbc -t "isPro"                 # патчит ВСЕ вхождения (может сломать логику)
-destruct patch file.hbc -s "someString"            # только поиск, без патча
-```
 
-**Флаги:**
-- `-t, --patch-string` — заменить строковый операнд инструкции на `true`/`false`/`nop`.
-- `-s, --search` — поиск строки в байткоде.
-- `--check-only` — ограничить патч только инструкциями проверки (безопаснее, чем патчить все вхождения).
-
----
-
-## `destruct interactive` (или `destruct repl`) — интерактивный radare2-подобный патчер
-
-```
 destruct interactive file.bundle
 destruct repl file.bundle
+
 ```
 
-Внутри REPL:
+Inside the REPL:
 
-| Команда | Действие |
+| Command | Action |
 |---|---|
-| `s <addr>` | перейти на адрес |
-| `sf <name\|#N>` | перейти к функции по имени или номеру |
-| `f [filter]` | список функций (опционально с фильтром по подстроке) |
-| `i` | информация о файле |
-| `pf` | распечатать текущую функцию |
-| `px [n]` | hex-дамп |
-| `pd [n]` | дизассемблировать n инструкций |
-| `wx <hex>` | записать сырые байты (без пересчёта адресов, фиксированный размер) |
-| `wi <instr>` | записать инструкцию текстом (полный пересчёт адресов через LCS, размер может измениться) |
-| `w` | сохранить изменения в текущий файл |
-| `wq [path]` | сохранить и выйти (опционально в другой файл) |
-| `q` | выйти |
-| `q!` | выйти без сохранения |
-| `help`, `?` | список команд |
+| `s <addr>` | seek to address |
+| `sf <name\|#N>` | seek to function by name or index |
+| `f [filter]` | list functions (optionally filtered by substring) |
+| `i` | file info |
+| `pf` | print current function |
+| `px [n]` | hex dump |
+| `pd [n]` | disassemble n instructions |
+| `wx <hex>` | write raw bytes (no address recompute, fixed size) |
+| `wi <instr>` | write instruction as text (full address recompute via LCS, size may change) |
+| `w` | save changes to current file |
+| `wq [path]` | save and quit (optionally to another file) |
+| `q` | quit |
+| `q!` | quit without saving |
+| `help`, `?` | command list |
 
 ---
 
-## `destruct hex` — интерактивный hex-редактор с отложенным патчингом
+## `destruct hex` — interactive hex editor with deferred patching
 
 ```
-destruct hex libil2cpp.so                                  # интерактивная сессия
+
+destruct hex libil2cpp.so                                  # interactive session
 destruct hex lib.so -c "info" -c "disasm 0x1000 32"        # one-shot, fail-fast
 destruct hex lib.so -c "patch 0x1000 90909090" -y -c "apply"
-destruct hex lib.so --read-only -c "search \"UnityPlayer\""
+destruct hex lib.so --read-only -c "search "UnityPlayer""
+
 ```
 
-Файл отображается в память **read-only** (не читается в heap целиком — можно
-открывать 100+ МБ `.so`). Правки накапливаются в памяти и попадают на диск
-только по `apply`/`save`. Патчи отображаются в `read`/`search`/`disasm`
-сразу после `patch` (строка с изменёнными байтами помечается `~`).
+The file is mapped into memory **read-only** (not read into the heap whole —
+100+ MB `.so` files are fine). Edits accumulate in memory and hit disk only on
+`apply`/`save`. Patches are reflected in `read`/`search`/`disasm` immediately
+after `patch` (changed lines are marked with `~`).
 
-| Команда | Действие |
+| Command | Action |
 |---|---|
-| `read [addr] [len]` | hex-дамп (по умолчанию: курсор, 256 байт; максимум 65536) |
-| `disasm [addr] [cnt]` | дизассемблировать (по умолчанию: курсор, 16; только ELF) |
-| `decompile <func\|addr>` | псевдокод функции (только AArch64 ELF; адрес = функция, содержащая адрес) |
-| `search <pattern>` | поиск: `"ASCII"`, `48 65 6c`, `48656c`, `48 ?? 6c` (wildcard) |
-| `goto <addr>` | переместить курсор |
-| `patch <addr> <hex>` | отложить патч (на диск пока ничего не пишется) |
-| `diff` | список отложенных патчей с индексами |
-| `drop <index>` / `clear` | удалить один патч / все патчи |
-| `apply` | записать патчи в исходный файл (атомарно, после подтверждения) |
-| `save [path]` | записать патчи в другой файл (исходный не трогается) |
-| `info` | формат, архитектура, таблица секций |
-| `exit` / `quit` / `q` | выход (при отложенных патчах `q` откажется выходить) |
-| `q!` | выход с отбрасыванием патчей |
+| `read [addr] [len]` | hex dump (default: cursor, 256 bytes; max 65536) |
+| `disasm [addr] [cnt]` | disassemble (default: cursor, 16; ELF only) |
+| `decompile <func\|addr>` | pseudocode of a function (AArch64 ELF only; address = containing function) |
+| `search <pattern>` | search: `"ASCII"`, `48 65 6c`, `48656c`, `48 ?? 6c` (wildcard) |
+| `goto <addr>` | move cursor |
+| `patch <addr> <hex>` | queue a patch (nothing written to disk yet) |
+| `diff` | list queued patches with indices |
+| `drop <index>` / `clear` | drop one patch / all patches |
+| `apply` | write patches to the original file (atomically, after confirmation) |
+| `save [path]` | write patches to another file (original untouched) |
+| `info` | format, architecture, section table |
+| `exit` / `quit` / `q` | quit (`q` refuses if patches are queued) |
+| `q!` | quit, discarding patches |
 
-**Адреса:** числа по умолчанию шестнадцатеричные. `f:0x1234` — file offset
-(по умолчанию; именно туда пишут патчи), `v:0x1234` — виртуальный адрес
-(только ELF; оба показываются, когда различаются). Счётчики (`len`, `cnt`)
-— десятичные, `0x` для hex.
+**Addresses:** numbers are hexadecimal by default. `f:0x1234` — file offset
+(default; this is where patches go), `v:0x1234` — virtual address (ELF only;
+both are shown when they differ). Counters (`len`, `cnt`) are decimal, `0x`
+for hex.
 
-**Флаги:**
-- `-c, --command <cmd>` — выполнить команду и выйти; можно повторять,
-  fail-fast. Коды выхода: 0 — успех, 1 — ошибка команды, 2 — ошибка
-  использования.
-- `-y, --yes` — не спрашивать подтверждение для `apply`/`save` (для скриптов).
-- `--read-only` — запретить `patch`/`apply`/`save`.
+**Flags:**
+- `-c, --command <cmd>` — run a command and exit; repeatable, fail-fast.
+  Exit codes: 0 — success, 1 — command error, 2 — usage error.
+- `-y, --yes` — skip confirmation for `apply`/`save` (for scripts).
+- `--read-only` — forbid `patch`/`apply`/`save`.
 
-**Ограничения v0.1:**
-- `disasm` — любой распознанный ELF (ARM/ARM64/x86/x86-64); `decompile` —
-  только AArch64 ELF. Для остальных форматов сообщение об ошибке укажет
-  на нужную подкоманду (`destruct jvm`, `destruct dex`, `destruct hermes`).
-- `apply` заменяет исходный файл целиком (atomic rename) и не создаёт
-  резервную копию: сначала показывается полный `diff`, затем запрашивается
-  подтверждение. Если размер/mtime файла изменились с момента открытия,
-  `apply` откажется писать. `save <path>` — безопасный вариант.
-- Патч не может изменить размер файла (только перезапись байтов).
-- Отображённый файл нельзя усекать извне: обращение к страницам за новым
-  концом — SIGBUS. После внешних изменений сессию нужно открыть заново.
+**v0.1 limitations:**
+- `disasm` — any recognized ELF (ARM/ARM64/x86/x86-64); `decompile` —
+  AArch64 ELF only. For other formats the error message points to the right
+  subcommand (`destruct jvm`, `destruct dex`, `destruct hermes`).
+- `apply` replaces the original file wholesale (atomic rename) and does not
+  create a backup: the full `diff` is shown, then confirmation is requested.
+  If file size/mtime changed since open, `apply` refuses to write.
+  `save <path>` is the safe variant.
+- A patch cannot change file size (byte overwrite only).
+- The mapped file must not be truncated externally: access past the new end
+  triggers SIGBUS. After external changes, reopen the session.
 
 ---
 
-## `destruct flutter` — дизассемблирование Flutter `libapp.so` (Dart AOT)
+## `destruct flutter` — disassemble Flutter `libapp.so` (Dart AOT)
 
 ```
+
 destruct flutter libapp.so -o output/
-destruct flutter libapp.so -o output/ --decompile   # вывод в .dart вместо ассемблера
+destruct flutter libapp.so -o output/ --decompile   # output .dart instead of assembly
+
 ```
 
-Требует, чтобы файл реально существовал и имел расширение `.so`/`.apk` — проверяется до запуска.
+Requires the file to actually exist and have a `.so`/`.apk` extension —
+validated before launch.
 
 ---
 
-## `destruct elf` — дизассемблирование ELF-бинарников (нативные `.so`, ARM/ARM64/x86)
+## `destruct elf` — disassemble ELF binaries (native .so, ARM/ARM64/x86)
 
 ```
+
 destruct elf libnative.so -o output/
-destruct elf libnative.so -o output/ --decompile                    # AArch64 псевдокод + enhancements
-destruct elf libnative.so -o output/ --decompile --no-enhance        # без enhanced-комментариев
-destruct elf libnative.so -o output/ --decompile --no-location-comments # без location-комментариев
-destruct elf libnative.so -o output/ --decompile --split-functions   # отдельный .c файл на функцию + functions.json
-destruct elf libnative.so -o output/ --decompile --cross-references  # XREF-комментарии + xrefs.json
-destruct elf libnative.so -o output/ --decompile --simplify-cfg      # упрощение CFG + удаление недостижимых блоков
-destruct elf libnative.so -o output/ --decompile --emit-llvm           # дополнительно экспортировать lifted IR в LLVM IR (<имя>.decompiled.ll)
-```
-
-Даёт читаемый ассемблерный листинг всех code-секций с аннотацией символами (если есть `.symtab`).
-
-**`--decompile`** (только AArch64): вместо листинга ассемблера прогоняет каждую функцию через ARM64→псевдокод лифтер (`internal/arm64lift`) и пишет результат ОДНИМ файлом — `<имя>.decompiled.c` — со всеми функциями подряд, каждая под своим `// имя_символа`.
-
-**`--split-functions`** / **`-sf`** (только AArch64 + `--decompile`): создаёт директорию `<имя_входа>_decompiled/`, пишет каждую функцию в свой `.c`-файл (`sub_<адрес>.c` или `<символ>_<адрес>.c`) и генерирует `functions.json` с метаданными: `address`, `name`, `size`, `success`. Полезно для анализа отдельных функций и интеграции с внешними инструментами.
-
-**`--cross-references`** / **`-x`** (только AArch64 + `--decompile`): добавляет в начало каждой функции комментарии `// XREF from:` / `// XREF to:` со списком вызывающих и вызываемых функций, а также генерирует `xrefs.json` (рядом с `.decompiled.c` или внутри `_decompiled/` при `--split-functions`). Работает через анализ прямых вызовов `bl #imm` во всех функциях.
-
-**`--simplify-cfg`** (только AArch64 + `--decompile`, экспериментальный): перед подъёмом в IR запускает проход упрощения CFG — удаляет недостижимые базовые блоки и склеивает линейные цепочки (единственный предшественник + единственный преемник). Обратные рёбра циклов не трогает, чтобы не сломать распознавание `while`/`if`. Может улучшить выход, но в сложных случаях взаимодействует с эвристическим лифтером непредсказуемо, поэтому пока opt-in.
-
-**`--emit-llvm`** (только AArch64; подразумевает `--decompile`): помимо `.decompiled.c` пишет `<имя>.decompiled.ll` — каждую поднятую функцию как LLVM IR (`internal/llvm`): все значения моделируются как `i64`, локалы — аллоками в `entry` с load/store (как у clang `-O0`), структурный control flow понижается до явных базовых блоков и ветвлений (`if`/`while`/`switch`, метки слияния `L_<addr>_<n>:` + `goto` транслируются в метки/переходы LLVM один в один). Строковые литералы выносятся в приватные глобалы. Формат рассчитан на дальнейший разбор через `llvm-as`/`opt` или дизассемблеры, а не на верифицированную компиляцию — точной типовой системы в поднятом IR нет.
-
-С `--decompile` автоматически включаются улучшенные комментарии (`--enhance`) и location-комментарии (`--location-comments`). Чтобы их отключить, используй `--no-enhance` / `--no-location-comments`.
-
-**`--print-options`** — распечатать распарсенную конфигурацию и выйти.
-
-**Поддерживаемые архитектуры дизассемблера:** `destruct elf` без `--decompile` дизассемблирует ARM64, ARM32 и x86/x86-64 ELF-файлы, выбирая Capstone-режим по machine-полю ELF-заголовка.
+destruct elf libnative.so -o output/ --decompile                    # AArch64 pseudocode + enhancements
+destruct elf libnative.so -o output/ --decompile --no-enhance        # without enhanced comments
+destruct elf libnative.so -o output/ --decompile --no-location-comments # without location comments
+destruct elf libnative.so -o output/ --decompile --split-functions   # one .c per function + functions.json
+destruct elf libnative.so -o output/ --decompile --cross-references  # XREF comments + xrefs.json
+destruct elf libnative.so -o output/ --decompile --simplify-cfg      # CFG simplification + unreachable block removal
+destruct elf libnative.so -o output/ --decompile --emit-llvm           # also export lifted IR to LLVM IR (<name>.decompiled.ll)
 
 ```
+
+Produces a readable assembly listing of all code sections annotated with symbols
+(if `.symtab` is present).
+
+**`--decompile`** (AArch64 only): instead of assembly listing, lifts every function
+through the ARM64→pseudocode lifter (`internal/arm64lift`) and writes one file —
+`<name>.decompiled.c` — containing all functions in sequence, each under its own
+`// symbol_name`.
+
+**`--split-functions`** / **`-sf`** (AArch64 + `--decompile` only): creates a
+`<input_name>_decompiled/` directory, writes each function to its own `.c` file
+(`sub_<addr>.c` or `<symbol>_<addr>.c`), and generates `functions.json` with
+metadata: `address`, `name`, `size`, `success`. Useful for per-function analysis
+and integration with external tools.
+
+**`--cross-references`** / **`-x`** (AArch64 + `--decompile` only): prepends
+`// XREF from:` / `// XREF to:` comments to each function listing callers and
+callees, and generates `xrefs.json` (next to `.decompiled.c`, or inside
+`_decompiled/` when `--split-functions` is used). Works via direct `bl #imm`
+call analysis across all functions.
+
+**`--simplify-cfg`** (AArch64 + `--decompile` only, experimental): runs a CFG
+simplification pass before lifting — removes unreachable basic blocks and merges
+linear chains (single predecessor + single successor). Does not touch loop
+back-edges to avoid breaking `while`/`if` recognition. May improve output, but
+in complex cases interacts unpredictably with the heuristic lifter, so it is
+opt-in.
+
+**`--emit-llvm`** (AArch64 only; implies `--decompile`): in addition to
+`.decompiled.c`, writes `<name>.decompiled.ll` — each lifted function as LLVM IR
+(`internal/llvm`): all values modeled as `i64`, locals as allocas in `entry`
+with load/store (clang `-O0` style), structured control flow lowered to explicit
+basic blocks and branches (`if`/`while`/`switch`, merge labels
+`L_<addr>_<n>:` + `goto` translated to LLVM labels/branches 1:1). String literals
+are lifted to private globals. The format targets `llvm-as`/`opt` or disassemblers,
+not verified compilation — the lifted IR has no exact type system.
+
+With `--decompile`, enhanced comments (`--enhance`) and location comments
+(`--location-comments`) are enabled automatically. Disable with `--no-enhance` /
+`--no-location-comments`.
+
+**`--print-options`** — print parsed configuration and exit.
+
+**Supported disassembler architectures:** `destruct elf` without `--decompile`
+disassembles ARM64, ARM32, and x86/x86-64 ELF files, picking the Capstone mode
+from the ELF header's machine field.
+
+```
+
 destruct elf libnative.so -o output/ --decompile
+
 ```
 
-Восстанавливает реальный control flow (if/else, while/do-while, вызовы, локальные переменные, доступ к полям структур через указатели), а не плоский листинг инструкций. Для бинарников с другой архитектурой (не AArch64) завершается с понятной ошибкой — используйте обычный `destruct elf` (без флага) для сырого дизассемблирования любой архитектуры. Функция, которую не удалось лифтить (паника внутри лифтера), не прерывает весь прогон — помечается комментарием `// [failed to decompile: ...]` в выходном файле и продолжается со следующей.
+Reconstructs real control flow (if/else, while/do-while, calls, local variables,
+struct field access through pointers) rather than a flat instruction listing. For
+non-AArch64 binaries it exits with a clear error — use plain `destruct elf`
+(without the flag) for raw disassembly of any architecture. A function that fails
+to lift (panic inside the lifter) does not abort the run — it is marked with a
+`// [failed to decompile: ...]` comment in the output file, and the run continues
+with the next one.
 
 ---
 
-## `destruct il2cpp` — дамп Unity IL2CPP (`global-metadata.dat` + `libil2cpp.so`) → `dump.cs`
+## `destruct il2cpp` — dump Unity IL2CPP (`global-metadata.dat` + `libil2cpp.so`) → `dump.cs`
 
 ```
+
 destruct il2cpp libil2cpp.so global-metadata.dat -o output/
-destruct il2cpp global-metadata.dat libil2cpp.so -o output/   # порядок аргументов не важен
-destruct il2cpp libil2cpp.so global-metadata.dat -v            # диагностика поиска регистраций
+destruct il2cpp global-metadata.dat libil2cpp.so -o output/   # argument order does not matter
+destruct il2cpp libil2cpp.so global-metadata.dat -v            # diagnose registration search
+
 ```
 
-Читает пару «библиотека IL2CPP + метаданные Unity» напрямую из файлов (без запуска
-приложения и без root) и генерирует `dump.cs` в формате Il2CppDumper: список образов,
-все типы/поля/свойства/методы с RVA/Offset/VA, Slot для виртуальных методов, значения
-default value и кастомные атрибуты.
+Reads the "IL2CPP library + Unity metadata" pair directly from files (no app
+launch, no root) and generates `dump.cs` in Il2CppDumper format: image list,
+all types/fields/properties/methods with RVA/Offset/VA, virtual method Slot,
+default values, and custom attributes.
 
-Что происходит внутри:
-1. Парсится `global-metadata.dat` (поддерживаются версии метаданных 16–31, включая
-   сжатые custom-attribute блобы v29+).
-2. В `libil2cpp.so` находятся `Il2CppCodeRegistration` и `Il2CppMetadataRegistration`
-   (эвристический поиск по ссылкам на `mscorlib.dll`, fallback на символы
-   `g_CodeRegistration`/`g_MetadataRegistration`) с учётом вариантов структур для
-   соседних версий IL2CPP.
-3. Применяются динамические релокации (AArch64/x86-64/ARM/x86), разворачиваются
-   codeGen-модули, типы, field offsets и generic-инстансы.
-4. Пишется `dump.cs`.
+What happens internally:
+1. Parse `global-metadata.dat` (metadata versions 16–31 supported, including
+   compressed v29+ custom-attribute blobs).
+2. Find `Il2CppCodeRegistration` and `Il2CppMetadataRegistration` in
+   `libil2cpp.so` (heuristic search via `mscorlib.dll` references, fallback to
+   `g_CodeRegistration`/`g_MetadataRegistration` symbols) accounting for
+   structure variations across adjacent IL2CPP versions.
+3. Apply dynamic relocations (AArch64/x86-64/ARM/x86), unroll codeGen modules,
+   types, field offsets, and generic instances.
+4. Write `dump.cs`.
 
-Флаги:
-- `-o, --output` — директория для `dump.cs` (по умолчанию `output/`).
-- `-v, --verbose` — печатать версию метаданных, адреса регистраций и т.д.
-- `--print-options` — распечатать конфигурацию и выйти.
+Flags:
+- `-o, --output` — directory for `dump.cs` (default `output/`).
+- `-v, --verbose` — print metadata version, registration addresses, etc.
+- `--print-options` — print configuration and exit.
 
-Обе позиционные аргумента опциональны по порядку: `.so` и `global-metadata.dat`
-распознаются по магическим числам, так что перепутать их нельзя.
+Both positional arguments are order-optional: `.so` and `global-metadata.dat`
+are recognized by magic bytes, so they cannot be swapped.
 
-Ограничения: вывод рассчитан на файловый дамп (RVA == VA адреса в образе);
-`dump.cs` пишется без восстановления тел методов — для дизассемблирования кода
-используй `destruct elf` по тем же RVA.
+Limitations: output is file-dump oriented (RVA == VA in image); `dump.cs` is
+written without recovering method bodies — for disassembling code, use
+`destruct elf` on the same RVAs.
 
 ---
 
-## `destruct pe` — дизассемблирование PE-бинарников (Windows `.exe`/`.dll`)
+## `destruct pe` — disassemble PE binaries (Windows `.exe`/`.dll`)
 
 ```
+
 destruct pe program.exe -o output/
+
 ```
 
-Тот же принцип, что `elf`, но для формата PE.
+Same principle as `elf`, but for PE format.
 
 ---
 
 ## `destruct version` / `destruct help`
 
 ```
-destruct version   # версия
-destruct help       # полный usage-текст (встроен в бинарник)
+
+destruct version   # version
+destruct help       # full usage text (embedded in the binary)
+
 ```
 
 ---
 
-## Общие флаги (применимы к большинству команд)
+## Common flags (apply to most commands)
 
-| Флаг | Значение |
+| Flag | Meaning |
 |---|---|
-| `-o, --output` | выходной файл/директория |
-| `-i, --input` | входной `.hbc`-файл (для `assemble`/`patch`) |
-| `-v, --verbose` | подробный вывод |
-| `--deobfuscate` | включить деобфускацию |
-| `--decompile` | использовать декомпилятор (JVM/Flutter/ELF AArch64) |
-| `--enhance` | улучшенные комментарии для AArch64 ELF декомпиляции |
-| `--location-comments` | добавить комментарии с адресами/местоположениями для AArch64 ELF |
-| `--print-options` | распечатать текущую конфигурацию и выйти |
-| `--no-enhance` | отключить enhanced-комментарии для AArch64 ELF декомпиляции |
-| `--no-location-comments` | отключить location-комментарии для AArch64 ELF декомпиляции |
-| `--split-functions`, `-sf` | записать каждую функцию в отдельный `.c`-файл и сгенерировать `functions.json` (только с `--decompile` для ELF AArch64) |
-| `--cross-references`, `-x` | добавить `// XREF:` комментарии и сгенерировать `xrefs.json` (только с `--decompile` для ELF AArch64) |
-| `--simplify-cfg` | запустить упрощение CFG / удаление недостижимых блоков (только с `--decompile` для ELF AArch64, экспериментально) |
-| `--emit-llvm` | экспортировать lifted IR в LLVM IR `<имя>.decompiled.ll` (только AArch64, подразумевает `--decompile`) |
-| `--no-project` | не создавать структуру проекта |
+| `-o, --output` | output file/directory |
+| `-i, --input` | input `.hbc` file (for `assemble`/`patch`) |
+| `-v, --verbose` | verbose output |
+| `--deobfuscate` | enable deobfuscation |
+| `--decompile` | use decompiler (JVM/Flutter/ELF AArch64) |
+| `--enhance` | enhanced comments for AArch64 ELF decompilation |
+| `--location-comments` | add address/location comments for AArch64 ELF |
+| `--print-options` | print current configuration and exit |
+| `--no-enhance` | disable enhanced comments for AArch64 ELF decompilation |
+| `--no-location-comments` | disable location comments for AArch64 ELF decompilation |
+| `--split-functions`, `-sf` | write each function to its own `.c` file and generate `functions.json` (ELF AArch64 with `--decompile` only) |
+| `--cross-references`, `-x` | add `// XREF:` comments and generate `xrefs.json` (ELF AArch64 with `--decompile` only) |
+| `--simplify-cfg` | run CFG simplification / unreachable block removal (ELF AArch64 with `--decompile` only, experimental) |
+| `--emit-llvm` | export lifted IR as LLVM IR `<name>.decompiled.ll` (AArch64 only, implies `--decompile`) |
+| `--no-project` | do not create project structure |
 
 ---
 
-## `lifttest` — тестовый драйвер для ARM64→C лифтера (экспериментальный, отдельный бинарник)
+## `lifttest` — test driver for the ARM64→C lifter (experimental, separate binary)
 
-Не входит в основной `destruct` CLI — собирается отдельно из `cmd/lifttest/`:
+Not part of the main `destruct` CLI — built separately from `cmd/lifttest/`:
 
 ```
+
 go build -o lifttest ./cmd/lifttest/
-./lifttest <путь_к_ELF> <mangled_имя_символа> [имена_параметров...]
+./lifttest <path_to_ELF> <mangled_symbol_name> [param_names...]
+
 ```
 
-**Пример:**
+**Example:**
 ```
+
 ./lifttest il2cpp_memory_dumper _ZN5utils7is_rootEv
-# // _ZN5utils7is_rootEv
-#     return .geteuid() == 0;
+
+// _ZN5utils7is_rootEv
+
+return .geteuid() == 0;
 
 ./lifttest il2cpp_memory_dumper _ZN5utils10write_fileE... path data size
+
 ```
 
-Имя символа для второго аргумента нужно узнать заранее, например через `readelf -s <файл> | grep FUNC`.
+Find the symbol name for the second argument in advance, e.g. via
+`readelf -s <file> | grep FUNC`.
 
-**Статус:** для разовой проверки одной функции удобнее `lifttest`; для декомпиляции ВСЕГО бинарника одним файлом — `destruct elf <файл> --decompile` (см. выше, уже часть основного CLI). Лифтер восстанавливает if/else, while/do-while (включая произвольную вложенность и составные `&&`/`||`-условия любой глубины), локальные переменные, доступ к полям структур через указатели и косвенные вызовы (`blr`/`br`, включая C++ vtable-thunk'и) — на тестовом бинарнике (`test/il2cpp_memory_dumper`) все 177 функций декомпилируются без пустого вывода и без паник. Оставшиеся ограничения (нет полноценной системы типов — имена вида `field_8`/`local_16` синтетические, не настоящие; индексная и pre/post-indexed адресация не отличается от обычной со смещением) см. в `internal/arm64lift/lift.go`, блок `TODO` в конце файла.
+**Status:** for one-off checks of a single function, `lifttest` is more convenient;
+for decompiling a whole binary into one file — `destruct elf <file> --decompile`
+(see above, already part of the main CLI). The lifter reconstructs if/else,
+while/do-while (including arbitrary nesting and compound `&&`/`||` conditions of
+any depth), local variables, struct field access through pointers, and indirect
+calls (`blr`/`br`, including C++ vtable thunks) — on the test binary
+(`test/il2cpp_memory_dumper`) all 177 functions decompile without empty output
+and without panics. Remaining limitations (no full type system — names like
+`field_8`/`local_16` are synthetic, not real; indexed and pre/post-indexed
+addressing are not distinguished from plain offset addressing) are listed in
+`internal/arm64lift/lift.go`, in the `TODO` block at the end.
 
 ---
 
-## Сборка
+## Build
 
 ```
-make build     # собрать destruct → ./destruct
-make test      # прогнать тесты
+
+make build     # build destruct -> ./destruct
+make test      # run tests
 make vet       # go vet
-make clean     # убрать бинарник и output/
+make clean     # remove binary and output/
+
 ```
 
-Требует `libcapstone-dev` в системе (для ELF/PE-дизассемблера и `lifttest`).
+Requires `libcapstone-dev` on the system (for the ELF/PE disassembler and `lifttest`).

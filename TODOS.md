@@ -51,7 +51,7 @@
 - [x] Replace direct `os.Exit` calls in command handlers with `func run(args []string) error`; keep process termination only in `main`. This will improve CLI testing and library reuse.
 - [x] Normalize file extensions at the pipeline boundary and validate file signatures where possible. `.JAR`, `.APK`, and similarly cased inputs should behave consistently.
 - [x] Replace unsafe Capstone structure pointer arithmetic in `internal/native/disasm.go` with a small, version-stable C helper API. Add lifecycle checks for nil/repeated `Close` and document thread-safety.
-  - [x] Follow-up: Capstone 6.0.0-Alpha10 implements `cs_option(CS_OPT_DETAIL)` as `handle->detail_opt |= value` (cs.c), so `CS_OPT_OFF` is a no-op and detail mode cannot be turned back off on a handle. Decide whether to keep detail permanently on after the first detailed call or use separate handles for detailed vs text-only disassembly. Decision: keep detail permanently on after the first detailed call — `cs_option(CS_OPT_OFF)` is a no-op in Alpha10, and separate handles are not worth the state complexity.
+  - [x] Follow-up: Capstone 6.0.0-Alpha10 implements `cs_option(CS_OPT_DETAIL)` as `handle->detail_opt |= value` (cs.c), so `CS_OPT_OFF` is a no-op and detail mode cannot be turned back off on a handle. Decide whether to keep detail permanently on after the first detailed call or use separate handles for detailed vs text-only disassembly. Decision: keep detail permanently on after the first detailed call — `cs_option(CS_OPT_OFF)` is a no-op in Alpha10, and separate handles are not worth the state complexity. Re-verified identical in 6.0.0-Alpha11 (cs.c `handle->detail_opt |= (cs_opt_value)value`).
 - [x] Add `context.Context` cancellation to long-running JAR/APK, ELF, Flutter, Hermes, and IL2CPP operations so Ctrl-C and API timeouts stop work cleanly.
   - [x] Pipeline-routed: JVM/APK/DEX/ELF/Flutter (`RunContext` + per-entry/per-function checks)
   - [x] Hermes/IL2CPP deep ctx threading (done via *Context variants in hermes/{decompiler,disasm,hermesdec}.go and il2cpp/{il2cpp,dump,executor,metadata,registration,elf}.go)
@@ -73,3 +73,24 @@
 ## Documentation
 - [x] ARM64_Enhancement_README.md - Phase 3 section added
 - [x] Update COMMANDS.md with new flags (`--emit-llvm`)
+
+## APK Build & Sign Support (Future)
+- [ ] Add `destruct apk build` command: repack modified classes.dex + resources into unsigned APK via apktool/d8/aapt2
+- [ ] Add `destruct apk sign` command: zipalign + apksigner/ubersigner signing with operator keystore
+- [ ] ARM64-v8a only: filter native libs to arm64-v8a (other ABIs unsupported on Termux/Android phone)
+- [ ] Integrate APK rebuild into DeStruct workflow: decompile → modify → rebuild → sign → install
+
+## Flint `--so` Testing (Done)
+- [x] Verified `flint build --so` works on Termux/Android (ARM64, NDK r30)
+- [x] Built test .so: `libflint_test.so` (168 KiB, valid ELF, custom labels in FLSO trailer)
+- [x] Custom symbols (`main`, `add`) exported via flint_so trailer, callable via `flint_so_call()`
+- [x] Requires `build/stub.so` (from `make`) in flint source dir; path is relative
+- [x] Test host: `tests/test_so.c` → `build/test_so <fused.so>`
+
+## Proxy Tunnel Analysis (Done)
+- [x] Decompiled `lib/arm64-v8a/libhev-socks5-tunnel.so` with deStruct: 513 functions, 0 failed
+- [x] `SkinVpnService` writes YAML config to `getFilesDir()/<name>` (ProtectedStrings.b[164-170])
+- [x] Calls `TProxyStartService(configPath, vpnLocalPort)` → native reads YAML via libyaml
+- [x] `hev_config_get_socks5_server()` → `.rodata[383792]` (server address from config, not hardcoded)
+- [x] `hev_tunnel_write()` — TCP/UDP passthrough via write()/writev() with GSO
+- [x] Proxy address is config-driven, not hardcoded in .so

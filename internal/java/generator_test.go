@@ -246,3 +246,149 @@ func TestGenerateClass_ImplicitSuperCall(t *testing.T) {
 		t.Errorf("expected the defensive bare \"super();\" fallback, got:\n%s", src)
 	}
 }
+
+// TestRenderStmt_ForStmt covers the ForStmt renderer: init/cond/post are
+// emitted in the Java for-header rather than falling through to the
+// abbreviated ir.ForStmt.String form, and the body is rendered in full.
+func TestRenderStmt_ForStmt(t *testing.T) {
+	stmt := &ir.ForStmt{
+		Init: &ir.VarDeclStmt{
+			Name: "i",
+			Type: &ir.PrimitiveType{Name: "int"},
+			Init: &ir.IntLit{Value: 0},
+		},
+		Cond: &ir.BinaryExpr{
+			Op:    "<",
+			Left:  &ir.LocalVar{Name: "i"},
+			Right: &ir.IntLit{Value: 3},
+		},
+		Post: &ir.ExprStmt{
+			Expr: &ir.UnaryExpr{Op: "++", Expr: &ir.LocalVar{Name: "i"}},
+		},
+		Body: &ir.Block{Statements: []ir.Stmt{
+			&ir.ExprStmt{Expr: &ir.StaticMethodCall{Class: "System", Method: "nanoTime"}},
+		}},
+	}
+
+	got := renderStmt(stmt, 2)
+	want := "\t\tfor (int i = 0; i < 3; ++i) {\n" +
+		"\t\t\tSystem.nanoTime();\n" +
+		"\t\t}"
+	if got != want {
+		t.Fatalf("renderStmt(ForStmt) =\n%q\nwant:\n%q", got, want)
+	}
+}
+
+// TestGenerateClass_ConstructorRendersFullBody is the regression test for
+// the constructor template path: a nested control-flow statement must be
+// rendered as a real body, not the "if (...) { ... }" placeholder produced
+// by ir.Stmt.String.
+func TestGenerateClass_ConstructorRendersFullBody(t *testing.T) {
+	class := &ir.Class{
+		Name:   "Sample",
+		Access: ir.AccPublic,
+		Methods: []*ir.Method{
+			{
+				Name:   "<init>",
+				Access: ir.AccPublic,
+				Params: []*ir.Param{
+					{Name: "x", Type: &ir.PrimitiveType{Name: "int"}},
+				},
+				Body: &ir.Block{Statements: []ir.Stmt{
+					&ir.SuperCallStmt{},
+					&ir.IfStmt{
+						Cond: &ir.BinaryExpr{
+							Op:    ">",
+							Left:  &ir.LocalVar{Name: "x"},
+							Right: &ir.IntLit{Value: 0},
+						},
+						Then: &ir.Block{Statements: []ir.Stmt{
+							&ir.ExprStmt{Expr: &ir.StaticMethodCall{Class: "System", Method: "nanoTime"}},
+						}},
+					},
+					&ir.ReturnStmt{},
+				}},
+			},
+		},
+	}
+
+	dir := t.TempDir()
+	g := NewGenerator(Options{OutputDir: dir})
+	if err := g.GenerateClass(class); err != nil {
+		t.Fatalf("GenerateClass: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "Sample.java"))
+	if err != nil {
+		t.Fatalf("reading generated file: %v", err)
+	}
+	src := string(data)
+
+	if !strings.Contains(src, "if (x > 0) {") {
+		t.Errorf("constructor body was not rendered in full, got:\n%s", src)
+	}
+	if strings.Contains(src, "if (x > 0) { ... }") {
+		t.Errorf("constructor body fell back to the abbreviated String() form, got:\n%s", src)
+	}
+	if !strings.Contains(src, "System.nanoTime();") {
+		t.Errorf("nested constructor statement missing, got:\n%s", src)
+	}
+}
+
+// TestGenerateClass_ClinitRendersFullBody covers the static-initializer
+// template path, which had the same {{.}} placeholder rendering bug.
+func TestGenerateClass_ClinitRendersFullBody(t *testing.T) {
+	class := &ir.Class{
+		Name:   "Sample",
+		Access: ir.AccPublic,
+		Methods: []*ir.Method{
+			{
+				Name:   "<clinit>",
+				Access: ir.AccStatic,
+				Body: &ir.Block{Statements: []ir.Stmt{
+					&ir.ForStmt{
+						Init: &ir.VarDeclStmt{
+							Name: "i",
+							Type: &ir.PrimitiveType{Name: "int"},
+							Init: &ir.IntLit{Value: 0},
+						},
+						Cond: &ir.BinaryExpr{
+							Op:    "<",
+							Left:  &ir.LocalVar{Name: "i"},
+							Right: &ir.IntLit{Value: 2},
+						},
+						Post: &ir.ExprStmt{
+							Expr: &ir.UnaryExpr{Op: "++", Expr: &ir.LocalVar{Name: "i"}},
+						},
+						Body: &ir.Block{Statements: []ir.Stmt{
+							&ir.ExprStmt{Expr: &ir.StaticMethodCall{Class: "System", Method: "nanoTime"}},
+						}},
+					},
+					&ir.ReturnStmt{},
+				}},
+			},
+		},
+	}
+
+	dir := t.TempDir()
+	g := NewGenerator(Options{OutputDir: dir})
+	if err := g.GenerateClass(class); err != nil {
+		t.Fatalf("GenerateClass: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "Sample.java"))
+	if err != nil {
+		t.Fatalf("reading generated file: %v", err)
+	}
+	src := string(data)
+
+	if !strings.Contains(src, "for (int i = 0; i < 2; ++i) {") {
+		t.Errorf("static initializer for-loop was not rendered in full, got:\n%s", src)
+	}
+	if strings.Contains(src, "for (...;") {
+		t.Errorf("static initializer fell back to the abbreviated ForStmt.String form, got:\n%s", src)
+	}
+	if !strings.Contains(src, "System.nanoTime();") {
+		t.Errorf("nested static-initializer statement missing, got:\n%s", src)
+	}
+}

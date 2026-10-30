@@ -64,7 +64,10 @@ test/**
 test/il2cpp_memory_dumper_main/build/
 
 # Bundled Capstone (downloaded source, not tracked in git)
-capstone-6.0.0-Alpha10/
+# Versioned source dirs plus the stable capstone-src symlink that
+# fetch-capstone.sh / make maintains (points at the pinned version).
+capstone-*/
+capstone-src
 
 # Bundled Capstone build artifacts
 third_party/capstone/build/
@@ -79,3 +82,17 @@ third_party/capstone/build/
 
 # Per-bug reproduction/hypothesis logs (local working artifacts)
 /fix-logs/
+
+# Local reference checkout used only to regenerate the Hermes opcode
+# tables (see internal/hermes/opcodes/data/build_data.py). The derived
+# tables are tracked; the upstream clone itself is not. Its Apache-2.0
+# licence is vendored at third_party/hbctool/LICENSE.Apache-2.0.
+/hbctool/
+
+# Local release/snapshot archive made at the repo root.
+/DeStruct.zip
+
+# Large local IL2CPP sample files used for manual validation. The test
+# suite does not depend on them; regenerate/download rather than tracking
+# ~100 MB of fixture data.
+/internal/il2cpp/testdata/

@@ -1,0 +1,2617 @@
+{
+  "version": 74,
+  "source": "github.com/Kirlif/HBC-Tool (Apache-2.0)",
+  "instructions": [
+    {
+      "name": "NewObjectWithBuffer",
+      "opcode": 0,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "UInt16"
+        }
+      ]
+    },
+    {
+      "name": "NewObjectWithBufferLong",
+      "opcode": 1,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "UInt32"
+        },
+        {
+          "type": "UInt32"
+        }
+      ]
+    },
+    {
+      "name": "NewObject",
+      "opcode": 2,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "NewObjectWithParent",
+      "opcode": 3,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "NewArrayWithBuffer",
+      "opcode": 4,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "UInt16"
+        }
+      ]
+    },
+    {
+      "name": "NewArrayWithBufferLong",
+      "opcode": 5,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "UInt32"
+        }
+      ]
+    },
+    {
+      "name": "NewArray",
+      "opcode": 6,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16"
+        }
+      ]
+    },
+    {
+      "name": "Mov",
+      "opcode": 7,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "MovLong",
+      "opcode": 8,
+      "operands": [
+        {
+          "type": "Reg32"
+        },
+        {
+          "type": "Reg32"
+        }
+      ]
+    },
+    {
+      "name": "Negate",
+      "opcode": 9,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Not",
+      "opcode": 10,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "BitNot",
+      "opcode": 11,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "TypeOf",
+      "opcode": 12,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Eq",
+      "opcode": 13,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "StrictEq",
+      "opcode": 14,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Neq",
+      "opcode": 15,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "StrictNeq",
+      "opcode": 16,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Less",
+      "opcode": 17,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "LessEq",
+      "opcode": 18,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Greater",
+      "opcode": 19,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "GreaterEq",
+      "opcode": 20,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Add",
+      "opcode": 21,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "AddN",
+      "opcode": 22,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Mul",
+      "opcode": 23,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "MulN",
+      "opcode": 24,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Div",
+      "opcode": 25,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "DivN",
+      "opcode": 26,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Mod",
+      "opcode": 27,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Sub",
+      "opcode": 28,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "SubN",
+      "opcode": 29,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "LShift",
+      "opcode": 30,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "RShift",
+      "opcode": 31,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "URshift",
+      "opcode": 32,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "BitAnd",
+      "opcode": 33,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "BitXor",
+      "opcode": 34,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "BitOr",
+      "opcode": 35,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "InstanceOf",
+      "opcode": 36,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "IsIn",
+      "opcode": 37,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "GetEnvironment",
+      "opcode": 38,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ]
+    },
+    {
+      "name": "StoreToEnvironment",
+      "opcode": 39,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "StoreToEnvironmentL",
+      "opcode": 40,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "StoreNPToEnvironment",
+      "opcode": 41,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "StoreNPToEnvironmentL",
+      "opcode": 42,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "LoadFromEnvironment",
+      "opcode": 43,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ]
+    },
+    {
+      "name": "LoadFromEnvironmentL",
+      "opcode": 44,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16"
+        }
+      ]
+    },
+    {
+      "name": "GetGlobalObject",
+      "opcode": 45,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "GetNewTarget",
+      "opcode": 46,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "CreateEnvironment",
+      "opcode": 47,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "DeclareGlobalVar",
+      "opcode": 48,
+      "operands": [
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "GetByIdShort",
+      "opcode": 49,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt8",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "GetById",
+      "opcode": 50,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "GetByIdLong",
+      "opcode": 51,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "TryGetById",
+      "opcode": 52,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "TryGetByIdLong",
+      "opcode": 53,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "PutById",
+      "opcode": 54,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "PutByIdLong",
+      "opcode": 55,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "TryPutById",
+      "opcode": 56,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "TryPutByIdLong",
+      "opcode": 57,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "PutNewOwnByIdShort",
+      "opcode": 58,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "PutNewOwnById",
+      "opcode": 59,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "PutNewOwnByIdLong",
+      "opcode": 60,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "PutNewOwnNEById",
+      "opcode": 61,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "PutNewOwnNEByIdLong",
+      "opcode": 62,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "PutOwnByIndex",
+      "opcode": 63,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ]
+    },
+    {
+      "name": "PutOwnByIndexL",
+      "opcode": 64,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32"
+        }
+      ]
+    },
+    {
+      "name": "PutOwnByVal",
+      "opcode": 65,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ]
+    },
+    {
+      "name": "DelById",
+      "opcode": 66,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "DelByIdLong",
+      "opcode": 67,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "GetByVal",
+      "opcode": 68,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "PutByVal",
+      "opcode": 69,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "DelByVal",
+      "opcode": 70,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "PutOwnGetterSetterByVal",
+      "opcode": 71,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ]
+    },
+    {
+      "name": "GetPNameList",
+      "opcode": 72,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "GetNextPName",
+      "opcode": 73,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Call",
+      "opcode": 74,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "Construct",
+      "opcode": 75,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "Call1",
+      "opcode": 76,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "CallDirect",
+      "opcode": 77,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "function_id"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "Call2",
+      "opcode": 78,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "Call3",
+      "opcode": 79,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "Call4",
+      "opcode": 80,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "CallLong",
+      "opcode": 81,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "ConstructLong",
+      "opcode": 82,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "CallDirectLongIndex",
+      "opcode": 83,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "function_id"
+        }
+      ],
+      "retTarget": true
+    },
+    {
+      "name": "CallBuiltin",
+      "opcode": 84,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ]
+    },
+    {
+      "name": "Ret",
+      "opcode": 85,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Catch",
+      "opcode": 86,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "DirectEval",
+      "opcode": 87,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Throw",
+      "opcode": 88,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "ThrowIfUndefinedInst",
+      "opcode": 89,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "Debugger",
+      "opcode": 90
+    },
+    {
+      "name": "AsyncBreakCheck",
+      "opcode": 91
+    },
+    {
+      "name": "ProfilePoint",
+      "opcode": 92,
+      "operands": [
+        {
+          "type": "UInt16"
+        }
+      ]
+    },
+    {
+      "name": "Unreachable",
+      "opcode": 93
+    },
+    {
+      "name": "CreateClosure",
+      "opcode": 94,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "function_id"
+        }
+      ]
+    },
+    {
+      "name": "CreateClosureLongIndex",
+      "opcode": 95,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "function_id"
+        }
+      ]
+    },
+    {
+      "name": "CreateGeneratorClosure",
+      "opcode": 96,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "function_id"
+        }
+      ]
+    },
+    {
+      "name": "CreateGeneratorClosureLongIndex",
+      "opcode": 97,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "function_id"
+        }
+      ]
+    },
+    {
+      "name": "CreateThis",
+      "opcode": 98,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "SelectObject",
+      "opcode": 99,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "LoadParam",
+      "opcode": 100,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ]
+    },
+    {
+      "name": "LoadParamLong",
+      "opcode": 101,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstUInt8",
+      "opcode": 102,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstInt",
+      "opcode": 103,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Imm32"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstDouble",
+      "opcode": 104,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Double"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstString",
+      "opcode": 105,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstStringLongIndex",
+      "opcode": 106,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstUndefined",
+      "opcode": 107,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstNull",
+      "opcode": 108,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstTrue",
+      "opcode": 109,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstFalse",
+      "opcode": 110,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "LoadConstZero",
+      "opcode": 111,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "CoerceThisNS",
+      "opcode": 112,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "LoadThisNS",
+      "opcode": 113,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "ToNumber",
+      "opcode": 114,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "ToInt32",
+      "opcode": 115,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "AddEmptyString",
+      "opcode": 116,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "GetArgumentsPropByVal",
+      "opcode": 117,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "GetArgumentsLength",
+      "opcode": 118,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "ReifyArguments",
+      "opcode": 119,
+      "operands": [
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "CreateRegExp",
+      "opcode": 120,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "string_id"
+        },
+        {
+          "type": "UInt32"
+        }
+      ]
+    },
+    {
+      "name": "SwitchImm",
+      "opcode": 121,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32"
+        },
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "UInt32"
+        },
+        {
+          "type": "UInt32"
+        }
+      ]
+    },
+    {
+      "name": "StartGenerator",
+      "opcode": 122
+    },
+    {
+      "name": "ResumeGenerator",
+      "opcode": 123,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "CompleteGenerator",
+      "opcode": 124
+    },
+    {
+      "name": "CreateGenerator",
+      "opcode": 125,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt16",
+          "meaning": "function_id"
+        }
+      ]
+    },
+    {
+      "name": "CreateGeneratorLongIndex",
+      "opcode": 126,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt32",
+          "meaning": "function_id"
+        }
+      ]
+    },
+    {
+      "name": "IteratorBegin",
+      "opcode": 127,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "IteratorNext",
+      "opcode": 128,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "IteratorClose",
+      "opcode": 129,
+      "operands": [
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "UInt8"
+        }
+      ]
+    },
+    {
+      "name": "Jmp",
+      "opcode": 130,
+      "operands": [
+        {
+          "type": "Addr8"
+        }
+      ]
+    },
+    {
+      "name": "JmpLong",
+      "opcode": 131,
+      "operands": [
+        {
+          "type": "Addr32"
+        }
+      ]
+    },
+    {
+      "name": "JmpTrue",
+      "opcode": 132,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JmpTrueLong",
+      "opcode": 133,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JmpFalse",
+      "opcode": 134,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JmpFalseLong",
+      "opcode": 135,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JmpUndefined",
+      "opcode": 136,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JmpUndefinedLong",
+      "opcode": 137,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "SaveGenerator",
+      "opcode": 138,
+      "operands": [
+        {
+          "type": "Addr8"
+        }
+      ]
+    },
+    {
+      "name": "SaveGeneratorLong",
+      "opcode": 139,
+      "operands": [
+        {
+          "type": "Addr32"
+        }
+      ]
+    },
+    {
+      "name": "JLess",
+      "opcode": 140,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JLessLong",
+      "opcode": 141,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotLess",
+      "opcode": 142,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotLessLong",
+      "opcode": 143,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JLessN",
+      "opcode": 144,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JLessNLong",
+      "opcode": 145,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotLessN",
+      "opcode": 146,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotLessNLong",
+      "opcode": 147,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JLessEqual",
+      "opcode": 148,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JLessEqualLong",
+      "opcode": 149,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotLessEqual",
+      "opcode": 150,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotLessEqualLong",
+      "opcode": 151,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JLessEqualN",
+      "opcode": 152,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JLessEqualNLong",
+      "opcode": 153,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotLessEqualN",
+      "opcode": 154,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotLessEqualNLong",
+      "opcode": 155,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JGreater",
+      "opcode": 156,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JGreaterLong",
+      "opcode": 157,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotGreater",
+      "opcode": 158,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotGreaterLong",
+      "opcode": 159,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JGreaterN",
+      "opcode": 160,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JGreaterNLong",
+      "opcode": 161,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotGreaterN",
+      "opcode": 162,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotGreaterNLong",
+      "opcode": 163,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JGreaterEqual",
+      "opcode": 164,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JGreaterEqualLong",
+      "opcode": 165,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotGreaterEqual",
+      "opcode": 166,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotGreaterEqualLong",
+      "opcode": 167,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JGreaterEqualN",
+      "opcode": 168,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JGreaterEqualNLong",
+      "opcode": 169,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotGreaterEqualN",
+      "opcode": 170,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotGreaterEqualNLong",
+      "opcode": 171,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JEqual",
+      "opcode": 172,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JEqualLong",
+      "opcode": 173,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotEqual",
+      "opcode": 174,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JNotEqualLong",
+      "opcode": 175,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JStrictEqual",
+      "opcode": 176,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JStrictEqualLong",
+      "opcode": 177,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JStrictNotEqual",
+      "opcode": 178,
+      "operands": [
+        {
+          "type": "Addr8"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    },
+    {
+      "name": "JStrictNotEqualLong",
+      "opcode": 179,
+      "operands": [
+        {
+          "type": "Addr32"
+        },
+        {
+          "type": "Reg8"
+        },
+        {
+          "type": "Reg8"
+        }
+      ]
+    }
+  ],
+  "builtins": [
+    "Array.isArray",
+    "ArrayBuffer.isView",
+    "Date.UTC",
+    "Date.now",
+    "Date.parse",
+    "JSON.parse",
+    "JSON.stringify",
+    "Math.abs",
+    "Math.acos",
+    "Math.asin",
+    "Math.atan",
+    "Math.atan2",
+    "Math.ceil",
+    "Math.cos",
+    "Math.exp",
+    "Math.floor",
+    "Math.hypot",
+    "Math.imul",
+    "Math.log",
+    "Math.max",
+    "Math.min",
+    "Math.pow",
+    "Math.random",
+    "Math.round",
+    "Math.sin",
+    "Math.sqrt",
+    "Math.tan",
+    "Math.trunc",
+    "Object.create",
+    "Object.defineProperties",
+    "Object.defineProperty",
+    "Object.freeze",
+    "Object.getOwnPropertyDescriptor",
+    "Object.getOwnPropertyNames",
+    "Object.getPrototypeOf",
+    "Object.isExtensible",
+    "Object.isFrozen",
+    "Object.keys",
+    "Object.seal",
+    "String.fromCharCode",
+    "silentSetPrototypeOf",
+    "requireFast",
+    "getTemplateObject",
+    "ensureObject",
+    "throwTypeError",
+    "generatorSetDelegated",
+    "copyDataProperties",
+    "copyRestArgs",
+    "arraySpread",
+    "apply",
+    "exportAll",
+    "exponentiationOperator"
+  ],
+  "builtinsApproximate": false,
+  "builtinsSource": "facebook/hermes d1637f28eb (include/hermes/FrontEndDefs/Builtins.def)"
+}

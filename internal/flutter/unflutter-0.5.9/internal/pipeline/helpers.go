@@ -10,10 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/destruct/destruct/internal/flutter/unflutter-0.5.9/internal/cluster"
+	"github.com/destruct/destruct/internal/flutter/unflutter-0.5.9/internal/output"
 	"github.com/destruct/destruct/internal/flutter/unflutter-0.5.9/internal/snapshot"
 )
 
@@ -339,64 +338,31 @@ func QualifiedName(ownerName, funcName string, pcOffset uint32) string {
 }
 
 // SanitizeFilename makes a string safe for use as a filename.
-// Strips non-printable runes and replaces filesystem-unsafe characters.
+// It delegates to output.SanitizeFileName so the paths built here, the
+// files written by the output package, and the links emitted by the
+// render package all use one canonical transform.
 func SanitizeFilename(name string) string {
-	// Strip non-printable runes (keeps valid Unicode including CJK, emoji, etc.).
-	var clean strings.Builder
-	for _, r := range name {
-		if r == utf8.RuneError || !unicode.IsPrint(r) {
-			clean.WriteByte('_')
-		} else {
-			clean.WriteRune(r)
-		}
-	}
-	r := strings.NewReplacer(
-		"/", "_",
-		"\\", "_",
-		":", "_",
-		"*", "_",
-		"?", "_",
-		"\"", "_",
-		"<", "_",
-		">", "_",
-		"|", "_",
-		" ", "_",
-	)
-	s := r.Replace(clean.String())
-	if len(s) > 200 {
-		s = s[:200]
-	}
-	return s
+	return output.SanitizeFileName(name)
 }
 
-// FuncRelPath returns a relative path like "OwnerClass/funcName_hex" for functions
-// with an owner, or "funcName_hex" for ownerless functions.
+// FuncRelPath returns the flat relative path used for a function's .txt and
+// .bin files: the sanitized qualified name "Owner.Func_hex". Characters that
+// are unsafe in filenames are folded to "_", so a Dart symbol can never open
+// an unintended subdirectory (e.g. "Duration.dyn:-_1435fa4" is written as
+// "Duration.dyn_-_1435fa4.txt").
 func FuncRelPath(ownerName, funcName string, pcOffset uint32) string {
-	suffix := fmt.Sprintf("_%x", pcOffset)
-	var fpart string
-	if funcName == "" {
-		fpart = "sub" + suffix
-	} else {
-		fpart = SanitizeFilename(funcName + suffix)
-	}
-	if ownerName != "" {
-		return SanitizeFilename(ownerName) + "/" + fpart
-	}
-	return fpart
+	return output.SanitizeFileName(QualifiedName(ownerName, funcName, pcOffset))
 }
 
-// FuncRelPathFromQualified reconstructs the relative path from a qualified name
-// and its owner. Used by post-disasm commands (signal, decompile).
+// FuncRelPathFromQualified reconstructs the relative path from a qualified
+// name (as stored in functions.jsonl) and its owner. It mirrors FuncRelPath:
+// the same sanitizer is applied to the same qualified string the writer
+// used, so post-disasm readers (signal, decompile) always resolve the file
+// that was actually written. The owner parameter is kept for call-site
+// compatibility; the qualified name already carries the owner.
 func FuncRelPathFromQualified(qualifiedName, owner string) string {
-	if owner != "" {
-		prefix := owner + "."
-		funcPart := qualifiedName
-		if strings.HasPrefix(qualifiedName, prefix) {
-			funcPart = qualifiedName[len(prefix):]
-		}
-		return SanitizeFilename(owner) + "/" + SanitizeFilename(funcPart)
-	}
-	return SanitizeFilename(qualifiedName)
+	_ = owner
+	return output.SanitizeFileName(qualifiedName)
 }
 
 // ReadJSONL reads a JSONL file into a slice of T.

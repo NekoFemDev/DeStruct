@@ -1,8 +1,18 @@
 # Bundled Capstone build for DeStruct
-# Builds a static libcapstone.a from the vendored Capstone 6.0.0-Alpha10 source.
+# Builds a static libcapstone.a from the fetched Capstone source.
 # Only ARM and ARM64 architectures are compiled to minimize binary size.
+#
+# CAPSTONE_DIR defaults to the stable capstone-src symlink at the repo
+# root (maintained by fetch-capstone.sh / top-level make), so version
+# bumps never touch this file. It can still be overridden:
+#   make -C third_party/capstone CAPSTONE_DIR=../../capstone-6.0.0-Alpha11
+# If the symlink is missing (e.g. source fetched by the old Makefile),
+# fall back to the newest capstone-*/ directory.
 
-CAPSTONE_DIR := ../../capstone-6.0.0-Alpha10
+CAPSTONE_DIR ?= ../../capstone-src
+ifeq ($(wildcard $(CAPSTONE_DIR)/cs.c),)
+  CAPSTONE_DIR := $(lastword $(sort $(wildcard ../../capstone-*/)))
+endif
 BUILD_DIR := build
 
 CC ?= gcc

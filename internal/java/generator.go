@@ -181,8 +181,13 @@ func (g *Generator) generateClass(class *ir.Class) error {
 			}
 			return stmts
 		},
-		"renderStmt": func(s ir.Stmt) string {
-			return renderStmt(s, 2)
+		// renderStmt renders a statement at an explicit indentation
+		// depth. Constructors and static initializers call it as
+		// {{renderStmt . 2}} so nested control flow (if/for/while/...)
+		// is emitted with full bodies rather than the abbreviated
+		// "if (...) { ... }" form of ir.Stmt.String.
+		"renderStmt": func(s ir.Stmt, depth int) string {
+			return renderStmt(s, depth)
 		},
 		"hasSuper": func(s string) bool {
 			return s != ""
@@ -354,6 +359,41 @@ func renderStmt(s ir.Stmt, depth int) string {
 			result += renderStmt(stmt, depth+1) + "\n"
 		}
 		result += indent + "} while (" + fmt.Sprint(v.Cond) + ");"
+		return result
+	case *ir.ForStmt:
+		// renderStmt emits the init/post statements with their own
+		// statement terminator, so the init clause already carries the
+		// first ';' when present. Java still requires both separators
+		// when a clause is empty, hence the explicit ";" fallback.
+		init := ""
+		if v.Init != nil {
+			init = strings.TrimSpace(renderStmt(v.Init, 0))
+		}
+		post := ""
+		if v.Post != nil {
+			// The update clause is an expression, not a statement:
+			// renderStmt's trailing ';' would produce "for (...; i++;)".
+			post = strings.TrimSuffix(strings.TrimSpace(renderStmt(v.Post, 0)), ";")
+		}
+		cond := ""
+		if v.Cond != nil {
+			cond = fmt.Sprint(v.Cond)
+		}
+		header := init
+		if header == "" {
+			header = ";"
+		}
+		header += " " + cond + ";"
+		if post != "" {
+			header += " " + post
+		}
+		result := indent + "for (" + header + ") {\n"
+		if v.Body != nil {
+			for _, stmt := range v.Body.Statements {
+				result += renderStmt(stmt, depth+1) + "\n"
+			}
+		}
+		result += indent + "}"
 		return result
 	case *ir.ForEachStmt:
 		result := indent + "for (" + typeName(v.VarType) + " " + v.VarName + " : " + fmt.Sprint(v.Expr) + ") {\n"
@@ -979,19 +1019,19 @@ const javaTemplate = `{{- if .Package}}package {{.Package}};
 	{{acc .Access}}{{$.Name}}({{params .Params}}) {
 		{{ctorCall .}}
 {{- range ctorBodyStatements .}}{{- if not (isReturnVoid .)}}
-		{{.}}{{- end}}{{- end}}
+{{renderStmt . 2}}{{- end}}{{- end}}
 	}
 {{- else if eq .Name "<clinit>"}}
 	static {
 {{- if .Body}}{{range .Body.Statements}}{{- if not (isReturnVoid .)}}
-		{{.}}{{- end}}{{- end}}{{- end}}
+{{renderStmt . 2}}{{- end}}{{- end}}{{- end}}
 	}
 {{- else if or .Access.IsNative .Access.IsAbstract}}
 	{{acc .Access}}{{mmod .Access}}{{typeName .ReturnType}} {{.Name}}({{params .Params}});
 {{- else}}
 	{{acc .Access}}{{mmod .Access}}{{typeName .ReturnType}} {{.Name}}({{params .Params}}) {
 {{- if .Body}}{{range .Body.Statements}}
-{{renderStmt .}}{{- end}}{{- else}}
+{{renderStmt . 2}}{{- end}}{{- else}}
 		// TODO{{- end}}
 	}
 {{- end}}
