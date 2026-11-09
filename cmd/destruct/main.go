@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
+	"github.com/destruct/destruct/internal/arm64lift"
 	"github.com/destruct/destruct/internal/hermes"
 	"github.com/destruct/destruct/internal/hermes/asm"
 	"github.com/destruct/destruct/internal/hermes/disasm"
@@ -21,7 +25,7 @@ import (
 	"github.com/destruct/destruct/internal/pipeline"
 )
 
-const version = "0.1.0"
+const version = "1.0.0-beta.3"
 
 func main() {
 	// Cancel in-flight work on Ctrl-C (SIGINT) or SIGTERM. Long-running
@@ -108,7 +112,10 @@ Commands:
   hex         Interactive hex editor with staged patching (mapped read-only;
                ELF disasm/decompile; -c for one-shot scripting)
   flutter     Disassemble Flutter libapp.so to readable Dart bytecode
-  elf         Disassemble ELF binaries to readable assembly (--decompile: AArch64-only pseudocode)
+  elf         Disassemble ELF binaries to readable assembly (--decompile: AArch64-only pseudo-C)
+  elf recompile <decompiled_dir> -o <binary>
+              Generate link stubs and recompile all .c files into a dummy
+              executable with clang
   il2cpp      Dump Unity IL2CPP metadata (global-metadata.dat + libil2cpp.so) to dump.cs
   pe          Disassemble PE binaries to readable assembly
   version     Show version
@@ -135,6 +142,18 @@ Options:
                          for AArch64 ELF decompilation (experimental)
   --emit-llvm           With --decompile (ELF), also export every lifted
                          function as LLVM IR to <input>.decompiled.ll
+  --il2cpp-offsets <path>
+                         With --decompile (ELF), load an IL2CPP field-offset
+                         dump (offsets.json / offset.hpp, or a directory
+                         containing one, e.g. game_dump/) so field accesses can
+                         use the dump's resolved names/offsets
+  --emit-pseudo         With --decompile (ELF), select the unified pseudo-C
+                         output explicitly (the default). The output is a
+                         syntactically valid C translation unit: declarations,
+                         uintptr_t casts, normalized labels and one dummy
+                         function per lifted symbol
+  --regs-as-vars        With --decompile (ELF), rename register placeholders
+                         to arg0..arg7 / var_N / fvar_N (default keeps x0/w0)
   --no-enhance          Disable enhanced comments when using --decompile (ELF)
   --no-location-comments Disable source-location comments when using --decompile (ELF)
   --print-options       Print the parsed configuration and exit
@@ -160,6 +179,9 @@ Examples:
   destruct hermes index.android.bundle -o output/
   destruct assemble output/index.android.bundle.hasm -i index.android.bundle -o patched.hbc
   destruct elf libnative.so -o output/ --decompile  # AArch64 pseudocode, one file
+  destruct elf libnative.so -o output/ --decompile --il2cpp-offsets game_dump/
+  destruct elf libnative.so -o output/ --emit-pseudo --split-functions
+  destruct elf recompile output/libnative.so_decompiled/ -o dummy
   destruct flutter libapp.so -o output/ --decompile
   destruct il2cpp libil2cpp.so global-metadata.dat -o output/
   destruct elf libnative.so -o output/
@@ -457,6 +479,9 @@ func handleFlutter(ctx context.Context, args []string) error {
 }
 
 func handleELF(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "recompile" {
+		return handleELFRecompile(ctx, args[1:])
+	}
 	opts, input := parseFlags(args)
 	if input == "" {
 		return errors.New("input file required")
@@ -471,6 +496,15 @@ func handleELF(ctx context.Context, args []string) error {
 	// --emit-llvm implies --decompile for ELF, since the LLVM exporter
 	// consumes the lifted IR.
 	if opts.emitLLVM {
+		opts.decompile = true
+	}
+
+	// The IL2CPP output mode only exists for the AArch64 decompiler;
+	// --emit-pseudo is the single, unified rendering mode.
+	if opts.emitPseudo {
+		opts.decompile = true
+	}
+	if opts.il2cppOffsets != "" || opts.regsAsVars {
 		opts.decompile = true
 	}
 
@@ -497,6 +531,9 @@ func handleELF(ctx context.Context, args []string) error {
 		CrossReferences: opts.crossReferences,
 		SimplifyCFG:     opts.simplifyCfg,
 		EmitLLVM:        opts.emitLLVM,
+		IL2CPPOffsets:   opts.il2cppOffsets,
+		EmitPseudo:      opts.emitPseudo,
+		RegsAsVars:      opts.regsAsVars,
 	})
 
 	if err := p.RunContext(ctx); err != nil {
@@ -505,6 +542,140 @@ func handleELF(ctx context.Context, args []string) error {
 
 	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
 	return nil
+}
+
+// handleELFRecompile implements:
+//
+//	destruct elf recompile <decompiled_dir> -o <output_binary>
+//
+// It generates stubs.c for every unresolved extern in the decompiled
+// directory, then invokes clang on every .c file in that directory
+// (including stubs.c) to produce a dummy executable.
+func handleELFRecompile(ctx context.Context, args []string) error {
+	var dir, output string
+	for i := 0; i < len(args); i++ {
+		switch arg := args[i]; arg {
+		case "-o", "--output":
+			if i+1 >= len(args) {
+				return errors.New("missing value for -o/--output")
+			}
+			i++
+			output = args[i]
+		case "-h", "--help":
+			fmt.Println(`Usage: destruct elf recompile <decompiled_dir> -o <output_binary>
+
+Generates <decompiled_dir>/stubs.c and links every .c file in the
+directory into a dummy executable with:
+
+  clang -std=c11 -w -o <output_binary> <all .c files>`)
+			return nil
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return fmt.Errorf("unknown option: %s", arg)
+			}
+			if dir != "" {
+				return errors.New("exactly one decompiled directory is required")
+			}
+			dir = arg
+		}
+	}
+	if dir == "" {
+		return errors.New("usage: destruct elf recompile <decompiled_dir> -o <output_binary>")
+	}
+
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("resolve decompiled directory: %w", err)
+	}
+	info, err := os.Stat(absDir)
+	if err != nil {
+		return fmt.Errorf("stat decompiled directory: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", absDir)
+	}
+
+	if output == "" {
+		output = filepath.Join(absDir, "decompiled_dummy")
+	}
+	absOut, err := filepath.Abs(output)
+	if err != nil {
+		return fmt.Errorf("resolve output binary: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(absOut), 0o755); err != nil {
+		return fmt.Errorf("create output directory: %w", err)
+	}
+
+	stubsPath := filepath.Join(absDir, "stubs.c")
+	fmt.Printf("Generating link stubs: %s\n", stubsPath)
+	stubInfo, err := arm64lift.GenerateLinkStubsDir(absDir, stubsPath)
+	if err != nil {
+		return fmt.Errorf("generate link stubs: %w", err)
+	}
+	fmt.Printf("Stubs: %d libc wrappers, %d generic functions, %d variables, main=%v\n",
+		len(stubInfo.LibcWrappers), len(stubInfo.GenericFunctions),
+		len(stubInfo.Variables), stubInfo.AddedMain)
+
+	files, err := collectCFiles(absDir, absOut)
+	if err != nil {
+		return fmt.Errorf("collect .c files: %w", err)
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no .c files found in %s", absDir)
+	}
+
+	clangPath, err := exec.LookPath("clang")
+	if err != nil {
+		return fmt.Errorf("clang not found in PATH: %w", err)
+	}
+	clangArgs := make([]string, 0, len(files)+4)
+	clangArgs = append(clangArgs, "-std=c11", "-w", "-o", absOut)
+	clangArgs = append(clangArgs, files...)
+
+	fmt.Printf("Compiling %d C files with %s...\n", len(files), clangPath)
+	cmd := exec.CommandContext(ctx, clangPath, clangArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("clang failed: %w", err)
+	}
+
+	fmt.Printf("Successfully compiled dummy executable: %s\n", absOut)
+	return nil
+}
+
+// collectCFiles returns every .c file under dir, sorted for deterministic
+// clang invocations. exclude (the output binary, when it happens to live
+// in the same directory) is skipped.
+func collectCFiles(dir, exclude string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.EqualFold(filepath.Ext(path), ".c") {
+			absPath, err := filepath.Abs(path)
+			if err != nil {
+				return err
+			}
+			if absPath == exclude {
+				return nil
+			}
+			files = append(files, absPath)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+	return files, nil
 }
 
 // handleIL2CPP implements `destruct il2cpp`, which dumps both a Unity
@@ -647,6 +818,9 @@ func cliOptionsMap(opts cliOpts) map[string]interface{} {
 		"crossReferences":    opts.crossReferences,
 		"simplifyCfg":        opts.simplifyCfg,
 		"emitLLVM":           opts.emitLLVM,
+		"il2cppOffsets":      opts.il2cppOffsets,
+		"emitPseudo":         opts.emitPseudo,
+		"regsAsVars":         opts.regsAsVars,
 	}
 }
 
@@ -676,6 +850,9 @@ type cliOpts struct {
 	crossReferences    bool
 	simplifyCfg        bool
 	emitLLVM           bool
+	il2cppOffsets      string
+	emitPseudo         bool
+	regsAsVars         bool
 }
 
 func parseFlags(args []string) (cliOpts, string) {
@@ -722,6 +899,15 @@ func parseFlags(args []string) (cliOpts, string) {
 			opts.simplifyCfg = true
 		case "--emit-llvm":
 			opts.emitLLVM = true
+		case "--il2cpp-offsets":
+			if i+1 < len(args) {
+				i++
+				opts.il2cppOffsets = args[i]
+			}
+		case "--emit-pseudo":
+			opts.emitPseudo = true
+		case "--regs-as-vars":
+			opts.regsAsVars = true
 		case "--no-project":
 			opts.project = false
 		default:

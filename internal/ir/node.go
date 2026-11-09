@@ -310,10 +310,37 @@ type (
 	BoolLit   struct{ Value bool }
 	NullLit   struct{}
 
+	// AddrLit is an absolute address constant produced by the ARM64
+	// lifter's adrp/adr/add address tracking (e.g. the operand of a
+	// "mov Rd, #imm" is an IntLit, but an adrp page or the final
+	// page+offset of a data reference is an AddrLit). Value is the
+	// numeric address; Label, when non-empty, is a symbolic rendering
+	// (".rodata+0x1fa0", a resolved symbol name, ...) preferred over
+	// the raw number by String. Addresses are printed in hex - a bare
+	// decimal page constant like "10674176" is unreadable, and every
+	// consumer of this node is by construction an address, never
+	// ordinary arithmetic.
+	AddrLit struct {
+		Value uint64
+		Label string
+	}
+
 	LocalVar    struct{ Name string }
 	FieldAccess struct {
 		Object Expr
 		Name   string
+		// IL2CPP metadata, optional (zero values on the JVM/DEX side,
+		// which has no equivalent concept). When the ARM64 lifter
+		// creates a field access from a memory displacement it fills
+		// Offset/HasOffset/Width in; when an IL2CPP field-offset
+		// database is loaded and the access's base object's type is
+		// known, FieldName/TypeName carry the resolved field and its
+		// owning class. FieldName, when set, is what String renders.
+		Offset    uint64 // byte displacement from Object
+		HasOffset bool
+		Width     int    // access width in bytes (8/4/2/1), 0 unknown
+		FieldName string // resolved IL2CPP field name
+		TypeName  string // owning IL2CPP class full name
 	}
 	MethodCall struct {
 		Object Expr
@@ -397,6 +424,7 @@ func (*DoubleLit) exprNode()        {}
 func (*StringLit) exprNode()        {}
 func (*BoolLit) exprNode()          {}
 func (*NullLit) exprNode()          {}
+func (*AddrLit) exprNode()          {}
 func (*LocalVar) exprNode()         {}
 func (*FieldAccess) exprNode()      {}
 func (*MethodCall) exprNode()       {}

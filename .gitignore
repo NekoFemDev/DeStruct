@@ -96,3 +96,15 @@ third_party/capstone/build/
 # suite does not depend on them; regenerate/download rather than tracking
 # ~100 MB of fixture data.
 /internal/il2cpp/testdata/
+
+# Dumps
+*_dump/
+*-dump/
+dump_*/
+dump-*/
+dump/
+
+# Local generated decompilation output and sample ELF used for manual
+# validation; not part of the source tree.
+/assets_decompile/
+/quazar_arm64

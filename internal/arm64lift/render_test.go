@@ -229,3 +229,96 @@ func TestTryStringDispatch_KeepsTrailingNonStrcmpLink(t *testing.T) {
 		}
 	}
 }
+
+func TestRenderCFunction_DeclarationsAndCasts(t *testing.T) {
+	stmts := []ir.Stmt{
+		&ir.AssignStmt{
+			Target: &ir.FieldAccess{
+				Object:    &ir.LocalVar{Name: "x8"},
+				Name:      "field_952",
+				Offset:    0x3b8,
+				HasOffset: true,
+				Width:     8,
+			},
+			Value: &ir.LocalVar{Name: "x9"},
+		},
+		&ir.AssignStmt{Target: &ir.LocalVar{Name: "w0"}, Value: &ir.IntLit{Value: 1}},
+		&ir.AssignStmt{Target: &ir.LocalVar{Name: "local_16"}, Value: &ir.LocalVar{Name: "x8"}},
+	}
+
+	var buf bytes.Buffer
+	RenderCFunction(&buf, "sub_90f98c", stmts)
+	out := buf.String()
+
+	for _, want := range []string{
+		"uint64_t sub_90f98c(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)",
+		"uint64_t x8, x9;",
+		"uint32_t w0;",
+		"int64_t local_16;",
+		"*(uint64_t*)((uintptr_t)x8 + 0x3b8) = x9;",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderCFunction_AddrLitUsesNumericCast(t *testing.T) {
+	stmts := []ir.Stmt{
+		&ir.AssignStmt{
+			Target: &ir.LocalVar{Name: "local_16"},
+			Value:  &ir.AddrLit{Value: 0xa2efa0, Label: ".data+0x0"},
+		},
+	}
+	var buf bytes.Buffer
+	RenderCFunction(&buf, "sub_90f934", stmts)
+	out := buf.String()
+	if !strings.Contains(out, "local_16 = ((uintptr_t)0xa2efa0);") {
+		t.Fatalf("expected numeric address cast, got:\n%s", out)
+	}
+	if strings.Contains(out, ".data+0x0") {
+		t.Fatalf("pseudo address label leaked into C output:\n%s", out)
+	}
+}
+
+func TestRenderCFunction_NormalizesLabels(t *testing.T) {
+	stmts := []ir.Stmt{
+		&ir.GotoStmt{Label: "L_old"},
+		&ir.LabelStmt{Name: "L_old"},
+		&ir.LabelStmt{Name: "L_old"},
+		&ir.GotoStmt{Label: "L_missing"},
+	}
+	var buf bytes.Buffer
+	RenderCFunction(&buf, "sub_labels", stmts)
+	out := buf.String()
+	for _, want := range []string{"goto LABEL_1;", "LABEL_1:;", "LABEL_2:;", "goto LABEL_3;", "LABEL_3:;"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderCFunction_ExternalCallsAndStrings(t *testing.T) {
+	stmts := []ir.Stmt{
+		&ir.ExprStmt{Expr: &ir.StaticMethodCall{
+			Method: "strlen",
+			Args:   []ir.Expr{&ir.LocalVar{Name: "x20"}},
+		}},
+		&ir.AssignStmt{
+			Target: &ir.LocalVar{Name: "x0"},
+			Value:  &ir.StringLit{Value: "hi"},
+		},
+	}
+	var buf bytes.Buffer
+	RenderCFunction(&buf, "sub_strings", stmts)
+	out := buf.String()
+	for _, want := range []string{
+		"extern uint64_t ext_strlen();",
+		"ext_strlen(x20);",
+		`x0 = ((uintptr_t)"hi");`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in:\n%s", want, out)
+		}
+	}
+}

@@ -40,7 +40,7 @@ import (
 func hoistableExpr(e ir.Expr) bool {
 	switch e.(type) {
 	case *ir.IntLit, *ir.LongLit, *ir.FloatLit, *ir.DoubleLit,
-		*ir.StringLit, *ir.BoolLit, *ir.NullLit,
+		*ir.StringLit, *ir.BoolLit, *ir.NullLit, *ir.AddrLit,
 		*ir.LocalVar, *ir.ThisExpr, *ir.SuperExpr,
 		*ir.ClassLiteral, *ir.ClassType, *ir.MethodRefExpr:
 		return false
@@ -205,6 +205,17 @@ func hasHoistableShare(refs map[ir.Expr]int) bool {
 // listed, so the zero-value case only ever covers expression-free
 // statements like break/continue.
 func hoistSharedExprs(s ir.Stmt) ([]ir.Stmt, ir.Stmt) {
+	return hoistSharedExprsWithCounter(s, new(int))
+}
+
+// hoistSharedExprsWithCounter is hoistSharedExprs with a caller-owned
+// temporary counter. Renderers that emit a whole function use one shared
+// counter across all statements, so the synthetic tmpN names are unique
+// within the function (a C translation unit cannot redeclare tmp0 in the
+// same scope for every statement). The legacy hoistSharedExprs wrapper
+// above keeps the historical per-statement numbering for existing
+// callers.
+func hoistSharedExprsWithCounter(s ir.Stmt, counter *int) ([]ir.Stmt, ir.Stmt) {
 	if s == nil {
 		return nil, nil
 	}
@@ -212,7 +223,7 @@ func hoistSharedExprs(s ir.Stmt) ([]ir.Stmt, ir.Stmt) {
 	h := &exprHoister{
 		refs:    make(map[ir.Expr]int),
 		names:   make(map[ir.Expr]string),
-		counter: new(int),
+		counter: counter,
 		prelude: &[]ir.Stmt{},
 	}
 	seen := make(map[ir.Expr]bool)

@@ -145,11 +145,22 @@ func CloneExpr(e Expr) Expr {
 		return &cp
 	case *NullLit:
 		return &NullLit{}
+	case *AddrLit:
+		cp := *v
+		return &cp
 	case *LocalVar:
 		cp := *v
 		return &cp
 	case *FieldAccess:
-		return &FieldAccess{Object: CloneExpr(v.Object), Name: v.Name}
+		return &FieldAccess{
+			Object:    CloneExpr(v.Object),
+			Name:      v.Name,
+			Offset:    v.Offset,
+			HasOffset: v.HasOffset,
+			Width:     v.Width,
+			FieldName: v.FieldName,
+			TypeName:  v.TypeName,
+		}
 	case *MethodCall:
 		return &MethodCall{Object: CloneExpr(v.Object), Name: v.Name, Args: cloneExprs(v.Args)}
 	case *StaticMethodCall:

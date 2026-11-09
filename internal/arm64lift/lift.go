@@ -227,13 +227,32 @@ func LiftFunction(instructions []native.DetailedInstruction, paramNames []string
 // reading bytes from the original binary by virtual address. When
 // non-nil it enables jump-table switch statement detection.
 func LiftFunctionWithData(instructions []native.DetailedInstruction, paramNames []string, resolver SymbolResolver, strResolver StringResolver, dataReader func(uint64, int) ([]byte, bool), simplify bool) []ir.Stmt {
+	return LiftFunctionWithOptions(instructions, paramNames, resolver, strResolver, dataReader, LiftOptions{Simplify: simplify})
+}
+
+// LiftFunctionWithOptions is the full entry point: LiftFunctionWithData
+// plus the IL2CPP-aware LiftOptions (see liftopts.go). The zero options
+// value is exactly LiftFunctionWithData's behavior, so every existing
+// caller keeps its current output.
+//
+// When Metadata is supplied, the function's entry address (the first
+// instruction's address) is looked up as a managed method RVA. A match
+// seeds the AAPCS64 parameter registers with the method's real
+// parameter names (prepending "this" for instance methods) and records
+// the declaring type, which in turn lets a `ldr/str [x0, #off]` on the
+// `this` pointer resolve its displacement to the actual IL2CPP field
+// name (see newFieldAccess). Nothing changes when the address doesn't
+// match - most lifted functions in a real binary aren't managed method
+// entries, and that's expected, not an error.
+func LiftFunctionWithOptions(instructions []native.DetailedInstruction, paramNames []string, resolver SymbolResolver, strResolver StringResolver, dataReader func(uint64, int) ([]byte, bool), opts LiftOptions) []ir.Stmt {
 	budget := blockVisitBudget
 	searchBudget := searchVisitBudget
 	labelSeq := 0
+	regSeq := 0
+	simdSeq := 0
 	l := &lifter{
 		regs:         make(map[string]ir.Expr),
 		stack:        make(map[int32]string),
-		params:       paramNames,
 		resolver:     resolver,
 		strings:      strResolver,
 		addrRegs:     make(map[string]uint64),
@@ -244,11 +263,28 @@ func LiftFunctionWithData(instructions []native.DetailedInstruction, paramNames 
 		dataReader:   dataReader,
 		labelSeq:     &labelSeq,
 		mergeLabels:  make(map[mergeShareKey]string),
+		opts:         opts,
+		regNames:     make(map[string]string),
+		regSeq:       &regSeq,
+		simdSeq:      &simdSeq,
 	}
+	if opts.Metadata != nil && len(instructions) > 0 {
+		if typeName, params, isStatic, ok := opts.Metadata.MethodAtRVA(instructions[0].Address); ok {
+			if paramNames == nil {
+				if isStatic {
+					paramNames = append([]string(nil), params...)
+				} else {
+					paramNames = append([]string{"this"}, params...)
+				}
+			}
+			l.thisType = typeName
+		}
+	}
+	l.params = paramNames
 	l.seedParams()
 
 	blocks := buildCFG(instructions)
-	if simplify {
+	if opts.Simplify {
 		blocks = simplifyCFG(blocks)
 	}
 	l.cfg = analyzeCFG(blocks)
@@ -1584,7 +1620,7 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.addrRegs {
 		addrRegs[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels}
+	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1893,6 +1929,29 @@ type lifter struct {
 	// one function, and the whole-binary output stayed in the hundreds
 	// of megabytes even with loops correctly recognized.
 	mergeLabels map[mergeShareKey]string
+
+	// opts holds the IL2CPP-aware options for this lift - see
+	// liftopts.go. The zero value is the original behavior.
+	opts LiftOptions
+
+	// thisType is the full dump name of the managed class whose instance
+	// method this lift is for, when opts.Metadata identified the entry
+	// address as one. Empty otherwise.
+	thisType string
+
+	// regNames maps a canonical physical register key ("x8", "v3") to
+	// the stable source-level name RegsAsVars assigned it - see
+	// regName. Only populated when opts.RegsAsVars is set. Shared
+	// across forks (a map is a reference type, and fork deliberately
+	// passes the same one) so that whatever branch discovers a register
+	// first, every other branch renders it under the same name.
+	regNames map[string]string
+
+	// regSeq / simdSeq number var_N / fvar_N names independently, so
+	// the SIMD class never interleaves with the integer class. Shared
+	// by pointer across forks for the same reason regNames is shared.
+	regSeq  *int
+	simdSeq *int
 }
 
 // mergeShareKey identifies one merge-label sharing scope: the merge
@@ -2362,7 +2421,7 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 	base := l.memBaseExpr(dstOp.Mem.Base)
 	l.consume(base)
 	l.consume(srcVal)
-	target := &ir.FieldAccess{Object: base, Name: fmt.Sprintf("field_%d", dstOp.Mem.Disp)}
+	target := l.newFieldAccessOn(base, dstOp.Mem.Disp, regWidth(srcOp.Reg))
 	return []ir.Stmt{&ir.AssignStmt{Target: target, Value: srcVal}}
 }
 
@@ -2444,16 +2503,131 @@ func (l *lifter) liftLdr(inst native.DetailedInstruction) []ir.Stmt {
 	if base, ok := l.addrRegs[srcOp.Mem.Base]; ok && l.resolver != nil {
 		addr := base + uint64(srcOp.Mem.Disp)
 		if name, ok := l.resolver(addr); ok {
-			return l.setReg(dstOp.Reg, &ir.LocalVar{Name: demangle(name)})
+			name = demangle(name)
+			// Section-relative labels (".data+0x0", ".got+0x8") are
+			// addresses, not variables: keep the numeric value too so
+			// the C renderer can spell them as ((uintptr_t)0x...).
+			// Plain symbol names stay LocalVars, preserving the
+			// resolved-name rendering existing callers expect.
+			if isSectionLabel(name) {
+				return l.setReg(dstOp.Reg, &ir.AddrLit{Value: addr, Label: name})
+			}
+			return l.setReg(dstOp.Reg, &ir.LocalVar{Name: name})
 		}
 	}
 
 	if srcOp.Mem.Base != "" {
-		val := &ir.FieldAccess{Object: l.memBaseExpr(srcOp.Mem.Base), Name: fmt.Sprintf("field_%d", srcOp.Mem.Disp)}
+		val := l.newFieldAccessOn(l.memBaseExpr(srcOp.Mem.Base), srcOp.Mem.Disp, regWidth(dstOp.Reg))
 		return l.setReg(dstOp.Reg, val)
 	}
 
 	return l.clobberReg(dstOp.Reg)
+}
+
+// regWidth returns the access width in bytes implied by the register an
+// ldr/str names: x/w are the 8/4-byte integer accesses and the SIMD
+// views map to their natural sizes (q=16, d=8, s=4, h=2, b=1). The
+// width feeds the IL2CPP rewrite's cast type; unknown spellings
+// default to 8, matching the plain "ldr" the lifter understands best.
+func regWidth(reg string) int {
+	if len(reg) < 2 {
+		return 8
+	}
+	for _, c := range reg[1:] {
+		if c < '0' || c > '9' {
+			return 8
+		}
+	}
+	switch reg[0] {
+	case 'x':
+		return 8
+	case 'w':
+		return 4
+	case 'q':
+		return 16
+	case 'd':
+		return 8
+	case 's':
+		return 4
+	case 'h':
+		return 2
+	case 'b':
+		return 1
+	}
+	return 8
+}
+
+// newFieldAccessOn builds the IR node for a memory access at disp
+// through base. Name keeps the historical displacement-derived
+// "field_<disp>" (decimal) spelling so every existing consumer and test
+// is unchanged; Offset/HasOffset/Width are the IL2CPP-facing metadata
+// (see ir.FieldAccess's own doc comment) and - when opts.Metadata has
+// bound this function to a managed method and base is the `this`
+// pointer - FieldName/TypeName carry the resolved field, which
+// FieldAccess.String prefers over the synthetic name.
+func (l *lifter) newFieldAccessOn(base ir.Expr, disp int32, width int) *ir.FieldAccess {
+	fa := &ir.FieldAccess{
+		Object: base,
+		Name:   fmt.Sprintf("field_%d", disp),
+		Width:  width,
+	}
+	if disp >= 0 {
+		fa.HasOffset = true
+		fa.Offset = uint64(disp)
+	}
+	if fa.HasOffset && l.thisType != "" && l.opts.Metadata != nil && l.isThisExpr(base) {
+		if name, _, ok := l.opts.Metadata.FieldAtOffset(l.thisType, fa.Offset); ok {
+			fa.FieldName = name
+			fa.TypeName = l.thisType
+		}
+	}
+	return fa
+}
+
+// isThisExpr reports whether e is the `this` pointer this lift seeded
+// for an instance method - a LocalVar named "this" (the name
+// LiftFunctionWithOptions gives parameter register x0 when Metadata
+// identified the entry as an instance method).
+func (l *lifter) isThisExpr(e ir.Expr) bool {
+	lv, ok := e.(*ir.LocalVar)
+	return ok && lv.Name == "this"
+}
+
+// isSectionLabel reports whether a resolver-provided name is a
+// section-relative address label (".data+0x0", ".rodata+0x1fa0")
+// rather than a real symbol. Section labels have no C declaration, so
+// the C renderer needs their numeric address; ordinary symbols keep
+// their name-based LocalVar rendering.
+func isSectionLabel(name string) bool {
+	return strings.HasPrefix(name, ".") && strings.Contains(name, "+0x")
+}
+
+// resolveAddrExpr turns a register's fully computed constant address
+// into the most readable expression available: the string literal it
+// points at (the common .rodata case), a symbol or ".section+0xoffset"
+// label from the resolver, or - when neither resolves it - an AddrLit,
+// which renders in hex rather than the unreadable decimal form the
+// adrp/add pair's two raw constants used to produce. fallback is
+// returned only for address 0, where no meaningful rendering exists.
+func (l *lifter) resolveAddrExpr(addr uint64, fallback ir.Expr) ir.Expr {
+	if addr == 0 {
+		return fallback
+	}
+	if l.strings != nil {
+		if s, ok := l.strings(addr); ok {
+			return &ir.StringLit{Value: s}
+		}
+	}
+	if l.resolver != nil {
+		if n, ok := l.resolver(addr); ok {
+			n = demangle(n)
+			if isSectionLabel(n) {
+				return &ir.AddrLit{Value: addr, Label: n}
+			}
+			return &ir.LocalVar{Name: n}
+		}
+	}
+	return &ir.AddrLit{Value: addr}
 }
 
 // liftAdd lifts "add Rd, Rn, Rm" (register-register add) and
@@ -2489,11 +2663,19 @@ func (l *lifter) liftAdd(inst native.DetailedInstruction) []ir.Stmt {
 		lhs := l.regValue(lhsOp.Reg)
 		l.consume(lhs)
 		base, isAddr := l.addrRegs[lhsOp.Reg]
-		stmts := l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: "+", Left: lhs, Right: &ir.IntLit{Value: rhsOp.Imm}})
+		var val ir.Expr = &ir.BinaryExpr{Op: "+", Left: lhs, Right: &ir.IntLit{Value: rhsOp.Imm}}
 		if isAddr {
-			l.addrRegs[dstOp.Reg] = base + uint64(rhsOp.Imm)
+			newBase := base + uint64(rhsOp.Imm)
+			// The page+offset sum is now a complete address: resolve it
+			// to a string literal / symbol / section label (or, failing
+			// all three, keep it as a hex AddrLit) instead of leaving
+			// the two raw decimal constants in the output.
+			val = l.resolveAddrExpr(newBase, val)
+			stmts := l.setReg(dstOp.Reg, val)
+			l.addrRegs[dstOp.Reg] = newBase
+			return stmts
 		}
-		return stmts
+		return l.setReg(dstOp.Reg, val)
 	default:
 		return nil
 	}
@@ -2578,7 +2760,7 @@ func (l *lifter) liftAddr(inst native.DetailedInstruction) []ir.Stmt {
 		return nil
 	}
 	dst, imm := inst.Operands[0], inst.Operands[1]
-	stmts := l.setReg(dst.Reg, &ir.IntLit{Value: imm.Imm})
+	stmts := l.setReg(dst.Reg, &ir.AddrLit{Value: uint64(imm.Imm)})
 	l.addrRegs[dst.Reg] = uint64(imm.Imm)
 	return stmts
 }
@@ -3070,6 +3252,7 @@ func (l *lifter) clobberReg(reg string) []ir.Stmt {
 // "int"-width instruction is still visible to anything (buildCall,
 // liftRet) that reads the 64-bit name instead.
 func (l *lifter) setReg(reg string, val ir.Expr) []ir.Stmt {
+	l.ensureRegName(reg)
 	stmts := l.clobberReg(reg)
 	l.regs[reg] = val
 	delete(l.resultRegs, reg)
@@ -3265,7 +3448,97 @@ func (l *lifter) regValue(reg string) ir.Expr {
 	if v, ok := l.regs[reg]; ok {
 		return v
 	}
-	return &ir.LocalVar{Name: reg}
+	return &ir.LocalVar{Name: l.regName(reg)}
+}
+
+// Register classes for RegsAsVars renaming: argument registers get
+// argN names, other integer registers var_N, and SIMD registers
+// (q/d/s/h/b0-31) fvar_N from their own counter so float state never
+// mixes into the integer numbering.
+const (
+	regClassUnknown = iota
+	regClassArg
+	regClassGeneral
+	regClassSIMD
+)
+
+// canonicalReg maps a physical register spelling to a stable key that
+// aliases across widths ("w3" and "x3" -> "x3"; "s2"/"d2"/"q2" -> "v2")
+// plus a register class. ok is false for non-register operands or
+// names outside the general/SIMD register files.
+func canonicalReg(reg string) (key string, class int, ok bool) {
+	if len(reg) < 2 {
+		return "", regClassUnknown, false
+	}
+	n := 0
+	for _, c := range reg[1:] {
+		if c < '0' || c > '9' {
+			return "", regClassUnknown, false
+		}
+		n = n*10 + int(c-'0')
+		if n > 31 {
+			return "", regClassUnknown, false
+		}
+	}
+	switch reg[0] {
+	case 'x', 'w':
+		if n > 30 {
+			return "", regClassUnknown, false
+		}
+		if n < len(aapcs64IntArgRegs) {
+			return "x" + reg[1:], regClassArg, true
+		}
+		return "x" + reg[1:], regClassGeneral, true
+	case 'q', 'd', 's', 'h', 'b':
+		return "v" + reg[1:], regClassSIMD, true
+	}
+	return "", regClassUnknown, false
+}
+
+// regName returns the source-level name for a register the lifter is
+// about to render as a bare placeholder variable (see regValue). With
+// RegsAsVars disabled - the default - that is the physical register
+// name itself, preserving the original output. Enabled, it assigns a
+// stable per-physical-register name on first use: argN for AAPCS64
+// argument registers, var_N for the rest of the integer file, fvar_N
+// for SIMD registers. Names are shared across all forks of a lift (see
+// regNames) so the same register reads the same whichever branch
+// discovered it first.
+func (l *lifter) regName(reg string) string {
+	if !l.opts.RegsAsVars {
+		return reg
+	}
+	key, class, ok := canonicalReg(reg)
+	if !ok {
+		return reg
+	}
+	if n, seen := l.regNames[key]; seen {
+		return n
+	}
+	var name string
+	switch class {
+	case regClassArg:
+		name = "arg" + key[1:]
+	case regClassSIMD:
+		name = fmt.Sprintf("fvar_%d", *l.simdSeq)
+		*l.simdSeq++
+	default:
+		name = fmt.Sprintf("var_%d", *l.regSeq)
+		*l.regSeq++
+	}
+	l.regNames[key] = name
+	return name
+}
+
+// ensureRegName registers the source-level name a write to reg will be
+// read back under (see regName) at the moment of the FIRST write, so
+// var_N numbering follows first-lvalue-use order even for a register
+// whose placeholder form only surfaces later. A no-op when
+// RegsAsVars is disabled.
+func (l *lifter) ensureRegName(reg string) {
+	if l.opts.RegsAsVars {
+		_ = l.regName(reg)
+	}
 }
 
 // memBaseExpr returns the expression to use as the object of a
@@ -3290,8 +3563,12 @@ func (l *lifter) memBaseExpr(base string) ir.Expr {
 	}
 	v := l.regValue(base)
 	switch v.(type) {
-	case *ir.IntLit, *ir.LongLit, *ir.FloatLit, *ir.DoubleLit, *ir.StringLit, *ir.BoolLit, *ir.NullLit:
-		return &ir.LocalVar{Name: base}
+	case *ir.IntLit, *ir.LongLit, *ir.FloatLit, *ir.DoubleLit, *ir.StringLit, *ir.BoolLit, *ir.NullLit, *ir.AddrLit:
+		// The register currently holds a raw constant (the merge-point
+		// state approximation leaving 0, an adrp page, ...), so the
+		// pointed-to value can't be expressed as a field access on it -
+		// fall back to the register's own placeholder name.
+		return &ir.LocalVar{Name: l.regName(base)}
 	}
 	return v
 }

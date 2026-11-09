@@ -208,6 +208,7 @@ destruct elf libnative.so -o output/ --decompile --split-functions   # one .c pe
 destruct elf libnative.so -o output/ --decompile --cross-references  # XREF comments + xrefs.json
 destruct elf libnative.so -o output/ --decompile --simplify-cfg      # CFG simplification + unreachable block removal
 destruct elf libnative.so -o output/ --decompile --emit-llvm           # also export lifted IR to LLVM IR (<name>.decompiled.ll)
+destruct elf recompile output/libnative.so_decompiled/ -o dummy        # stubs.c + clang link into a dummy executable
 
 ```
 
@@ -237,6 +238,19 @@ linear chains (single predecessor + single successor). Does not touch loop
 back-edges to avoid breaking `while`/`if` recognition. May improve output, but
 in complex cases interacts unpredictably with the heuristic lifter, so it is
 opt-in.
+
+**`elf recompile <decompiled_dir> -o <binary>`**: post-processes a split
+decompilation. Scans every `.c` file for unresolved `extern` declarations,
+generates `<decompiled_dir>/stubs.c` (libc wrappers, generic zero-return
+function stubs, variable stubs and a dummy `main`), then invokes:
+
+```
+clang -std=c11 -w -o <binary> <all .c files>
+```
+
+The output binary is a dummy executable suitable for link-time validation, not
+a functional reimplementation of the original library. If `-o` is omitted the
+binary is written to `<decompiled_dir>/decompiled_dummy`.
 
 **`--emit-llvm`** (AArch64 only; implies `--decompile`): in addition to
 `.decompiled.c`, writes `<name>.decompiled.ll` — each lifted function as LLVM IR

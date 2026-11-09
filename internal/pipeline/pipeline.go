@@ -51,6 +51,19 @@ type Options struct {
 	CrossReferences bool
 	SimplifyCFG     bool
 	EmitLLVM        bool
+	// IL2CPPOffsets is the path to an IL2CPP field-offset dump -
+	// offsets.json / offset.hpp, or a directory containing one (see
+	// internal/arm64lift.LoadOffsetDB). Empty means no IL2CPP metadata
+	// is loaded and the lifted output stays purely numeric.
+	IL2CPPOffsets string
+	// EmitPseudo selects the unified pseudo-C rendering explicitly (the
+	// default). It exists so a caller can request the documented mode by
+	// name; it no longer has a mutually exclusive alternative.
+	EmitPseudo bool
+	// RegsAsVars renames register placeholders to argN / var_N /
+	// fvar_N in the pseudo output as well - see
+	// arm64lift.LiftOptions.RegsAsVars.
+	RegsAsVars bool
 }
 
 type Pipeline struct {
@@ -573,6 +586,44 @@ func (p *Pipeline) disassembleELF(ctx context.Context) error {
 	return nil
 }
 
+// annotatedELFResolver wraps the ELF symbol resolver with a
+// section-label fallback for data addresses: when no symbol-table name
+// exists for an address, a non-executable section the address falls in
+// gives a traceable ".rodata+0x1fa0" / ".got+0x8" label instead of a
+// bare decimal page constant. Executable addresses deliberately keep
+// the base resolver's behavior (func_<addr> placeholders and real
+// symbols) - see native.ELFParser.AnnotateAddr.
+func annotatedELFResolver(ctx context.Context, elf *native.ELFParser) arm64lift.SymbolResolver {
+	base := elf.SymbolResolverContext(ctx)
+	return func(addr uint64) (string, bool) {
+		if name, ok := base(addr); ok {
+			return name, true
+		}
+		return elf.AnnotateAddr(addr)
+	}
+}
+
+// loadIL2CPPOffsetDump loads an offset dump from a file (offsets.json /
+// offset.hpp) or from a directory containing one. A directory without
+// offsets.json but with offset.hpp is accepted too, so pointing at the
+// game_dump or at a header-only copy both work.
+func loadIL2CPPOffsetDump(path string) (*arm64lift.OffsetDB, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("IL2CPP offsets: %w", err)
+	}
+	if !st.IsDir() {
+		return arm64lift.LoadOffsetDB(path)
+	}
+	for _, name := range []string{"offsets.json", "offset.hpp", "offsets.hpp"} {
+		p := filepath.Join(path, name)
+		if _, err := os.Stat(p); err == nil {
+			return arm64lift.LoadOffsetDB(p)
+		}
+	}
+	return nil, fmt.Errorf("IL2CPP offsets: %s contains neither offsets.json nor offset.hpp", path)
+}
+
 // decompileELFArm64 lifts every function symbol in an AArch64 ELF
 // binary to C-like pseudocode (see internal/arm64lift) and writes the
 // whole binary's output to a SINGLE file, one function after another -
@@ -609,9 +660,25 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	}
 	defer d.Close()
 
-	resolver := elf.SymbolResolverContext(ctx)
+	resolver := annotatedELFResolver(ctx, elf)
 	strResolver := func(addr uint64) (string, bool) { return elf.ReadCString(addr) }
 	dataReader := elf.DataReader()
+
+	// IL2CPP mode: load the field-offset dump when one was given. The
+	// unified pseudo-C renderer always emits explicit pointer casts;
+	// register renaming remains an explicit --regs-as-vars choice.
+	var offsetDB *arm64lift.OffsetDB
+	if p.opts.IL2CPPOffsets != "" {
+		offsetDB, err = loadIL2CPPOffsetDump(p.opts.IL2CPPOffsets)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("IL2CPP offsets: %d classes loaded from %s\n", offsetDB.Count(), p.opts.IL2CPPOffsets)
+	}
+	liftOpts := arm64lift.LiftOptions{
+		Simplify:   p.opts.SimplifyCFG,
+		RegsAsVars: p.opts.RegsAsVars,
+	}
 
 	baseName := filepath.Base(p.opts.Input)
 
@@ -650,6 +717,13 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 			return fmt.Errorf("create output file: %w", err)
 		}
 		defer f.Abort()
+	}
+
+	// The unified pseudo-C mode is a self-contained translation unit:
+	// fixed-width integer includes plus one function definition per
+	// lifted symbol. No IL2CPP class header is generated.
+	if f != nil {
+		arm64lift.WriteCFilePreamble(f, baseName)
 	}
 
 	candidates := functionCandidatesFromSymbols(elf)
@@ -696,7 +770,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 		}
 
 		if p.opts.SplitFunctions {
-			meta := p.writeSplitFunction(splitDir, c, insns, resolver, strResolver, dataReader, xrefs[c.addr], llMod)
+			meta := p.writeSplitFunction(splitDir, c, insns, resolver, strResolver, dataReader, xrefs[c.addr], llMod, liftOpts, offsetDB)
 			if meta.Success {
 				if meta.Empty {
 					empty++
@@ -720,7 +794,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 						fmt.Fprintf(f, "// %s\n// [failed to decompile: %v]\n\n", arm64lift.Demangle(c.name), r)
 					}
 				}()
-				stmts := arm64lift.LiftFunctionWithData(insns, nil, resolver, strResolver, dataReader, p.opts.SimplifyCFG)
+				stmts := arm64lift.LiftFunctionWithOptions(insns, nil, resolver, strResolver, dataReader, liftOpts)
 				if len(stmts) == 0 {
 					empty++
 				} else {
@@ -739,12 +813,22 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 						llMod.EmitFunction(arm64lift.Demangle(c.name), stmts)
 					}()
 				}
+				// The LLVM export consumes the plain lifted IR; the
+				// unified pseudo-C renderer applies its own C spellings
+				// at print time and never mutates the IR.
 				fmt.Fprintf(f, "// %s\n", arm64lift.Demangle(c.name))
 				if p.opts.SourceLocations {
 					writeFunctionLocation(f, c, insns)
 				}
 				writeXrefComments(f, xrefs[c.addr])
-				arm64lift.RenderStmts(f, stmts, 0)
+				arm64lift.RenderCFunctionWithOptions(f, c.name, stmts, arm64lift.CRenderOptions{
+					Offsets:             offsetDB,
+					OffsetComments:      offsetDB != nil,
+					SimplifyVTableCalls: true,
+					ReduceGotos:         true,
+					CharConstants:       true,
+					AddressComments:     true,
+				})
 				fmt.Fprintln(f)
 			}()
 		}
@@ -876,6 +960,8 @@ func (p *Pipeline) writeSplitFunction(
 	dataReader func(uint64, int) ([]byte, bool),
 	fx *functionXrefs,
 	llMod *llvm.Module,
+	liftOpts arm64lift.LiftOptions,
+	offsetDB *arm64lift.OffsetDB,
 ) splitFuncResult {
 	filePath := filepath.Join(splitDir, functionFileName(c))
 	outF, err := atomicfile.Create(filePath, 0o644)
@@ -885,6 +971,8 @@ func (p *Pipeline) writeSplitFunction(
 	}
 	defer outF.Abort()
 
+	arm64lift.WriteCFilePreamble(outF, filepath.Base(p.opts.Input))
+
 	var result splitFuncResult
 	func() {
 		defer func() {
@@ -893,7 +981,7 @@ func (p *Pipeline) writeSplitFunction(
 				fmt.Fprintf(outF, "// %s\n// [failed to decompile: %v]\n\n", arm64lift.Demangle(c.name), r)
 			}
 		}()
-		stmts := arm64lift.LiftFunctionWithData(insns, nil, resolver, strResolver, dataReader, p.opts.SimplifyCFG)
+		stmts := arm64lift.LiftFunctionWithOptions(insns, nil, resolver, strResolver, dataReader, liftOpts)
 		result.Empty = len(stmts) == 0
 		result.Success = true
 		if p.opts.EmitLLVM && llMod != nil {
@@ -911,7 +999,14 @@ func (p *Pipeline) writeSplitFunction(
 			writeFunctionLocation(outF, c, insns)
 		}
 		writeXrefComments(outF, fx)
-		arm64lift.RenderStmts(outF, stmts, 0)
+		arm64lift.RenderCFunctionWithOptions(outF, c.name, stmts, arm64lift.CRenderOptions{
+			Offsets:             offsetDB,
+			OffsetComments:      offsetDB != nil,
+			SimplifyVTableCalls: true,
+			ReduceGotos:         true,
+			CharConstants:       true,
+			AddressComments:     true,
+		})
 		fmt.Fprintln(outF)
 	}()
 

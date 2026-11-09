@@ -1128,6 +1128,44 @@ func (p *ELFParser) SectionName(sec SectionHeader) string {
 	return p.getSectionName(sec)
 }
 
+// SectionForAddr returns the section whose [Addr, Addr+Size) range
+// contains vaddr. Sections with a zero address (headers/string tables
+// carry no runtime address) and empty sections are skipped. When more
+// than one section contains the address - rare, and only for
+// overlapping program-header-synthesized layouts - the first in
+// section-table order wins.
+func (p *ELFParser) SectionForAddr(vaddr uint64) (SectionHeader, bool) {
+	for _, s := range p.Sections {
+		if s.Addr == 0 || s.Size == 0 {
+			continue
+		}
+		if vaddr >= s.Addr && vaddr-s.Addr < s.Size {
+			return s, true
+		}
+	}
+	return SectionHeader{}, false
+}
+
+// AnnotateAddr returns a symbolic ".section+0xoffset" label for a data
+// (non-executable) address, so a resolver with no symbol-table name for
+// it can still render a traceable reference instead of a bare decimal
+// address. Executable sections are deliberately excluded: call targets
+// go through the symbol resolver and the lifter's own func_<addr>
+// placeholders, and labeling them ".text+0x..." would be noise. ok is
+// false when the address isn't inside an allocatable, named,
+// non-executable section.
+func (p *ELFParser) AnnotateAddr(vaddr uint64) (string, bool) {
+	s, ok := p.SectionForAddr(vaddr)
+	if !ok || s.Flags&SHF_EXECINSTR != 0 {
+		return "", false
+	}
+	name := p.getSectionName(s)
+	if name == "" {
+		return "", false
+	}
+	return fmt.Sprintf("%s+0x%x", name, vaddr-s.Addr), true
+}
+
 // CodeSection represents a section containing code
 type CodeSection struct {
 	Name    string

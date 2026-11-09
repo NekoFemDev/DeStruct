@@ -7,7 +7,7 @@ Multi-format decompiler: JVM `.class`/`.jar` → Java, Android `.dex`/`.apk` →
 - **JVM** — Full Java decompiler with control flow recovery (if/else, while, for, switch, try/catch, generics, lambdas). Streaming `.jar` mode for large files.
 - **DEX** — Android `.dex`/`.apk` → Java. Streaming per-class output, multidex support, MUTF-8 strings, switch/fill-array-data payloads, and structured control flow recovery (if/else, while, do-while, switch).
 - **Hermes** — Disassemble and decompile React Native Hermes bytecode (`.hbc`/`.bundle`) to readable JS. Includes assembler, interactive patcher, and hex-editor workflow.
-- **ARM64 ELF** — Lift disassembled AArch64 instructions to C-like pseudocode with control flow recovery (if/else, while/do-while, struct field access, indirect calls). Cross-reference analysis, CFG simplification, per-function split output.
+- **ARM64 ELF** — Lift disassembled AArch64 instructions to valid, recompilable pseudo-C with control flow recovery (if/else, while/do-while, struct field access, indirect calls). Offset comments, `CALL_VTABLE` macros, ASCII constants, goto reduction, per-function split output, generated link stubs, and one-command `elf recompile` linking into a dummy executable.
 - **Flutter** — Disassemble Flutter `libapp.so` (Dart AOT) to readable ARM64 assembly + binary patching support.
 - **IL2CPP** — Dump Unity `global-metadata.dat` + `libil2cpp.so` to `dump.cs` (images, types, fields, properties, methods with RVA/Offset/VA/Slot, default values, attributes).
 - **PE** — Disassemble Windows PE binaries (basic).
@@ -115,6 +115,7 @@ destruct elf libnative.so -o output/ --decompile --split-functions
 destruct elf libnative.so -o output/ --decompile --cross-references
 destruct elf libnative.so -o output/ --decompile --simplify-cfg
 destruct elf libnative.so -o output/ --decompile --emit-llvm
+destruct elf recompile output/libnative.so_decompiled/ -o dummy
 
 # Flutter
 destruct flutter libapp.so -o output/

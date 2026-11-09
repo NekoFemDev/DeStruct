@@ -178,15 +178,36 @@ func (e *NullLit) String() string {
 	return "null"
 }
 
+// AddrLit renders an address constant: its symbolic label when the
+// lifter resolved one (".rodata+0x1fa0", a symbol name), otherwise the
+// raw address in hex - a decimal page constant like 10674176 is not
+// readable as an address at all.
+func (e *AddrLit) String() string {
+	if e.Label != "" {
+		return e.Label
+	}
+	return fmt.Sprintf("0x%x", e.Value)
+}
+
 func (e *LocalVar) String() string {
 	return e.Name
 }
 
 func (e *FieldAccess) String() string {
-	if e.Object != nil {
-		return fmt.Sprintf("%s.%s", fieldAccessObject(e.Object), e.Name)
+	name := e.Name
+	if e.FieldName != "" {
+		name = e.FieldName
 	}
-	return e.Name
+	if e.Object != nil {
+		// A pointer-typed cast object is the IL2CPP rewrite's named
+		// field shape - "((PlayerAchievement*)arg0)->progressTarget_" -
+		// where C requires an arrow, not a dot, through a pointer.
+		if cast, ok := e.Object.(*CastExpr); ok && strings.HasSuffix(fmt.Sprint(cast.Type), "*") {
+			return fmt.Sprintf("(%s)->%s", cast.String(), name)
+		}
+		return fmt.Sprintf("%s.%s", fieldAccessObject(e.Object), name)
+	}
+	return name
 }
 
 // fieldAccessObject renders a FieldAccess's object expression,
@@ -268,7 +289,17 @@ func (e *ArrayAccess) String() string {
 }
 
 func (e *CastExpr) String() string {
-	return fmt.Sprintf("(%s)%s", e.Type, e.Expr)
+	// A binary/ternary operand must be parenthesized before the cast:
+	// "(uint64_t*)x + 8" would cast x and then add as an integer, while
+	// the intended "*(uint64_t*)(x + 8)" needs the whole sum inside the
+	// cast - the shape the ARM64 IL2CPP rewrite emits for a lifted
+	// field access.
+	s := fmt.Sprint(e.Expr)
+	switch e.Expr.(type) {
+	case *BinaryExpr, *TernaryExpr:
+		s = "(" + s + ")"
+	}
+	return fmt.Sprintf("(%s)%s", e.Type, s)
 }
 
 func (e *ThisExpr) String() string {
@@ -381,6 +412,17 @@ func (e *UnaryExpr) String() string {
 			case "instanceof", "==", "!=", "<", ">", "<=", ">=":
 				return fmt.Sprintf("%s(%s)", e.Op, e.Expr)
 			}
+		}
+	}
+	// A dereference ("*") of a low-precedence operand needs the same
+	// treatment: "*x + 8" parses as "(*x) + 8", so the IL2CPP rewrite's
+	// "*(uint64_t*)(x + 8)" must keep the sum parenthesized when it is
+	// not already inside a cast.
+	switch e.Op {
+	case "*":
+		switch e.Expr.(type) {
+		case *BinaryExpr, *TernaryExpr:
+			return fmt.Sprintf("%s(%s)", e.Op, e.Expr)
 		}
 	}
 	return fmt.Sprintf("%s%s", e.Op, e.Expr)

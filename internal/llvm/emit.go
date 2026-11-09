@@ -650,6 +650,10 @@ func (e *emitter) expr(x ir.Expr) string {
 	switch v := x.(type) {
 	case *ir.IntLit:
 		return fmt.Sprintf("%d", v.Value)
+	case *ir.AddrLit:
+		// An address constant exports as its raw numeric value; the
+		// label form is a pseudo-C display nicety, not part of the IR.
+		return fmt.Sprintf("%d", v.Value)
 	case *ir.LongLit:
 		return fmt.Sprintf("%d", v.Value)
 	case *ir.BoolLit:
