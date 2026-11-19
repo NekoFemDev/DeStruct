@@ -8,7 +8,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/destruct/destruct/internal/native"
@@ -63,6 +62,28 @@ func TestWithDiscoveredFunctions(t *testing.T) {
 	}
 }
 
+func TestMergeDWARFCandidates(t *testing.T) {
+	info, err := native.LoadDWARF("../native/testdata/dwarf-aarch64.o")
+	if err != nil {
+		t.Fatalf("LoadDWARF: %v", err)
+	}
+	candidates := []funcCandidate{{addr: 0x28, size: 0x28, name: "sub_28"}}
+	merged := mergeDWARFCandidates(candidates, info)
+
+	if len(merged) != 2 {
+		t.Fatalf("merged candidates = %d, want 2: %+v", len(merged), merged)
+	}
+	if merged[0].addr != 0 || merged[0].name != "add" {
+		t.Fatalf("merged[0] = %+v, want add at 0", merged[0])
+	}
+	if len(merged[0].params) != 2 || merged[0].params[0] != "a" || merged[0].paramTypes[0] != "int32_t" {
+		t.Fatalf("add params = %+v / %+v, want a:int32_t,b:int32_t", merged[0].params, merged[0].paramTypes)
+	}
+	if merged[1].name != "main" || merged[1].sourceLine != 2 {
+		t.Fatalf("merged[1] = %+v, want main with source line 2", merged[1])
+	}
+}
+
 func TestExtractLibappArchiveLimit(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oversize.apk")
 	f, err := os.Create(path)
@@ -114,26 +135,11 @@ func TestWriteFunctionLocation(t *testing.T) {
 	if got := out.String(); got != "// ELF function entry VA: 0x0\n" {
 		t.Fatalf("zero-address function location = %q", got)
 	}
-}
 
-func TestEnhancementPreservesRenderedLines(t *testing.T) {
-	dir := t.TempDir()
-	input := "sample.so"
-	original := "// name\nif (x) {\n    return 1;\n}\n"
-	path := filepath.Join(dir, input+".decompiled.c")
-	if err := os.WriteFile(path, []byte(original), 0600); err != nil {
-		t.Fatal(err)
-	}
-	p := New(Options{Input: input, Output: dir, SourceLocations: true})
-	if err := p.ApplyARM64DecompilationEnhancements(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := os.ReadFile(path + ".enhanced")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != original || strings.Contains(string(got), "0x400000") {
-		t.Fatalf("enhancement invented locations or changed rendered output: %q", got)
+	out.Reset()
+	writeFunctionLocation(&out, funcCandidate{addr: 0x1234, sourceFile: "/src/app.c", sourceLine: 12}, nil)
+	if got, want := out.String(), "// Source: app.c:12\n// ELF function entry VA: 0x1234\n"; got != want {
+		t.Fatalf("source location comments = %q, want %q", got, want)
 	}
 }
 

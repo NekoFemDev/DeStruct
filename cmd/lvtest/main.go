@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"github.com/destruct/destruct/internal/jvm"
+	"os"
 )
 
 func main() {

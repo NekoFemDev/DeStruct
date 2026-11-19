@@ -197,6 +197,78 @@ func WriteCFilePreamble(w io.Writer, sourceName string) {
 	// vtable = *(uint64_t**)obj; method = vtable[off/8]; method(args...).
 	io.WriteString(w, "#define CALL_VTABLE(obj, off, ...) \\\n")
 	io.WriteString(w, "    (((uint64_t (*)())(*(uint64_t*)((uintptr_t)(*(uint64_t*)((uintptr_t)(obj)))) + (off)))(__VA_ARGS__))\n\n")
+	io.WriteString(w, "static inline float eni_b2f(uint32_t u) { union { uint32_t u; float f; } v; v.u = u; return v.f; }\n")
+	io.WriteString(w, "static inline uint32_t eni_f2b(float f) { union { uint32_t u; float f; } v; v.f = f; return v.u; }\n")
+	io.WriteString(w, "static inline double eni_b2d(uint64_t u) { union { uint64_t u; double d; } v; v.u = u; return v.d; }\n")
+	io.WriteString(w, "static inline uint64_t eni_d2b(double d) { union { uint64_t u; double d; } v; v.d = d; return v.u; }\n")
+	io.WriteString(w, "#define ENI_BITCAST_F32(v) eni_b2f((uint32_t)(v))\n")
+	io.WriteString(w, "#define ENI_BITCAST_U32(v) eni_f2b((float)(v))\n")
+	io.WriteString(w, "#define ENI_BITCAST_F64(v) eni_b2d((uint64_t)(v))\n")
+	io.WriteString(w, "#define ENI_BITCAST_U64(v) eni_d2b((double)(v))\n\n")
+	// Lane-wise vector helpers. The IR keeps q-registers as eni_uint128,
+	// so these reinterpret the same 16 bytes with the arrangement named
+	// in the suffix (4s, 2d, 8h, 16b).
+	io.WriteString(w, "typedef struct { float e[4]; } eni_f32x4;\n")
+	io.WriteString(w, "typedef struct { double e[2]; } eni_f64x2;\n")
+	io.WriteString(w, "typedef struct { uint8_t e[16]; } eni_u8x16;\n")
+	io.WriteString(w, "typedef struct { uint16_t e[8]; } eni_u16x8;\n")
+	io.WriteString(w, "typedef struct { uint32_t e[4]; } eni_u32x4;\n")
+	io.WriteString(w, "typedef struct { uint64_t e[2]; } eni_u64x2;\n")
+	io.WriteString(w, `#define ENI_DEFINE_VEC_BIN(name, T, N, OP) \
+static inline eni_uint128 name(eni_uint128 a, eni_uint128 b) { \
+    union { eni_uint128 q; T e[N]; } ua, ub, ur; \
+    ua.q = a; ub.q = b; \
+    for (int i = 0; i < N; i++) ur.e[i] = ua.e[i] OP ub.e[i]; \
+    return ur.q; \
+}
+`)
+	io.WriteString(w, `#define ENI_DEFINE_VEC_FMA(name, T, N, SIGN) \
+static inline eni_uint128 name(eni_uint128 a, eni_uint128 b, eni_uint128 c) { \
+    union { eni_uint128 q; T e[N]; } ua, ub, uc, ur; \
+    ua.q = a; ub.q = b; uc.q = c; \
+    for (int i = 0; i < N; i++) ur.e[i] = ua.e[i] SIGN ub.e[i] * uc.e[i]; \
+    return ur.q; \
+}
+`)
+	io.WriteString(w, `#define ENI_DEFINE_VEC_DUP(name, T, N) \
+static inline eni_uint128 name(T x) { \
+    union { eni_uint128 q; T e[N]; } u; \
+    for (int i = 0; i < N; i++) u.e[i] = x; \
+    return u.q; \
+}
+`)
+	for _, d := range []struct {
+		name string
+		t    string
+		n    int
+	}{
+		{"F32X4", "float", 4},
+		{"F64X2", "double", 2},
+	} {
+		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vadd_%s, %s, %d, +)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vsub_%s, %s, %d, -)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vmul_%s, %s, %d, *)\n", strings.ToLower(d.name), d.t, d.n)
+		if d.name == "F32X4" || d.name == "F64X2" {
+			fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vdiv_%s, %s, %d, /)\n", strings.ToLower(d.name), d.t, d.n)
+		}
+		fmt.Fprintf(w, "ENI_DEFINE_VEC_FMA(eni_vfma_%s, %s, %d, +)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "ENI_DEFINE_VEC_FMA(eni_vfms_%s, %s, %d, -)\n", strings.ToLower(d.name), d.t, d.n)
+	}
+	for _, d := range []struct {
+		name string
+		t    string
+		n    int
+	}{
+		{"U8X16", "uint8_t", 16},
+		{"U16X8", "uint16_t", 8},
+		{"U32X4", "uint32_t", 4},
+		{"U64X2", "uint64_t", 2},
+	} {
+		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vadd_%s, %s, %d, +)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vsub_%s, %s, %d, -)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "ENI_DEFINE_VEC_DUP(eni_vdup_%s, %s, %d)\n", strings.ToLower(d.name), d.t, d.n)
+	}
+	io.WriteString(w, "\n")
 }
 
 // CRenderOptions controls the readability passes applied while emitting
@@ -219,6 +291,15 @@ type CRenderOptions struct {
 	// AddressComments appends /* ADDR */ to large numeric address
 	// constants.
 	AddressComments bool
+	// LocalTypes maps recovered source local names to their C types
+	// ("int32_t", "float", ...). Empty leaves the name-based defaults.
+	LocalTypes map[string]string
+	// ParamNames/ParamTypes optionally override the generic x0..x7
+	// parameter list with DWARF-derived names and C types.
+	ParamNames []string
+	ParamTypes []string
+	// ReturnType optionally overrides the default uint64_t return type.
+	ReturnType string
 }
 
 // RenderCFunction writes one lifted function as a complete C function
@@ -244,6 +325,10 @@ func RenderCFunctionWithOptions(w io.Writer, name string, stmts []ir.Stmt, opts 
 	r.offsetComments = opts.OffsetComments && opts.Offsets != nil
 	r.charConstants = opts.CharConstants
 	r.addressComments = opts.AddressComments
+	r.localTypes = opts.LocalTypes
+	r.paramNames = opts.ParamNames
+	r.paramTypes = opts.ParamTypes
+	r.returnType = opts.ReturnType
 	r.scanStmts(stmts)
 
 	var body bytes.Buffer
@@ -252,12 +337,20 @@ func RenderCFunctionWithOptions(w io.Writer, name string, stmts []ir.Stmt, opts 
 
 	r.chooseParams()
 
-	fmt.Fprintf(w, "uint64_t %s(", r.funcName)
+	funcSignatureReturn := "uint64_t"
+	if r.returnType != "" && r.returnType != "void" {
+		funcSignatureReturn = r.returnType
+	}
+	fmt.Fprintf(w, "%s %s(", funcSignatureReturn, r.funcName)
 	for i := 0; i < 8; i++ {
 		if i > 0 {
 			io.WriteString(w, ", ")
 		}
-		fmt.Fprintf(w, "uint64_t %s", r.params[i])
+		typ := "uint64_t"
+		if i < len(r.paramTypes) && r.paramTypes[i] != "" {
+			typ = r.paramTypes[i]
+		}
+		fmt.Fprintf(w, "%s %s", typ, r.params[i])
 	}
 	io.WriteString(w, ")\n{\n")
 
@@ -279,6 +372,10 @@ type cRenderer struct {
 	varNames     map[string]string // original IR name -> sanitized C name
 	origByMapped map[string]string // sanitized C name -> original IR name
 	varTypes     map[string]string // sanitized C name -> C declaration type
+	localTypes   map[string]string // original source name -> recovered C type
+	paramNames   []string          // optional DWARF names for x0..x7
+	paramTypes   []string          // optional DWARF C types for x0..x7
+	returnType   string            // optional DWARF return type
 	usedOrig     map[string]bool   // original names seen in the body
 	explicit     map[string]bool   // originals declared by VarDeclStmt
 	paramSet     map[string]bool   // sanitized parameter names
@@ -385,9 +482,9 @@ func cVarType(name string) string {
 		case 'q':
 			return "eni_uint128"
 		case 'd':
-			return "uint64_t"
+			return "double"
 		case 's':
-			return "uint32_t"
+			return "float"
 		case 'h':
 			return "uint16_t"
 		case 'b':
@@ -397,6 +494,10 @@ func cVarType(name string) string {
 	switch {
 	case name == "this", name == "null_ptr", name == "sp", name == "fp", name == "lr":
 		return "uintptr_t"
+	case strings.HasPrefix(name, "flocal_"):
+		return "float"
+	case strings.HasPrefix(name, "dlocal_"):
+		return "double"
 	case strings.HasPrefix(name, "var_"), strings.HasPrefix(name, "fvar_"),
 		strings.HasPrefix(name, "local_"), strings.HasPrefix(name, "tmp"):
 		return "int64_t"
@@ -446,7 +547,11 @@ func (r *cRenderer) useVar(raw string) string {
 	r.origByMapped[mapped] = raw
 	r.usedOrig[raw] = true
 	if !r.explicit[raw] {
-		r.varTypes[mapped] = cVarType(raw)
+		typ := cVarType(raw)
+		if t, ok := r.localTypes[raw]; ok && t != "" {
+			typ = t
+		}
+		r.varTypes[mapped] = typ
 	}
 	return mapped
 }
@@ -461,6 +566,19 @@ func (r *cRenderer) markExplicit(raw string) {
 
 func (r *cRenderer) chooseParams() {
 	for i := 0; i < 8; i++ {
+		if i < len(r.paramNames) && r.paramNames[i] != "" {
+			raw := r.paramNames[i]
+			mapped := r.useVar(raw)
+			typ := "uint64_t"
+			if i < len(r.paramTypes) && r.paramTypes[i] != "" {
+				typ = r.paramTypes[i]
+			}
+			r.varTypes[mapped] = typ
+			r.params[i] = mapped
+			r.paramSet[mapped] = true
+			r.explicit[raw] = true
+			continue
+		}
 		x := "x" + strconv.Itoa(i)
 		a := "arg" + strconv.Itoa(i)
 		chosen := x
@@ -481,7 +599,7 @@ func (r *cRenderer) chooseParams() {
 func (r *cRenderer) writePrototypes(w io.Writer) {
 	names := make([]string, 0, len(r.calls))
 	for name := range r.calls {
-		if name == r.funcName || name == "CALL_VTABLE" || r.paramSet[name] {
+		if name == r.funcName || name == "CALL_VTABLE" || strings.HasPrefix(name, "ENI_") || r.paramSet[name] {
 			continue
 		}
 		if _, isVar := r.varTypes[name]; isVar {
@@ -926,9 +1044,15 @@ func (r *cRenderer) fieldAccess(v *ir.FieldAccess) string {
 		return r.withFieldComment(fmt.Sprintf("((%s*)((uintptr_t)(%s)))->%s", typ, obj, field), v)
 	}
 	ctype := cTypeForWidth(v.Width)
+	if v.CType != "" {
+		ctype = v.CType
+	}
 	base := r.addressBase(v.Object, obj)
 	if v.HasOffset && v.Offset != 0 {
 		return r.withFieldComment(fmt.Sprintf("*(%s*)(%s + 0x%x)", ctype, base, v.Offset), v)
+	}
+	if v.Disp < 0 {
+		return r.withFieldComment(fmt.Sprintf("*(%s*)(%s - 0x%x)", ctype, base, uint64(-int64(v.Disp))), v)
 	}
 	return fmt.Sprintf("*(%s*)(%s)", ctype, base)
 }
@@ -1113,7 +1237,11 @@ func (r *cRenderer) expr(e ir.Expr) string {
 	case *ir.IndirectCall:
 		return "((uint64_t (*)())(" + r.expr(v.Callee) + "))(" + r.exprList(v.Args) + ")"
 	case *ir.ArrayAccess:
-		return "((uint64_t*)((uintptr_t)(" + r.expr(v.Array) + ")))[" + r.expr(v.Index) + "]"
+		ctype := cTypeForWidth(v.Width)
+		if v.CType != "" {
+			ctype = v.CType
+		}
+		return "((" + ctype + "*)((uintptr_t)(" + r.expr(v.Array) + ")))[" + r.expr(v.Index) + "]"
 	case *ir.ThisExpr:
 		return r.useVar("this")
 	case *ir.SuperExpr:

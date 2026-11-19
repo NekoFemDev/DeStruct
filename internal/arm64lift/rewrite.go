@@ -197,7 +197,7 @@ func (rw *il2cppRewriter) expr(e ir.Expr) ir.Expr {
 	case *ir.ArrayInitExpr:
 		out = &ir.ArrayInitExpr{ElemType: v.ElemType, Elems: rw.exprs(v.Elems)}
 	case *ir.ArrayAccess:
-		out = &ir.ArrayAccess{Array: rw.expr(v.Array), Index: rw.expr(v.Index)}
+		out = &ir.ArrayAccess{Array: rw.expr(v.Array), Index: rw.expr(v.Index), Width: v.Width, CType: v.CType}
 	default:
 		out = e
 	}
@@ -243,7 +243,9 @@ func (rw *il2cppRewriter) fieldAccess(v *ir.FieldAccess) ir.Expr {
 		Name:      v.Name,
 		Offset:    v.Offset,
 		HasOffset: v.HasOffset,
+		Disp:      v.Disp,
 		Width:     v.Width,
+		CType:     v.CType,
 		FieldName: v.FieldName,
 		TypeName:  v.TypeName,
 	}

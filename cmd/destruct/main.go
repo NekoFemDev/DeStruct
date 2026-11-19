@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -25,7 +24,7 @@ import (
 	"github.com/destruct/destruct/internal/pipeline"
 )
 
-const version = "1.0.0-beta.3"
+const version = "1.0.0-beta.4"
 
 func main() {
 	// Cancel in-flight work on Ctrl-C (SIGINT) or SIGTERM. Long-running
@@ -82,22 +81,25 @@ func run(ctx context.Context, args []string) error {
 		return handleELF(ctx, args[1:])
 	case "il2cpp":
 		return handleIL2CPP(ctx, args[1:])
-	case "pe":
-		return handlePE(ctx, args[1:])
-	case "version":
+	case "version", "--version", "-V":
 		fmt.Printf("DeStruct v%s\n", version)
 		return nil
 	case "help", "--help", "-h":
+		if len(args) > 1 {
+			printCommandHelp(args[1])
+			return nil
+		}
 		printUsage()
 		return nil
 	default:
+		fmt.Fprintf(os.Stderr, "destruct: unknown command: %s\n", cmd)
 		printUsage()
-		return fmt.Errorf("unknown command: %s", cmd)
+		return errUsage
 	}
 }
 
 func printUsage() {
-	fmt.Println(`DeStruct - Multi-format Decompiler
+	fmt.Println(`DeStruct - Multi-format Decompiler & Reverse-Engineering Toolkit
 Usage: destruct <command> [options]
 
 Commands:
@@ -111,13 +113,14 @@ Commands:
               Interactive Hermes patching session (seek/hexdump/disasm/write)
   hex         Interactive hex editor with staged patching (mapped read-only;
                ELF disasm/decompile; -c for one-shot scripting)
-  flutter     Disassemble Flutter libapp.so to readable Dart bytecode
+  flutter     Disassemble Flutter libapp.so to readable ARM64 assembly
   elf         Disassemble ELF binaries to readable assembly (--decompile: AArch64-only pseudo-C)
+  elf info <file>
+              Print ELF header, sections, symbols, dependencies and hardening flags
   elf recompile <decompiled_dir> -o <binary>
               Generate link stubs and recompile all .c files into a dummy
               executable with clang
   il2cpp      Dump Unity IL2CPP metadata (global-metadata.dat + libil2cpp.so) to dump.cs
-  pe          Disassemble PE binaries to readable assembly
   version     Show version
   help        Show this help
 
@@ -127,10 +130,12 @@ Options:
                          .hasm references that file's tables and is not
                          self-contained)
   -v, --verbose         Verbose output
-  --deobfuscate         Enable deobfuscation
-  --decompile           Use the decompiler (jvm/dex/flutter/elf). Hermes
-                         decompilation is disabled during the refactor -
-                         use the disassembly instead.
+  -h, --help            Show command help (also: destruct <command> -h)
+  --deobfuscate         Accepted for compatibility; deobfuscation passes are
+                         not implemented yet (except 'destruct js')
+  --decompile           Use the decompiler (jvm/dex/elf). Hermes and Flutter
+                         decompilation are not supported; use their
+                         disassembly workflows instead.
   --split-functions, -sf
                         With --decompile (ELF), write each function to a
                          separate .c file under <input>_decompiled/ and emit
@@ -147,6 +152,10 @@ Options:
                          dump (offsets.json / offset.hpp, or a directory
                          containing one, e.g. game_dump/) so field accesses can
                          use the dump's resolved names/offsets
+  --il2cpp-metadata <path>
+                         With --decompile (ELF), load Unity global-metadata.dat
+                         to recover managed method, parameter and field names
+                         (auto-detected next to libil2cpp.so)
   --emit-pseudo         With --decompile (ELF), select the unified pseudo-C
                          output explicitly (the default). The output is a
                          syntactically valid C translation unit: declarations,
@@ -154,13 +163,13 @@ Options:
                          function per lifted symbol
   --regs-as-vars        With --decompile (ELF), rename register placeholders
                          to arg0..arg7 / var_N / fvar_N (default keeps x0/w0)
-  --no-enhance          Disable enhanced comments when using --decompile (ELF)
   --no-location-comments Disable source-location comments when using --decompile (ELF)
   --print-options       Print the parsed configuration and exit
   --arch                With 'apk build', keep only lib/<arch>/ native
                          libraries (e.g. arm64-v8a, armeabi-v7a)
   --hermes-dec          Accepted no-op alias: the hermes-dec exact format is
                          always used for disassembly and assembly
+  --version, -V         Show version
 
 Workflow for Hermes patching (structural edits):
   1. destruct hermes file.hbc -o output/            # hermes-dec exact .hasm
@@ -178,11 +187,14 @@ Examples:
   destruct apk sign unsigned.apk -k release.jks -p "$KS_PASS" -o signed.apk
   destruct hermes index.android.bundle -o output/
   destruct assemble output/index.android.bundle.hasm -i index.android.bundle -o patched.hbc
+  destruct js bundle.js -o bundle.deobf.js
   destruct elf libnative.so -o output/ --decompile  # AArch64 pseudocode, one file
   destruct elf libnative.so -o output/ --decompile --il2cpp-offsets game_dump/
+  destruct elf libil2cpp.so -o output/ --decompile --il2cpp-metadata global-metadata.dat
   destruct elf libnative.so -o output/ --emit-pseudo --split-functions
+  destruct elf info libnative.so
   destruct elf recompile output/libnative.so_decompiled/ -o dummy
-  destruct flutter libapp.so -o output/ --decompile
+  destruct flutter libapp.so -o output/
   destruct il2cpp libil2cpp.so global-metadata.dat -o output/
   destruct elf libnative.so -o output/
   destruct hex libil2cpp.so
@@ -190,12 +202,19 @@ Examples:
   destruct hex lib.so -c "search \"UnityPlayer\"" -c "read 0x2000"`)
 }
 func handleJVM(ctx context.Context, args []string) error {
-	opts, input := parseFlags(args)
+	opts, input, err := parseFlags(args)
+	if err != nil {
+		return commandUsageError("jvm", err)
+	}
+	if opts.help {
+		printCommandHelp("jvm")
+		return nil
+	}
 	if opts.printOptions {
 		return printOptionsJSON("jvm", opts)
 	}
 	if input == "" {
-		return errors.New("input file required")
+		return commandUsageError("jvm", errors.New("input file required"))
 	}
 
 	ext := strings.ToLower(filepath.Ext(input))
@@ -221,12 +240,19 @@ func handleJVM(ctx context.Context, args []string) error {
 }
 
 func handleDex(ctx context.Context, args []string) error {
-	opts, input := parseFlags(args)
+	opts, input, err := parseFlags(args)
+	if err != nil {
+		return commandUsageError("dex", err)
+	}
+	if opts.help {
+		printCommandHelp("dex")
+		return nil
+	}
 	if opts.printOptions {
 		return printOptionsJSON("dex", opts)
 	}
 	if input == "" {
-		return errors.New("input file required")
+		return commandUsageError("dex", errors.New("input file required"))
 	}
 
 	ext := strings.ToLower(filepath.Ext(input))
@@ -252,12 +278,22 @@ func handleDex(ctx context.Context, args []string) error {
 }
 
 func handleHermes(ctx context.Context, args []string) error {
-	opts, input := parseFlags(args)
+	opts, input, err := parseFlags(args)
+	if err != nil {
+		return commandUsageError("hermes", err)
+	}
+	if opts.help {
+		printCommandHelp("hermes")
+		return nil
+	}
 	if opts.printOptions {
 		return printOptionsJSON("hermes", opts)
 	}
+	if opts.decompile {
+		return commandUsageError("hermes", errors.New("Hermes decompilation was removed; use the disassembly/assembly workflow (`destruct hermes` then `destruct assemble`)"))
+	}
 	if input == "" {
-		return errors.New("input .hbc file required")
+		return commandUsageError("hermes", errors.New("input .hbc file required"))
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -279,12 +315,6 @@ func handleHermes(ctx context.Context, args []string) error {
 
 	fmt.Printf("Parsed Hermes bytecode v%d (%d functions, %d strings)\n",
 		m.Version, len(m.Functions), len(m.Strings))
-
-	if opts.decompile {
-		// Frozen during the internal/hermes refactor; the stub returns a
-		// single explicit error (see internal/hermes/decompiler.go).
-		return hermes.NewDecompiler(m).DecompileAllContext(ctx, io.Discard)
-	}
 
 	hasmPath := filepath.Join(opts.output, filepath.Base(input)+".hasm")
 	f, err := os.Create(hasmPath)
@@ -321,12 +351,19 @@ func handleHermes(ctx context.Context, args []string) error {
 // IIFE unwrapping, debugger removal), and write the beautified result next
 // to the input as <name>.deobf.js unless -o overrides the path.
 func handleJS(args []string) error {
-	opts, input := parseFlags(args)
+	opts, input, err := parseFlags(args)
+	if err != nil {
+		return commandUsageError("js", err)
+	}
+	if opts.help {
+		printCommandHelp("js")
+		return nil
+	}
 	if opts.printOptions {
 		return printOptionsJSON("js", opts)
 	}
 	if input == "" {
-		return errors.New("input .js file required")
+		return commandUsageError("js", errors.New("input .js file required"))
 	}
 
 	raw, err := os.ReadFile(input)
@@ -355,12 +392,19 @@ func handleJS(args []string) error {
 }
 
 func handleAssemble(args []string) error {
-	opts, input := parseFlags(args)
+	opts, input, err := parseFlags(args)
+	if err != nil {
+		return commandUsageError("assemble", err)
+	}
+	if opts.help {
+		printCommandHelp("assemble")
+		return nil
+	}
 	if opts.printOptions {
 		return printOptionsJSON("assemble", opts)
 	}
 	if input == "" {
-		return errors.New("input .hasm file required")
+		return commandUsageError("assemble", errors.New("input .hasm file required"))
 	}
 
 	if opts.output == "output" {
@@ -383,7 +427,7 @@ func handleAssemble(args []string) error {
 	// assembled standalone. Only functions whose text actually changed
 	// are reassembled.
 	if opts.inputFile == "" {
-		return errors.New("assembly requires the original .hbc/.bundle via -i/--input (the .hasm text references that file's string/function tables and cannot be assembled standalone)")
+		return commandUsageError("assemble", errors.New("assembly requires the original .hbc/.bundle via -i/--input (the .hasm text references that file's string/function tables and cannot be assembled standalone)"))
 	}
 
 	original, err := os.ReadFile(opts.inputFile)
@@ -423,9 +467,16 @@ func handleAssemble(args []string) error {
 // hexdump, disassemble, and write commands operating on an in-memory
 // buffer with explicit save via 'w'/'wq'.
 func handleInteractive(args []string) error {
-	_, input := parseFlags(args)
+	opts, input, err := parseFlags(args)
+	if err != nil {
+		return commandUsageError("interactive", err)
+	}
+	if opts.help {
+		printCommandHelp("interactive")
+		return nil
+	}
 	if input == "" {
-		return errors.New("input .hbc/.bundle file required")
+		return commandUsageError("interactive", errors.New("input .hbc/.bundle file required"))
 	}
 
 	data, err := os.ReadFile(input)
@@ -444,12 +495,22 @@ func handleInteractive(args []string) error {
 }
 
 func handleFlutter(ctx context.Context, args []string) error {
-	opts, input := parseFlags(args)
+	opts, input, err := parseFlags(args)
+	if err != nil {
+		return commandUsageError("flutter", err)
+	}
+	if opts.help {
+		printCommandHelp("flutter")
+		return nil
+	}
 	if opts.printOptions {
 		return printOptionsJSON("flutter", opts)
 	}
+	if opts.decompile {
+		return commandUsageError("flutter", errors.New("Flutter decompilation was removed; use the disassembly output (`destruct flutter <libapp.so> -o output/`)"))
+	}
 	if input == "" {
-		return errors.New("input file required")
+		return commandUsageError("flutter", errors.New("input file required"))
 	}
 
 	ext := strings.ToLower(filepath.Ext(input))
@@ -479,12 +540,27 @@ func handleFlutter(ctx context.Context, args []string) error {
 }
 
 func handleELF(ctx context.Context, args []string) error {
-	if len(args) > 0 && args[0] == "recompile" {
-		return handleELFRecompile(ctx, args[1:])
+	if len(args) > 0 {
+		switch args[0] {
+		case "help", "-h", "--help":
+			printCommandHelp("elf")
+			return nil
+		case "recompile":
+			return handleELFRecompile(ctx, args[1:])
+		case "info":
+			return handleELFInfo(ctx, args[1:])
+		}
 	}
-	opts, input := parseFlags(args)
+	opts, input, err := parseFlags(args)
+	if err != nil {
+		return commandUsageError("elf", err)
+	}
+	if opts.help {
+		printCommandHelp("elf")
+		return nil
+	}
 	if input == "" {
-		return errors.New("input file required")
+		return commandUsageError("elf", errors.New("input file required"))
 	}
 
 	// --cross-references implies --decompile for ELF, since it needs the
@@ -504,13 +580,12 @@ func handleELF(ctx context.Context, args []string) error {
 	if opts.emitPseudo {
 		opts.decompile = true
 	}
-	if opts.il2cppOffsets != "" || opts.regsAsVars {
+	if opts.il2cppOffsets != "" || opts.il2cppMetadata != "" || opts.regsAsVars {
 		opts.decompile = true
 	}
 
-	// --decompile automatically enables enhancement output; use
-	// --no-enhance / --no-location-comments to opt out.
-	enhance := opts.decompile && !opts.noEnhance
+	// --decompile automatically enables source-location comments; use
+	// --no-location-comments to opt out.
 	sourceLocations := opts.decompile && !opts.noLocationComments
 
 	if opts.printOptions {
@@ -525,13 +600,13 @@ func handleELF(ctx context.Context, args []string) error {
 		Deobf:           opts.deobfuscate,
 		Project:         opts.project,
 		Decompile:       opts.decompile,
-		EnhanceComments: enhance,
 		SourceLocations: sourceLocations,
 		SplitFunctions:  opts.splitFunctions,
 		CrossReferences: opts.crossReferences,
 		SimplifyCFG:     opts.simplifyCfg,
 		EmitLLVM:        opts.emitLLVM,
 		IL2CPPOffsets:   opts.il2cppOffsets,
+		IL2CPPMetadata:  opts.il2cppMetadata,
 		EmitPseudo:      opts.emitPseudo,
 		RegsAsVars:      opts.regsAsVars,
 	})
@@ -556,31 +631,26 @@ func handleELFRecompile(ctx context.Context, args []string) error {
 	for i := 0; i < len(args); i++ {
 		switch arg := args[i]; arg {
 		case "-o", "--output":
-			if i+1 >= len(args) {
-				return errors.New("missing value for -o/--output")
+			v, err := nextFlagValue(args, &i, arg)
+			if err != nil {
+				return commandUsageError("elf recompile", err)
 			}
-			i++
-			output = args[i]
+			output = v
 		case "-h", "--help":
-			fmt.Println(`Usage: destruct elf recompile <decompiled_dir> -o <output_binary>
-
-Generates <decompiled_dir>/stubs.c and links every .c file in the
-directory into a dummy executable with:
-
-  clang -std=c11 -w -o <output_binary> <all .c files>`)
+			printCommandHelp("elf recompile")
 			return nil
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("unknown option: %s", arg)
+				return commandUsageError("elf recompile", fmt.Errorf("unknown option: %s", arg))
 			}
 			if dir != "" {
-				return errors.New("exactly one decompiled directory is required")
+				return commandUsageError("elf recompile", errors.New("exactly one decompiled directory is required"))
 			}
 			dir = arg
 		}
 	}
 	if dir == "" {
-		return errors.New("usage: destruct elf recompile <decompiled_dir> -o <output_binary>")
+		return commandUsageError("elf recompile", errors.New("decompiled directory required"))
 	}
 
 	absDir, err := filepath.Abs(dir)
@@ -688,24 +758,34 @@ func handleIL2CPP(ctx context.Context, args []string) error {
 	output := "output"
 	verbose := false
 	printOptions := false
+	help := false
 	var positionals []string
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "-h", "--help":
+			help = true
 		case "-o", "--output":
-			if i+1 < len(args) {
-				i++
-				output = args[i]
+			v, err := nextFlagValue(args, &i, args[i])
+			if err != nil {
+				return commandUsageError("il2cpp", err)
 			}
+			output = v
 		case "-v", "--verbose":
 			verbose = true
 		case "--print-options":
 			printOptions = true
 		default:
-			if !strings.HasPrefix(args[i], "-") {
-				positionals = append(positionals, args[i])
+			if strings.HasPrefix(args[i], "-") {
+				return commandUsageError("il2cpp", fmt.Errorf("unknown option: %s", args[i]))
 			}
+			positionals = append(positionals, args[i])
 		}
+	}
+
+	if help {
+		printCommandHelp("il2cpp")
+		return nil
 	}
 
 	if printOptions {
@@ -723,7 +803,10 @@ func handleIL2CPP(ctx context.Context, args []string) error {
 	}
 
 	if len(positionals) < 2 {
-		return errors.New("both libil2cpp.so and global-metadata.dat are required\nUsage: destruct il2cpp <libil2cpp.so> <global-metadata.dat> [-o output/]")
+		return commandUsageError("il2cpp", errors.New("both libil2cpp.so and global-metadata.dat are required"))
+	}
+	if len(positionals) > 2 {
+		return commandUsageError("il2cpp", fmt.Errorf("unexpected extra argument: %s", positionals[2]))
 	}
 	lib, meta := positionals[0], positionals[1]
 	if looksLikeMetadata(lib) && looksLikeELF(meta) {
@@ -776,32 +859,6 @@ func looksLikeELF(path string) bool {
 	return string(magic[:]) == "\x7fELF"
 }
 
-func handlePE(ctx context.Context, args []string) error {
-	opts, input := parseFlags(args)
-	if opts.printOptions {
-		return printOptionsJSON("pe", opts)
-	}
-	if input == "" {
-		return errors.New("input file required")
-	}
-
-	p := pipeline.New(pipeline.Options{
-		Input:   input,
-		Output:  opts.output,
-		Format:  pipeline.FormatPE,
-		Verbose: opts.verbose,
-		Deobf:   opts.deobfuscate,
-		Project: opts.project,
-	})
-
-	if err := p.RunContext(ctx); err != nil {
-		return err
-	}
-
-	fmt.Printf("Decompilation complete. Output: %s\n", opts.output)
-	return nil
-}
-
 func cliOptionsMap(opts cliOpts) map[string]interface{} {
 	return map[string]interface{}{
 		"output":             opts.output,
@@ -812,13 +869,13 @@ func cliOptionsMap(opts cliOpts) map[string]interface{} {
 		"hermesDec":          opts.hermesDec,
 		"inputFile":          opts.inputFile,
 		"printOptions":       opts.printOptions,
-		"noEnhance":          opts.noEnhance,
 		"noLocationComments": opts.noLocationComments,
 		"splitFunctions":     opts.splitFunctions,
 		"crossReferences":    opts.crossReferences,
 		"simplifyCfg":        opts.simplifyCfg,
 		"emitLLVM":           opts.emitLLVM,
 		"il2cppOffsets":      opts.il2cppOffsets,
+		"il2cppMetadata":     opts.il2cppMetadata,
 		"emitPseudo":         opts.emitPseudo,
 		"regsAsVars":         opts.regsAsVars,
 	}
@@ -844,18 +901,23 @@ type cliOpts struct {
 	hermesDec          bool
 	inputFile          string
 	printOptions       bool
-	noEnhance          bool
+	help               bool
 	noLocationComments bool
 	splitFunctions     bool
 	crossReferences    bool
 	simplifyCfg        bool
 	emitLLVM           bool
 	il2cppOffsets      string
+	il2cppMetadata     string
 	emitPseudo         bool
 	regsAsVars         bool
 }
 
-func parseFlags(args []string) (cliOpts, string) {
+// parseFlags parses the shared command-line flags used by most
+// subcommands. It returns an error for an unknown flag, a flag missing
+// its value, or a second positional argument instead of silently
+// ignoring them.
+func parseFlags(args []string) (cliOpts, string, error) {
 	opts := cliOpts{
 		output:  "output",
 		project: true,
@@ -865,19 +927,25 @@ func parseFlags(args []string) (cliOpts, string) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
+		case "-h", "--help":
+			opts.help = true
 		case "-o", "--output":
-			if i+1 < len(args) {
-				i++
-				opts.output = args[i]
+			v, err := nextFlagValue(args, &i, arg)
+			if err != nil {
+				return opts, "", err
 			}
+			opts.output = v
 		case "-i", "--input":
-			if i+1 < len(args) {
-				i++
-				opts.inputFile = args[i]
+			v, err := nextFlagValue(args, &i, arg)
+			if err != nil {
+				return opts, "", err
 			}
+			opts.inputFile = v
 		case "-v", "--verbose":
 			opts.verbose = true
 		case "--deobfuscate":
+			// Accepted for compatibility; the deobfuscation passes are
+			// not implemented yet.
 			opts.deobfuscate = true
 		case "--decompile":
 			opts.decompile = true
@@ -887,8 +955,6 @@ func parseFlags(args []string) (cliOpts, string) {
 			opts.hermesDec = true
 		case "--print-options":
 			opts.printOptions = true
-		case "--no-enhance":
-			opts.noEnhance = true
 		case "--no-location-comments":
 			opts.noLocationComments = true
 		case "--split-functions", "-sf":
@@ -900,10 +966,17 @@ func parseFlags(args []string) (cliOpts, string) {
 		case "--emit-llvm":
 			opts.emitLLVM = true
 		case "--il2cpp-offsets":
-			if i+1 < len(args) {
-				i++
-				opts.il2cppOffsets = args[i]
+			v, err := nextFlagValue(args, &i, arg)
+			if err != nil {
+				return opts, "", err
 			}
+			opts.il2cppOffsets = v
+		case "--il2cpp-metadata":
+			v, err := nextFlagValue(args, &i, arg)
+			if err != nil {
+				return opts, "", err
+			}
+			opts.il2cppMetadata = v
 		case "--emit-pseudo":
 			opts.emitPseudo = true
 		case "--regs-as-vars":
@@ -911,11 +984,15 @@ func parseFlags(args []string) (cliOpts, string) {
 		case "--no-project":
 			opts.project = false
 		default:
-			if !strings.HasPrefix(arg, "-") {
-				input = arg
+			if strings.HasPrefix(arg, "-") {
+				return opts, "", fmt.Errorf("unknown option: %s", arg)
 			}
+			if input != "" {
+				return opts, "", fmt.Errorf("unexpected extra argument: %s", arg)
+			}
+			input = arg
 		}
 	}
 
-	return opts, input
+	return opts, input, nil
 }

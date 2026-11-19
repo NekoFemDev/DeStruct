@@ -36,6 +36,10 @@ func classFromDef(dex *DexFile, classDef ClassDef) *ir.Class {
 		Access:     convertClassAccessFlags(classDef.AccessFlags),
 		SuperClass: super,
 	}
+	annotations := dex.GetAnnotations(classDef)
+	if annotations != nil {
+		class.Annotations = toIRAnnotations(annotations.Class)
+	}
 
 	for _, iface := range dex.GetInterfaces(classDef) {
 		class.Interfaces = append(class.Interfaces, JavaClassName(dex.GetTypeDesc(iface)))
@@ -47,22 +51,22 @@ func classFromDef(dex *DexFile, classDef ClassDef) *ir.Class {
 	}
 
 	for _, field := range classData.StaticFields {
-		if f := dex.convertField(field); f != nil {
+		if f := dex.convertField(field, fieldAnnotations(annotations, field.FieldIdx)); f != nil {
 			class.Fields = append(class.Fields, f)
 		}
 	}
 	for _, field := range classData.InstanceFields {
-		if f := dex.convertField(field); f != nil {
+		if f := dex.convertField(field, fieldAnnotations(annotations, field.FieldIdx)); f != nil {
 			class.Fields = append(class.Fields, f)
 		}
 	}
 	for _, method := range classData.DirectMethods {
-		if m := dex.convertMethod(method); m != nil {
+		if m := dex.convertMethod(method, methodAnnotations(annotations, method.MethodIdx), parameterAnnotations(annotations, method.MethodIdx)); m != nil {
 			class.Methods = append(class.Methods, m)
 		}
 	}
 	for _, method := range classData.VirtualMethods {
-		if m := dex.convertMethod(method); m != nil {
+		if m := dex.convertMethod(method, methodAnnotations(annotations, method.MethodIdx), parameterAnnotations(annotations, method.MethodIdx)); m != nil {
 			class.Methods = append(class.Methods, m)
 		}
 	}
@@ -70,19 +74,20 @@ func classFromDef(dex *DexFile, classDef ClassDef) *ir.Class {
 	return class
 }
 
-func (dex *DexFile) convertField(field Field) *ir.Field {
+func (dex *DexFile) convertField(field Field, anns []DexAnnotation) *ir.Field {
 	fid := dex.GetFieldId(field.FieldIdx)
 	if fid == nil {
 		return nil
 	}
 	return &ir.Field{
-		Name:   dex.GetString(fid.NameIdx),
-		Type:   TypeFromDesc(dex.GetTypeDesc(uint32(fid.TypeIdx))),
-		Access: convertFieldAccessFlags(field.AccessFlags),
+		Name:        dex.GetString(fid.NameIdx),
+		Type:        TypeFromDesc(dex.GetTypeDesc(uint32(fid.TypeIdx))),
+		Access:      convertFieldAccessFlags(field.AccessFlags),
+		Annotations: toIRAnnotations(anns),
 	}
 }
 
-func (dex *DexFile) convertMethod(method Method) *ir.Method {
+func (dex *DexFile) convertMethod(method Method, anns []DexAnnotation, paramAnns [][]DexAnnotation) *ir.Method {
 	methodID := dex.GetMethodId(method.MethodIdx)
 	if methodID == nil {
 		return nil
@@ -95,10 +100,14 @@ func (dex *DexFile) convertMethod(method Method) *ir.Method {
 
 	var params []*ir.Param
 	for i, typeIdx := range dex.GetParameters(*proto) {
-		params = append(params, &ir.Param{
+		param := &ir.Param{
 			Name: fmt.Sprintf("p%d", i),
 			Type: TypeFromDesc(dex.GetTypeDesc(typeIdx)),
-		})
+		}
+		if i < len(paramAnns) {
+			param.Annotations = toIRAnnotations(paramAnns[i])
+		}
+		params = append(params, param)
 	}
 
 	var body *ir.Block
@@ -107,6 +116,12 @@ func (dex *DexFile) convertMethod(method Method) *ir.Method {
 		if codeItem != nil {
 			converter := NewDalvikToIR(dex, &method, codeItem)
 			body = converter.Convert()
+			debugParams := converter.ParamNames()
+			for i, name := range debugParams {
+				if name != "" && i < len(params) {
+					params[i].Name = name
+				}
+			}
 		}
 	}
 
@@ -116,12 +131,56 @@ func (dex *DexFile) convertMethod(method Method) *ir.Method {
 	}
 
 	return &ir.Method{
-		Name:       name,
-		Access:     convertMethodAccessFlags(method.AccessFlags),
-		Params:     params,
-		ReturnType: TypeFromDesc(dex.GetTypeDesc(proto.ReturnTypeIdx)),
-		Body:       body,
+		Name:        name,
+		Access:      convertMethodAccessFlags(method.AccessFlags),
+		Params:      params,
+		ReturnType:  TypeFromDesc(dex.GetTypeDesc(proto.ReturnTypeIdx)),
+		Body:        body,
+		Annotations: toIRAnnotations(anns),
 	}
+}
+
+func fieldAnnotations(dir *DexAnnotationDirectory, idx uint32) []DexAnnotation {
+	if dir == nil {
+		return nil
+	}
+	return dir.Fields[idx]
+}
+
+func methodAnnotations(dir *DexAnnotationDirectory, idx uint32) []DexAnnotation {
+	if dir == nil {
+		return nil
+	}
+	return dir.Methods[idx]
+}
+
+func parameterAnnotations(dir *DexAnnotationDirectory, idx uint32) [][]DexAnnotation {
+	if dir == nil {
+		return nil
+	}
+	return dir.Params[idx]
+}
+
+func toIRAnnotations(anns []DexAnnotation) []*ir.Annotation {
+	if len(anns) == 0 {
+		return nil
+	}
+	out := make([]*ir.Annotation, 0, len(anns))
+	for _, a := range anns {
+		// System annotations describe bytecode-level metadata (generic
+		// signatures, inner-class links, native optimizations), not
+		// source-level annotations; rendering them produces invalid or
+		// meaningless Java.
+		if strings.HasPrefix(a.TypeDesc, "Ldalvik/annotation/") {
+			continue
+		}
+		ann := &ir.Annotation{Type: JavaClassName(a.TypeDesc)}
+		for _, e := range a.Elements {
+			ann.Elements = append(ann.Elements, ir.AnnotationElement{Name: e.Name, Value: e.Value})
+		}
+		out = append(out, ann)
+	}
+	return out
 }
 
 // moveConstructorCallFirst hoists a constructor's super(...)/this(...)
@@ -216,7 +275,7 @@ func convertMethodAccessFlags(flags uint32) ir.AccessFlags {
 	if flags&ACC_FINAL != 0 {
 		access |= ir.AccFinal
 	}
-	if flags&ACC_SYNCHRONIZED != 0 {
+	if flags&ACC_SYNCHRONIZED != 0 || flags&ACC_DECLARED_SYNCHRONIZED != 0 {
 		access |= ir.AccSynchronized
 	}
 	if flags&ACC_BRIDGE != 0 {

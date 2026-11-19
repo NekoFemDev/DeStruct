@@ -37,10 +37,31 @@ structured control flow (`if`/`else`, `while`, `do-while`, `switch`).
 Supports standard DEX 035–039, including MUTF-8 strings, switch/fill-array-data
 payloads, and the compact 4-byte 23x instruction encoding found in protected apps.
 
-Current limitations: `try`/`catch`/`finally` and `synchronized` blocks are
-partially reconstructed (exception handler code may be dropped); register names
-stay as `vN`; local variable types are not inferred; non-standard packer opcodes
-are skipped.
+Current limitations: `try`/`catch`/`finally`, `synchronized` blocks and
+class/field/method/parameter annotations are reconstructed from DEX metadata;
+full local-variable type inference and per-statement line comments remain
+partial. `debug_info_item` parameter/local names and line tables are decoded
+and used where present.
+
+---
+
+## `destruct apk` — rebuild and sign an APK
+
+```
+destruct apk build decoded/ -o unsigned.apk --arch arm64-v8a
+destruct apk sign unsigned.apk -k release.jks -p "$KS_PASS" -o signed.apk
+```
+
+`apk build` repacks an apktool project and optionally strips native libraries
+for every ABI except `--arch <abi>` (for example `arm64-v8a`). `apk sign` runs
+`zipalign` then `apksigner` with the supplied keystore.
+
+External tools must be on `PATH`:
+
+- `apk build` — `apktool`
+- `apk sign` — `zipalign`, `apksigner` (Android SDK build-tools)
+
+Run `destruct apk --help` for the full option list.
 
 ---
 
@@ -55,8 +76,9 @@ destruct hermes index.android.bundle -o output/   # exact hermes-dec format (.ha
 **Flags:**
 - `--hermes-dec` — accepted no-op alias: the hermes-dec exact format is always
   used for disassembly (and for assembly).
-- `--decompile` — disabled for Hermes during the current refactor; the command
-  returns an explicit error instead of emitting `.js`.
+
+**Note:** Hermes decompilation to JavaScript is not supported. Use the
+disassembly + `assemble` workflow for structural edits.
 
 **Workflow for structural edits (add/remove/reorder instructions):**
 ```
@@ -73,6 +95,23 @@ For same-size edits you can also patch the raw bytes directly with
 `destruct hex`/any hex editor: every instruction's function-relative offset is
 shown in the `.hasm`, and function bytecode offsets are available via the
 `interactive` session (`disasm` / `info` commands).
+
+---
+
+## `destruct js` — deobfuscate/beautify JavaScript
+
+```
+destruct js bundle.js
+destruct js bundle.js -o bundle.deobf.js
+```
+
+Runs the AST-based JavaScript deobfuscation pipeline: constant folding
+(`!0` → `true`, `![]` → `false`, `void 0` → `undefined`), IIFE unwrapping and
+`debugger` statement removal, then prints beautified JavaScript. The default
+output is `<input>.deobf.js` next to the input.
+
+The parser is treated as adversarial: malformed input and parser panics are
+reported as errors instead of crashing the process.
 
 ---
 
@@ -185,35 +224,50 @@ for hex.
 ## `destruct flutter` — disassemble Flutter `libapp.so` (Dart AOT)
 
 ```
-
 destruct flutter libapp.so -o output/
-destruct flutter libapp.so -o output/ --decompile   # output .dart instead of assembly
-
 ```
 
 Requires the file to actually exist and have a `.so`/`.apk` extension —
 validated before launch.
+
+**Note:** Flutter decompilation to Dart is not supported; the command emits
+ARM64 assembly plus per-function binary blobs.
 
 ---
 
 ## `destruct elf` — disassemble ELF binaries (native .so, ARM/ARM64/x86)
 
 ```
-
 destruct elf libnative.so -o output/
-destruct elf libnative.so -o output/ --decompile                    # AArch64 pseudocode + enhancements
-destruct elf libnative.so -o output/ --decompile --no-enhance        # without enhanced comments
-destruct elf libnative.so -o output/ --decompile --no-location-comments # without location comments
+destruct elf libnative.so -o output/ --decompile                    # AArch64 pseudocode
+destruct elf libnative.so -o output/ --decompile --no-location-comments
 destruct elf libnative.so -o output/ --decompile --split-functions   # one .c per function + functions.json
 destruct elf libnative.so -o output/ --decompile --cross-references  # XREF comments + xrefs.json
 destruct elf libnative.so -o output/ --decompile --simplify-cfg      # CFG simplification + unreachable block removal
-destruct elf libnative.so -o output/ --decompile --emit-llvm           # also export lifted IR to LLVM IR (<name>.decompiled.ll)
-destruct elf recompile output/libnative.so_decompiled/ -o dummy        # stubs.c + clang link into a dummy executable
-
+destruct elf libnative.so -o output/ --decompile --emit-llvm         # also export lifted IR to LLVM IR (<name>.decompiled.ll)
+destruct elf libil2cpp.so -o output/ --decompile --il2cpp-metadata global-metadata.dat
+destruct elf recompile output/libnative.so_decompiled/ -o dummy      # stubs.c + clang link into a dummy executable
+destruct elf info libnative.so                                       # header/sections/symbols/security summary
 ```
 
 Produces a readable assembly listing of all code sections annotated with symbols
 (if `.symtab` is present).
+
+### `destruct elf info <file>`
+
+Prints a readelf-style triage summary without decompiling:
+
+- class, endianness, OS/ABI, ELF type, machine, entry point;
+- program-header and section counts;
+- section table (name, type, flags, address, offset, size);
+- dynamic dependencies (`NEEDED`, `SONAME`, `RPATH`, `RUNPATH`);
+- symbol counts, defined/undefined split, exported function list and imports;
+- function count from symbols plus `.eh_frame_hdr` discovery;
+- DWARF summary (functions, lines, params, locals) when debug info is present;
+- hardening flags: PIE, NX (GNU_STACK), RELRO (partial/full), stack canary,
+  FORTIFY symbols.
+
+### ELF decompilation flags
 
 **`--decompile`** (AArch64 only): instead of assembly listing, lifts every function
 through the ARM64→pseudocode lifter (`internal/arm64lift`) and writes one file —
@@ -261,9 +315,13 @@ basic blocks and branches (`if`/`while`/`switch`, merge labels
 are lifted to private globals. The format targets `llvm-as`/`opt` or disassemblers,
 not verified compilation — the lifted IR has no exact type system.
 
-With `--decompile`, enhanced comments (`--enhance`) and location comments
-(`--location-comments`) are enabled automatically. Disable with `--no-enhance` /
-`--no-location-comments`.
+**`--il2cpp-metadata <path>`** (AArch64 + `--decompile`): loads Unity
+`global-metadata.dat` and resolves native method RVAs back to managed
+type/method/parameter names and object field names/offsets. When omitted,
+`global-metadata.dat` is auto-detected next to a `libil2cpp.so` input.
+
+With `--decompile`, source-location comments are enabled automatically;
+disable them with `--no-location-comments`.
 
 **`--print-options`** — print parsed configuration and exit.
 
@@ -327,25 +385,13 @@ written without recovering method bodies — for disassembling code, use
 
 ---
 
-## `destruct pe` — disassemble PE binaries (Windows `.exe`/`.dll`)
-
-```
-
-destruct pe program.exe -o output/
-
-```
-
-Same principle as `elf`, but for PE format.
-
----
-
 ## `destruct version` / `destruct help`
 
 ```
-
-destruct version   # version
-destruct help       # full usage text (embedded in the binary)
-
+destruct version      # version
+destruct --version    # same
+destruct help         # full usage text (embedded in the binary)
+destruct <command> -h # per-command help
 ```
 
 ---
@@ -357,18 +403,18 @@ destruct help       # full usage text (embedded in the binary)
 | `-o, --output` | output file/directory |
 | `-i, --input` | input `.hbc` file (for `assemble`/`patch`) |
 | `-v, --verbose` | verbose output |
-| `--deobfuscate` | enable deobfuscation |
-| `--decompile` | use decompiler (JVM/Flutter/ELF AArch64) |
-| `--enhance` | enhanced comments for AArch64 ELF decompilation |
-| `--location-comments` | add address/location comments for AArch64 ELF |
+| `-h, --help` | per-command help |
+| `--deobfuscate` | accepted for compatibility; general deobfuscation passes are not implemented yet |
+| `--decompile` | use the decompiler (ELF AArch64; JVM/DEX always decompile; Hermes and Flutter are disassembly-only) |
 | `--print-options` | print current configuration and exit |
-| `--no-enhance` | disable enhanced comments for AArch64 ELF decompilation |
-| `--no-location-comments` | disable location comments for AArch64 ELF decompilation |
+| `--no-location-comments` | disable source-location comments for AArch64 ELF decompilation |
 | `--split-functions`, `-sf` | write each function to its own `.c` file and generate `functions.json` (ELF AArch64 with `--decompile` only) |
 | `--cross-references`, `-x` | add `// XREF:` comments and generate `xrefs.json` (ELF AArch64 with `--decompile` only) |
 | `--simplify-cfg` | run CFG simplification / unreachable block removal (ELF AArch64 with `--decompile` only, experimental) |
 | `--emit-llvm` | export lifted IR as LLVM IR `<name>.decompiled.ll` (AArch64 only, implies `--decompile`) |
+| `--il2cpp-metadata <path>` | load Unity `global-metadata.dat` for managed method/field names (implies `--decompile`) |
 | `--no-project` | do not create project structure |
+| `--version`, `-V` | print the version and exit |
 
 ---
 
@@ -407,9 +453,11 @@ any depth), local variables, struct field access through pointers, and indirect
 calls (`blr`/`br`, including C++ vtable thunks) — on the test binary
 (`test/il2cpp_memory_dumper`) all 177 functions decompile without empty output
 and without panics. Remaining limitations (no full type system — names like
-`field_8`/`local_16` are synthetic, not real; indexed and pre/post-indexed
-addressing are not distinguished from plain offset addressing) are listed in
-`internal/arm64lift/lift.go`, in the `TODO` block at the end.
+`field_8` are synthetic, not real; DWARF is used for function/parameter names
+and types, return types, declaration source and simple frame locals, but
+per-statement line comments, full struct/array/pointer types, less common
+vector arrangements and some FP conversion modes are not reconstructed) are
+listed in `internal/arm64lift/lift.go`, in the `TODO` block at the end.
 
 ---
 
@@ -419,9 +467,12 @@ addressing are not distinguished from plain offset addressing) are listed in
 
 make build     # build destruct -> ./destruct
 make test      # run tests
+make test-race # run tests with the race detector
 make vet       # go vet
+make fmt       # gofmt all sources
 make clean     # remove binary and output/
 
 ```
 
-Requires `libcapstone-dev` on the system (for the ELF/PE disassembler and `lifttest`).
+Requires a C toolchain and `make`; Capstone is built statically from the
+pinned source (see the top-level Makefile).

@@ -253,6 +253,8 @@ func LiftFunctionWithOptions(instructions []native.DetailedInstruction, paramNam
 	l := &lifter{
 		regs:         make(map[string]ir.Expr),
 		stack:        make(map[int32]string),
+		stackWidth:   make(map[int32]int),
+		stackTyped:   make(map[int32]bool),
 		resolver:     resolver,
 		strings:      strResolver,
 		addrRegs:     make(map[string]uint64),
@@ -1606,6 +1608,14 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.stack {
 		stack[k] = v
 	}
+	stackWidth := make(map[int32]int, len(l.stackWidth))
+	for k, v := range l.stackWidth {
+		stackWidth[k] = v
+	}
+	stackTyped := make(map[int32]bool, len(l.stackTyped))
+	for k, v := range l.stackTyped {
+		stackTyped[k] = v
+	}
 	calls := make([]ir.Expr, len(l.calls))
 	copy(calls, l.calls)
 	consumed := make(map[ir.Expr]bool, len(l.consumed))
@@ -1620,7 +1630,7 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.addrRegs {
 		addrRegs[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq}
+	return &lifter{regs: regs, stack: stack, stackWidth: stackWidth, stackTyped: stackTyped, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq, x29Offset: l.x29Offset, x29Known: l.x29Known}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1694,21 +1704,10 @@ func (l *lifter) liftCondition(inst native.DetailedInstruction) ir.Expr {
 	// block's body (including its own trailing cmp) before calling
 	// this.
 	op := condOpFromMnemonic(inst.Mnemonic)
-	if l.lastCmp == nil {
-		// No preceding cmp was lifted (e.g. this branch tests flags
-		// from something other than a plain "cmp", like "tst" or an
-		// arithmetic instruction's own flag-setting side effect - not
-		// yet handled) - fall back to a placeholder rather than
-		// guessing operands that would be actively wrong.
+	if op == "?" {
 		return &ir.LocalVar{Name: "cond"}
 	}
-	cmp := &ir.BinaryExpr{Op: op, Left: l.lastCmp.lhs, Right: l.lastCmp.rhs}
-	if l.lastCmp.combine != nil {
-		// A ccmp chain left a conditional-comparison composition behind
-		// - see cmpOperands.combine and liftCcmp's own doc comment.
-		return l.lastCmp.combine(op, cmp)
-	}
-	return cmp
+	return l.flagCondition(op)
 }
 
 // isBooleanExpr reports whether e is already a 0/1-valued boolean
@@ -1786,6 +1785,20 @@ type lifter struct {
 	// reload from the same slot resolves back to the same named
 	// variable instead of inventing a new one.
 	stack map[int32]string
+	// stackWidth records the widest access seen for each stack slot and
+	// feeds basic local type inference when no DWARF type is known.
+	stackWidth map[int32]int
+	// stackTyped marks slots whose type came from DWARF (or FP naming)
+	// and must not be overwritten by the width heuristic.
+	stackTyped map[int32]bool
+
+	// x29Offset/x29Known track the frame pointer's displacement from
+	// the stack base established by "mov x29, sp" / "add x29, sp, #N".
+	// -O0 code addresses locals through x29; mapping those accesses to
+	// the same stack map as sp-relative ones turns them into named
+	// locals instead of raw `*(uint64_t*)((uintptr_t)x29 - 0xN)`.
+	x29Offset int32
+	x29Known  bool
 
 	// params holds the declared parameter names in AAPCS64 register
 	// order, as given to LiftFunction.
@@ -2181,25 +2194,117 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 	for _, inst := range instructions {
 		switch inst.Mnemonic {
 		case "sub":
+			if len(inst.Operands) > 0 && isVectorReg(inst.Operands[0]) {
+				stmts = append(stmts, l.liftVectorBin(inst)...)
+				continue
+			}
 			// "sub sp, sp, #N" is the standard -O0 prologue reserving
 			// stack frame space - not part of the source program's own
 			// logic (no C statement corresponds to it), so it's
 			// recognized and silently skipped rather than lifted into
 			// a meaningless "sp = sp - 16" statement. Any other "sub"
 			// shape is ordinary arithmetic - see liftALU.
+			if off, ok := framePointerSubOffset(inst); ok {
+				l.x29Offset = off
+				l.x29Known = true
+				continue
+			}
 			if isSpAdjust(inst) {
 				continue
 			}
 			stmts = append(stmts, l.liftALU(inst)...)
+		case "subs":
+			stmts = append(stmts, l.liftFlagResult(inst, "-")...)
 		case "add":
+			if len(inst.Operands) > 0 && isVectorReg(inst.Operands[0]) {
+				stmts = append(stmts, l.liftVectorBin(inst)...)
+				continue
+			}
+			if off, ok := framePointerAddOffset(inst); ok {
+				l.x29Offset = off
+				l.x29Known = true
+				continue
+			}
 			if isSpAdjust(inst) {
 				// "add sp, sp, #N" is the matching -O0 epilogue - same
 				// reasoning as the sub case above.
 				continue
 			}
 			stmts = append(stmts, l.liftAdd(inst)...)
-		case "and", "orr", "eor", "mul", "lsl", "lsr", "asr":
+		case "adds":
+			stmts = append(stmts, l.liftFlagResult(inst, "+")...)
+		case "and":
 			stmts = append(stmts, l.liftALU(inst)...)
+		case "ands":
+			stmts = append(stmts, l.liftFlagResult(inst, "&")...)
+		case "orr", "eor", "mul", "udiv", "sdiv", "lsl", "lsr", "asr":
+			stmts = append(stmts, l.liftALU(inst)...)
+		case "fadd", "fsub", "fmul", "fdiv":
+			if len(inst.Operands) > 0 && isVectorReg(inst.Operands[0]) {
+				stmts = append(stmts, l.liftVectorBin(inst)...)
+			} else {
+				stmts = append(stmts, l.liftALU(inst)...)
+			}
+		case "fmla":
+			stmts = append(stmts, l.liftVectorFma(inst, false)...)
+		case "fmls":
+			stmts = append(stmts, l.liftVectorFma(inst, true)...)
+		case "dup":
+			stmts = append(stmts, l.liftVectorDup(inst)...)
+		case "madd":
+			stmts = append(stmts, l.liftMadd(inst, false)...)
+		case "msub":
+			stmts = append(stmts, l.liftMadd(inst, true)...)
+		case "mneg":
+			stmts = append(stmts, l.liftMadd(inst, true)...)
+		case "ubfx":
+			stmts = append(stmts, l.liftBitfield(inst, false)...)
+		case "sbfx":
+			stmts = append(stmts, l.liftBitfield(inst, true)...)
+		case "ubfiz":
+			stmts = append(stmts, l.liftBfiz(inst, false)...)
+		case "sbfiz":
+			stmts = append(stmts, l.liftBfiz(inst, true)...)
+		case "sxtb":
+			stmts = append(stmts, l.liftExtend(inst, &ir.PrimitiveType{Name: "sbyte"})...)
+		case "sxth":
+			stmts = append(stmts, l.liftExtend(inst, &ir.PrimitiveType{Name: "short"})...)
+		case "sxtw":
+			stmts = append(stmts, l.liftExtend(inst, &ir.PrimitiveType{Name: "int"})...)
+		case "uxtb":
+			stmts = append(stmts, l.liftExtend(inst, &ir.PrimitiveType{Name: "byte"})...)
+		case "uxth":
+			stmts = append(stmts, l.liftExtend(inst, &ir.PrimitiveType{Name: "ushort"})...)
+		case "uxtw":
+			stmts = append(stmts, l.liftExtend(inst, &ir.PrimitiveType{Name: "uint"})...)
+		case "tst":
+			l.liftTst(inst)
+		case "cmn":
+			l.liftCmn(inst)
+		case "fcmp", "fcmpe":
+			l.liftFcmp(inst)
+		case "neg":
+			stmts = append(stmts, l.liftNeg(inst, false)...)
+		case "negs":
+			stmts = append(stmts, l.liftNeg(inst, true)...)
+		case "fneg":
+			stmts = append(stmts, l.liftFPUnary(inst, false)...)
+		case "fabs":
+			stmts = append(stmts, l.liftFPUnary(inst, true)...)
+		case "bics":
+			stmts = append(stmts, l.liftBics(inst)...)
+		case "extr":
+			stmts = append(stmts, l.liftExtr(inst)...)
+		case "scvtf", "ucvtf":
+			stmts = append(stmts, l.liftFPConvertToFloat(inst)...)
+		case "fcvtzs":
+			stmts = append(stmts, l.liftFPConvertToInt(inst, true)...)
+		case "fcvtzu":
+			stmts = append(stmts, l.liftFPConvertToInt(inst, false)...)
+		case "fmov":
+			stmts = append(stmts, l.liftFmov(inst)...)
+		case "movz", "movk", "movn":
+			stmts = append(stmts, l.liftMovWide(inst)...)
 		case "adrp", "adr":
 			stmts = append(stmts, l.liftAddr(inst)...)
 		case "stp":
@@ -2208,18 +2313,25 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			// pointer and return address before establishing this
 			// function's own frame) - not part of the source program's
 			// own logic, same reasoning as the sub/sp-adjust prologue
-			// case above. Any other "stp" shape is deliberately NOT
-			// specially handled yet - falls through unlifted; see the
-			// TODO at the bottom of this file.
+			// case above. Every other pair is a real two-register
+			// memory access.
 			if isFramePointerSave(inst) {
 				continue
 			}
+			if isCalleeSavedPair(inst) {
+				continue
+			}
+			stmts = append(stmts, l.liftPair(inst, false)...)
 		case "ldp":
 			// "ldp x29, x30, [sp], #N" is the matching -O0
 			// frame-pointer epilogue - same reasoning as stp above.
 			if isFramePointerRestore(inst) {
 				continue
 			}
+			if isCalleeSavedPair(inst) {
+				continue
+			}
+			stmts = append(stmts, l.liftPair(inst, true)...)
 		case "mov":
 			// "mov x29, sp" (establishing the frame pointer, standard
 			// -O0 prologue) has no source-level meaning of its own -
@@ -2227,15 +2339,53 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			// genuine register-to-register or register-immediate move;
 			// see liftMov.
 			if isFramePointerEstablish(inst) {
+				l.x29Offset = 0
+				l.x29Known = true
 				continue
 			}
 			stmts = append(stmts, l.liftMov(inst)...)
-		case "str":
-			stmts = append(stmts, l.liftStr(inst)...)
-		case "ldr":
-			stmts = append(stmts, l.liftLdr(inst)...)
+		case "str", "stur", "strb", "strh", "sturb", "sturh", "stlr":
+			stmts = append(stmts, l.liftStore(inst, accessWidth(inst))...)
+		case "stxr", "stlxr", "stxrb", "stxrh", "stlxrb", "stlxrh":
+			width := 8
+			if len(inst.Operands) > 1 && inst.Operands[1].Type == native.OperandReg {
+				width = regWidth(inst.Operands[1].Reg)
+			}
+			switch inst.Mnemonic {
+			case "stxrb", "stlxrb":
+				width = 1
+			case "stxrh", "stlxrh":
+				width = 2
+			}
+			stmts = append(stmts, l.liftStoreExclusive(inst, width)...)
+		case "cas", "casa", "casl", "casal", "casb", "cash":
+			width := 8
+			if len(inst.Operands) > 0 && inst.Operands[0].Type == native.OperandReg {
+				width = regWidth(inst.Operands[0].Reg)
+			}
+			switch inst.Mnemonic {
+			case "casb":
+				width = 1
+			case "cash":
+				width = 2
+			}
+			stmts = append(stmts, l.liftCas(inst, width)...)
+		case "ld1":
+			stmts = append(stmts, l.liftVectorList(inst, true)...)
+		case "st1":
+			stmts = append(stmts, l.liftVectorList(inst, false)...)
+		case "ldr", "ldur", "ldrb", "ldrh", "ldurb", "ldurh", "ldar", "ldaxr", "ldxr", "ldaxrb", "ldaxrh", "ldxrb", "ldxrh":
+			stmts = append(stmts, l.liftLoad(inst, accessWidth(inst), nil)...)
+		case "ldrsb":
+			stmts = append(stmts, l.liftLoad(inst, 1, &ir.PrimitiveType{Name: "sbyte"})...)
+		case "ldrsh":
+			stmts = append(stmts, l.liftLoad(inst, 2, &ir.PrimitiveType{Name: "short"})...)
+		case "ldrsw":
+			stmts = append(stmts, l.liftLoad(inst, 4, &ir.PrimitiveType{Name: "int"})...)
 		case "cmp", "ccmp":
 			l.liftCmp(inst)
+		case "csel", "csinc", "csinv", "csneg", "fcsel":
+			stmts = append(stmts, l.liftCsel(inst)...)
 		case "bl":
 			stmts = append(stmts, l.liftCall(inst)...)
 		case "blr":
@@ -2257,9 +2407,62 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			// liftBr's own doc comment.
 			stmts = append(stmts, l.liftBr(inst)...)
 		}
+
+		// A flag-writing instruction this lifter doesn't understand
+		// invalidates the comparison snapshot a later b.cond/csel/cset
+		// would otherwise read, which could silently turn the branch
+		// into a test of an older, unrelated comparison. Clear it so
+		// the condition degrades to the explicit "cond" placeholder
+		// instead of a wrong expression.
+		if inst.WritesFlags && !handlesFlags(inst.Mnemonic) {
+			l.lastCmp = nil
+		}
 	}
 
 	return stmts
+}
+
+// handlesFlags reports whether run() has an explicit lift for an
+// instruction that writes NZCV. Anything else that writes flags clears
+// the lastCmp snapshot (see run) so a later b.cond/csel/cset cannot
+// silently test an older comparison.
+func handlesFlags(mnemonic string) bool {
+	switch mnemonic {
+	case "cmp", "ccmp", "cmn", "tst", "subs", "adds", "ands", "negs", "bics", "fcmp", "fcmpe":
+		return true
+	}
+	return false
+}
+
+// isCalleeSavedPair reports whether inst is a stp/ldp of two
+// callee-saved integer registers to/from the stack - the standard -O0
+// prologue/epilogue spill, which has no source-level equivalent (same
+// reasoning as isFramePointerSave/Restore, just for x19-x28).
+func isCalleeSavedPair(inst native.DetailedInstruction) bool {
+	if len(inst.Operands) < 3 {
+		return false
+	}
+	if inst.Operands[0].Type != native.OperandReg || inst.Operands[1].Type != native.OperandReg {
+		return false
+	}
+	if inst.Operands[2].Type != native.OperandMem || inst.Operands[2].Mem.Base != "sp" {
+		return false
+	}
+	return isCalleeSavedReg(inst.Operands[0].Reg) && isCalleeSavedReg(inst.Operands[1].Reg)
+}
+
+func isCalleeSavedReg(reg string) bool {
+	if len(reg) < 2 || (reg[0] != 'x' && reg[0] != 'w') {
+		return false
+	}
+	n := 0
+	for _, c := range reg[1:] {
+		if c < '0' || c > '9' {
+			return false
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n >= 19 && n <= 28
 }
 
 // isSpAdjust reports whether inst is "{add,sub} sp, sp, #N" - the
@@ -2317,6 +2520,51 @@ func isFramePointerRestore(inst native.DetailedInstruction) bool {
 		return false
 	}
 	return inst.Operands[3].Type == native.OperandImm
+}
+
+// stackSlotDisp returns the sp-relative stack displacement for an
+// access through sp or a known frame pointer (x29). Indexed accesses
+// are not stack slots.
+func (l *lifter) stackSlotDisp(base string, mem native.MemOperand) (int32, bool) {
+	if mem.Index != "" {
+		return 0, false
+	}
+	switch {
+	case base == "sp":
+		return mem.Disp, true
+	case base == "x29" && l.x29Known:
+		return l.x29Offset + mem.Disp, true
+	default:
+		return 0, false
+	}
+}
+
+// framePointerAddOffset recognizes the -O0 frame-pointer setup
+// "add x29, sp, #imm" and returns imm.
+func framePointerAddOffset(inst native.DetailedInstruction) (int32, bool) {
+	if len(inst.Operands) != 3 {
+		return 0, false
+	}
+	if inst.Operands[0].Type != native.OperandReg || inst.Operands[0].Reg != "x29" {
+		return 0, false
+	}
+	if inst.Operands[1].Type != native.OperandReg || inst.Operands[1].Reg != "sp" {
+		return 0, false
+	}
+	if inst.Operands[2].Type != native.OperandImm {
+		return 0, false
+	}
+	return int32(inst.Operands[2].Imm), true
+}
+
+// framePointerSubOffset recognizes "sub x29, sp, #imm" (frame pointer
+// below the current stack base) and returns -imm.
+func framePointerSubOffset(inst native.DetailedInstruction) (int32, bool) {
+	off, ok := framePointerAddOffset(inst)
+	if !ok {
+		return 0, false
+	}
+	return -off, true
 }
 
 // isFramePointerEstablish reports whether inst is "mov x29, sp" -
@@ -2378,7 +2626,12 @@ func isFramePointerEstablish(inst native.DetailedInstruction) bool {
 // consume here: its presence in the output is guaranteed the moment
 // this function returns, unlike a register merely holding a value that
 // might go unread later.
-func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
+//
+// width is the access width in bytes (1/2/4/8): the plain str/stur
+// forms pass the source register's width, while strb/strh override it.
+// The non-stack path also accepts register-indexed addressing
+// ("[Rn, Rm]" / "[Rn, Rm, lsl #N]").
+func (l *lifter) liftStr(inst native.DetailedInstruction, width int) []ir.Stmt {
 	if len(inst.Operands) != 2 {
 		return nil
 	}
@@ -2386,13 +2639,10 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 	if srcOp.Type != native.OperandReg || dstOp.Type != native.OperandMem {
 		return nil
 	}
-	if dstOp.Mem.Index != "" {
-		return nil
-	}
 	srcVal := l.regValue(srcOp.Reg)
+	ctype := fpCType(srcOp.Reg)
 
-	if dstOp.Mem.Base == "sp" {
-		disp := dstOp.Mem.Disp
+	if disp, ok := l.stackSlotDisp(dstOp.Mem.Base, dstOp.Mem); ok {
 		name, exists := l.stack[disp]
 		if !exists {
 			if lv, ok := srcVal.(*ir.LocalVar); ok && l.isParam(lv.Name) {
@@ -2405,6 +2655,22 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 			}
 			l.stack[disp] = name
 		}
+		if ctype != "" {
+			name = fpStackName(disp, ctype)
+			l.stack[disp] = name
+			l.stackTyped[disp] = true
+		}
+		if dstOp.Mem.Base == "x29" && l.opts.Debug != nil {
+			if dname, dtype, ok := l.opts.Debug.LocalAt(int64(dstOp.Mem.Disp)); ok {
+				name = dname
+				l.stack[disp] = name
+				l.stackTyped[disp] = true
+				if dtype != "" && l.opts.LocalTypes != nil {
+					l.opts.LocalTypes[name] = dtype
+				}
+			}
+		}
+		l.noteStackWidth(disp, width)
 		l.consume(srcVal)
 		return []ir.Stmt{&ir.AssignStmt{Target: &ir.LocalVar{Name: name}, Value: srcVal}}
 	}
@@ -2418,10 +2684,12 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 	// text is guaranteed to appear in this unconditionally-returned
 	// statement. memBaseExpr (see its own doc comment) keeps a
 	// constant/zero base from rendering as a literal `.field_N`.
-	base := l.memBaseExpr(dstOp.Mem.Base)
-	l.consume(base)
+	target := l.memoryAccessTarget(dstOp.Mem.Base, dstOp.Mem, width, true)
+	if target == nil {
+		return nil
+	}
+	setAccessCType(target, ctype)
 	l.consume(srcVal)
-	target := l.newFieldAccessOn(base, dstOp.Mem.Disp, regWidth(srcOp.Reg))
 	return []ir.Stmt{&ir.AssignStmt{Target: target, Value: srcVal}}
 }
 
@@ -2481,7 +2749,12 @@ func (l *lifter) liftStr(inst native.DetailedInstruction) []ir.Stmt {
 // whatever the load actually produced, so leaving its old IR value in
 // place would misrepresent it as still holding that stale value rather
 // than an unknown freshly-loaded one.
-func (l *lifter) liftLdr(inst native.DetailedInstruction) []ir.Stmt {
+//
+// width is the access width in bytes (1/2/4/8): the plain ldr/ldur
+// forms pass the destination register's width, while ldrb/ldrh override
+// it. The non-stack path also accepts register-indexed addressing
+// ("[Rn, Rm]" / "[Rn, Rm, lsl #N]").
+func (l *lifter) liftLdr(inst native.DetailedInstruction, width int, cast ir.Type) []ir.Stmt {
 	if len(inst.Operands) != 2 {
 		return nil
 	}
@@ -2489,39 +2762,885 @@ func (l *lifter) liftLdr(inst native.DetailedInstruction) []ir.Stmt {
 	if dstOp.Type != native.OperandReg || srcOp.Type != native.OperandMem {
 		return nil
 	}
-	if srcOp.Mem.Index != "" {
-		return nil
+	wrap := func(e ir.Expr) ir.Expr {
+		if e == nil || cast == nil {
+			return e
+		}
+		return &ir.CastExpr{Type: cast, Expr: e}
 	}
+	ctype := fpCType(dstOp.Reg)
 
-	if srcOp.Mem.Base == "sp" {
-		if name, ok := l.stack[srcOp.Mem.Disp]; ok {
-			return l.setReg(dstOp.Reg, &ir.LocalVar{Name: name})
+	if disp, ok := l.stackSlotDisp(srcOp.Mem.Base, srcOp.Mem); ok {
+		if srcOp.Mem.Base == "x29" && l.opts.Debug != nil {
+			if dname, dtype, ok := l.opts.Debug.LocalAt(int64(srcOp.Mem.Disp)); ok {
+				l.stack[disp] = dname
+				l.stackTyped[disp] = true
+				if dtype != "" && l.opts.LocalTypes != nil {
+					l.opts.LocalTypes[dname] = dtype
+				}
+				l.noteStackWidth(disp, width)
+				return l.setReg(dstOp.Reg, wrap(&ir.LocalVar{Name: dname}))
+			}
+		}
+		if name, ok := l.stack[disp]; ok {
+			if ctype != "" && !strings.HasPrefix(name, "flocal_") && !strings.HasPrefix(name, "dlocal_") {
+				name = fpStackName(disp, ctype)
+				l.stack[disp] = name
+				l.stackTyped[disp] = true
+			}
+			l.noteStackWidth(disp, width)
+			return l.setReg(dstOp.Reg, wrap(&ir.LocalVar{Name: name}))
+		}
+		if ctype != "" {
+			name := fpStackName(disp, ctype)
+			l.stack[disp] = name
+			l.stackTyped[disp] = true
+			l.noteStackWidth(disp, width)
+			return l.setReg(dstOp.Reg, wrap(&ir.LocalVar{Name: name}))
 		}
 		return l.clobberReg(dstOp.Reg)
 	}
 
-	if base, ok := l.addrRegs[srcOp.Mem.Base]; ok && l.resolver != nil {
-		addr := base + uint64(srcOp.Mem.Disp)
-		if name, ok := l.resolver(addr); ok {
-			name = demangle(name)
-			// Section-relative labels (".data+0x0", ".got+0x8") are
-			// addresses, not variables: keep the numeric value too so
-			// the C renderer can spell them as ((uintptr_t)0x...).
-			// Plain symbol names stay LocalVars, preserving the
-			// resolved-name rendering existing callers expect.
-			if isSectionLabel(name) {
-				return l.setReg(dstOp.Reg, &ir.AddrLit{Value: addr, Label: name})
+	if srcOp.Mem.Index == "" {
+		if base, ok := l.addrRegs[srcOp.Mem.Base]; ok && l.resolver != nil {
+			addr := base + uint64(srcOp.Mem.Disp)
+			if name, ok := l.resolver(addr); ok {
+				name = demangle(name)
+				// Section-relative labels (".data+0x0", ".got+0x8") are
+				// addresses, not variables: keep the numeric value too so
+				// the C renderer can spell them as ((uintptr_t)0x...).
+				// Plain symbol names stay LocalVars, preserving the
+				// resolved-name rendering existing callers expect.
+				if isSectionLabel(name) {
+					return l.setReg(dstOp.Reg, wrap(&ir.AddrLit{Value: addr, Label: name}))
+				}
+				return l.setReg(dstOp.Reg, wrap(&ir.LocalVar{Name: name}))
 			}
-			return l.setReg(dstOp.Reg, &ir.LocalVar{Name: name})
 		}
 	}
 
 	if srcOp.Mem.Base != "" {
-		val := l.newFieldAccessOn(l.memBaseExpr(srcOp.Mem.Base), srcOp.Mem.Disp, regWidth(dstOp.Reg))
-		return l.setReg(dstOp.Reg, val)
+		val := l.memoryAccessTarget(srcOp.Mem.Base, srcOp.Mem, width, false)
+		if val != nil {
+			setAccessCType(val, ctype)
+			return l.setReg(dstOp.Reg, wrap(val))
+		}
+		return l.clobberReg(dstOp.Reg)
 	}
 
 	return l.clobberReg(dstOp.Reg)
+}
+
+// applyWriteback updates a non-stack base register after a pre/post-
+// indexed load/store. The stack pointer is deliberately excluded: this
+// lifter models sp-relative slots by their raw displacement rather than
+// maintaining a running sp value.
+func (l *lifter) applyWriteback(inst native.DetailedInstruction, mem native.MemOperand) []ir.Stmt {
+	if !inst.Writeback || mem.Base == "" || mem.Base == "sp" || mem.Base == "x29" {
+		return nil
+	}
+	disp := mem.Disp
+	if inst.PostIndex {
+		disp = 0
+		for i := len(inst.Operands) - 1; i >= 0; i-- {
+			if inst.Operands[i].Type == native.OperandImm {
+				disp = int32(inst.Operands[i].Imm)
+				break
+			}
+		}
+	}
+	if disp == 0 {
+		return nil
+	}
+	base := l.memBaseExpr(mem.Base)
+	val := &ir.BinaryExpr{Op: "+", Left: base, Right: &ir.IntLit{Value: int64(disp)}}
+	return l.setReg(mem.Base, val)
+}
+
+// liftLoad is liftLdr plus any pre/post-indexed base-register update.
+func (l *lifter) liftLoad(inst native.DetailedInstruction, width int, cast ir.Type) []ir.Stmt {
+	stmts := l.liftLdr(inst, width, cast)
+	if len(inst.Operands) >= 2 && inst.Operands[1].Type == native.OperandMem {
+		stmts = append(stmts, l.applyWriteback(inst, inst.Operands[1].Mem)...)
+	}
+	return stmts
+}
+
+// liftStore is liftStr plus any pre/post-indexed base-register update.
+func (l *lifter) liftStore(inst native.DetailedInstruction, width int) []ir.Stmt {
+	stmts := l.liftStr(inst, width)
+	if len(inst.Operands) >= 2 && inst.Operands[1].Type == native.OperandMem {
+		stmts = append(stmts, l.applyWriteback(inst, inst.Operands[1].Mem)...)
+	}
+	return stmts
+}
+
+// pairElementInst adapts one half of an ldp/stp into the single-register
+// instruction liftLdr/liftStr already know how to lift.
+func pairElementInst(mnemonic string, reg native.Operand, mem native.MemOperand) native.DetailedInstruction {
+	return native.DetailedInstruction{
+		Mnemonic: mnemonic,
+		Operands: []native.Operand{
+			reg,
+			{Type: native.OperandMem, Mem: mem},
+		},
+	}
+}
+
+// liftPair lifts a general "ldp/stp Rt, Rt2, [Rn, #disp]" (including
+// register-indexed and writeback forms). The two accesses are widened
+// into the existing single-register lifters, so stack slots, field
+// accesses, byte/halfword widths and indexed addressing all behave the
+// same way they do for ldr/str.
+func (l *lifter) liftPair(inst native.DetailedInstruction, load bool) []ir.Stmt {
+	if len(inst.Operands) < 3 {
+		return nil
+	}
+	reg1, reg2, memOp := inst.Operands[0], inst.Operands[1], inst.Operands[2]
+	if reg1.Type != native.OperandReg || reg2.Type != native.OperandReg || memOp.Type != native.OperandMem {
+		return nil
+	}
+
+	mem1 := memOp.Mem
+	mem2 := memOp.Mem
+	mem2.Disp += int32(regWidth(reg1.Reg))
+
+	var stmts []ir.Stmt
+	if !load || !isZeroReg(reg1.Reg) {
+		if load {
+			stmts = append(stmts, l.liftLdr(pairElementInst("ldr", reg1, mem1), regWidth(reg1.Reg), nil)...)
+		} else {
+			stmts = append(stmts, l.liftStr(pairElementInst("str", reg1, mem1), regWidth(reg1.Reg))...)
+		}
+	}
+	if !load || !isZeroReg(reg2.Reg) {
+		if load {
+			stmts = append(stmts, l.liftLdr(pairElementInst("ldr", reg2, mem2), regWidth(reg2.Reg), nil)...)
+		} else {
+			stmts = append(stmts, l.liftStr(pairElementInst("str", reg2, mem2), regWidth(reg2.Reg))...)
+		}
+	}
+	stmts = append(stmts, l.applyWriteback(inst, memOp.Mem)...)
+	return stmts
+}
+
+// liftStoreExclusive lifts "stxr/stlxr Wstatus, Rt, [Rn]" by emitting a
+// zero success status and the actual store. The loop/retry logic around
+// it is not reconstructed, but the memory side effect and status are
+// preserved.
+func (l *lifter) liftStoreExclusive(inst native.DetailedInstruction, width int) []ir.Stmt {
+	if len(inst.Operands) < 3 {
+		return nil
+	}
+	status, src, memOp := inst.Operands[0], inst.Operands[1], inst.Operands[2]
+	if status.Type != native.OperandReg || src.Type != native.OperandReg || memOp.Type != native.OperandMem {
+		return nil
+	}
+
+	var stmts []ir.Stmt
+	if !isZeroReg(status.Reg) {
+		stmts = append(stmts, l.setReg(status.Reg, &ir.IntLit{Value: 0})...)
+		stmts = append(stmts, &ir.AssignStmt{
+			Target: &ir.LocalVar{Name: l.regName(status.Reg)},
+			Value:  &ir.IntLit{Value: 0},
+		})
+	}
+	stmts = append(stmts, l.liftStr(pairElementInst("str", src, memOp.Mem), width)...)
+	stmts = append(stmts, l.applyWriteback(inst, memOp.Mem)...)
+	return stmts
+}
+
+// liftCas lifts the compare-and-swap family:
+//
+//	if (*mem == expected) *mem = desired;
+//	else expected = *mem;
+//
+// The acquire/release suffix variants (casa/casal/casl) have the same
+// source-level shape; ordering semantics remain implicit.
+func (l *lifter) liftCas(inst native.DetailedInstruction, width int) []ir.Stmt {
+	if len(inst.Operands) < 3 {
+		return nil
+	}
+	expectedOp, desiredOp, memOp := inst.Operands[0], inst.Operands[1], inst.Operands[2]
+	if expectedOp.Type != native.OperandReg || desiredOp.Type != native.OperandReg || memOp.Type != native.OperandMem {
+		return nil
+	}
+	expected := l.regValue(expectedOp.Reg)
+	desired := l.regValue(desiredOp.Reg)
+	l.consume(expected)
+	l.consume(desired)
+
+	read := l.memoryAccessTarget(memOp.Mem.Base, memOp.Mem, width, true)
+	write := l.memoryAccessTarget(memOp.Mem.Base, memOp.Mem, width, true)
+	reload := l.memoryAccessTarget(memOp.Mem.Base, memOp.Mem, width, true)
+	if read == nil || write == nil || reload == nil {
+		return nil
+	}
+
+	then := &ir.Block{Statements: []ir.Stmt{&ir.AssignStmt{Target: write, Value: desired}}}
+	var els *ir.Block
+	if !isZeroReg(expectedOp.Reg) {
+		els = &ir.Block{Statements: []ir.Stmt{&ir.AssignStmt{
+			Target: &ir.LocalVar{Name: l.regName(expectedOp.Reg)},
+			Value:  reload,
+		}}}
+	}
+	return []ir.Stmt{&ir.IfStmt{
+		Cond: &ir.BinaryExpr{Op: "==", Left: read, Right: expected},
+		Then: then,
+		Else: els,
+	}}
+}
+
+// explicit so C's usual integer promotions do the sign/zero extension.
+func (l *lifter) liftExtend(inst native.DetailedInstruction, cast ir.Type) []ir.Stmt {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg || inst.Operands[1].Type != native.OperandReg {
+		return nil
+	}
+	val := l.regValue(inst.Operands[1].Reg)
+	l.consume(val)
+	return l.setReg(inst.Operands[0].Reg, &ir.CastExpr{Type: cast, Expr: val})
+}
+
+// liftMadd lifts "madd Rd, Rn, Rm, Ra" (Rn*Rm + Ra) and the msub
+// variant (Rn*Rm - Ra).
+func (l *lifter) liftMadd(inst native.DetailedInstruction, negate bool) []ir.Stmt {
+	if inst.Mnemonic == "mneg" {
+		if len(inst.Operands) != 3 {
+			return nil
+		}
+		dst, rn, rm := inst.Operands[0], inst.Operands[1], inst.Operands[2]
+		if dst.Type != native.OperandReg || rn.Type != native.OperandReg || rm.Type != native.OperandReg {
+			return nil
+		}
+		a := l.regValue(rn.Reg)
+		b := l.regValue(rm.Reg)
+		l.consume(a)
+		l.consume(b)
+		return l.setReg(dst.Reg, &ir.UnaryExpr{Op: "-", Expr: &ir.BinaryExpr{Op: "*", Left: a, Right: b}})
+	}
+	if len(inst.Operands) != 4 {
+		return nil
+	}
+	dst, rn, rm, ra := inst.Operands[0], inst.Operands[1], inst.Operands[2], inst.Operands[3]
+	if dst.Type != native.OperandReg || rn.Type != native.OperandReg || rm.Type != native.OperandReg || ra.Type != native.OperandReg {
+		return nil
+	}
+	a := l.regValue(rn.Reg)
+	b := l.regValue(rm.Reg)
+	c := l.regValue(ra.Reg)
+	l.consume(a)
+	l.consume(b)
+	l.consume(c)
+	product := &ir.BinaryExpr{Op: "*", Left: a, Right: b}
+	op := "+"
+	if negate {
+		op = "-"
+	}
+	return l.setReg(dst.Reg, &ir.BinaryExpr{Op: op, Left: product, Right: c})
+}
+
+// isVectorReg reports whether an operand is a SIMD vector register as
+// Capstone exposes it (qN).
+func isVectorReg(op native.Operand) bool {
+	return op.Type == native.OperandReg && len(op.Reg) >= 2 && op.Reg[0] == 'q'
+}
+
+// vectorLayout extracts the arrangement suffix (4s, 2d, 16b, ...) from
+// an instruction's textual operand list.
+func vectorLayout(opstr string) string {
+	for _, layout := range []string{"16b", "8h", "4s", "2d", "8b", "4h", "2s", "1d"} {
+		if strings.Contains(opstr, "."+layout) {
+			return layout
+		}
+	}
+	return ""
+}
+
+// liftVectorBin lifts lane-wise vector add/sub/mul/div through the
+// eni_v* helper functions emitted in the file preamble.
+func (l *lifter) liftVectorBin(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 3 || !isVectorReg(inst.Operands[0]) ||
+		!isVectorReg(inst.Operands[1]) || !isVectorReg(inst.Operands[2]) {
+		return nil
+	}
+	layout := vectorLayout(inst.OpStr)
+	if layout == "" {
+		return nil
+	}
+	suffix := ""
+	isFP := inst.Mnemonic == "fadd" || inst.Mnemonic == "fsub" || inst.Mnemonic == "fmul" || inst.Mnemonic == "fdiv"
+	if isFP {
+		switch layout {
+		case "4s":
+			suffix = "F32X4"
+		case "2d":
+			suffix = "F64X2"
+		default:
+			return nil
+		}
+	} else {
+		switch layout {
+		case "4s":
+			suffix = "U32X4"
+		case "2d":
+			suffix = "U64X2"
+		case "16b":
+			suffix = "U8X16"
+		case "8h":
+			suffix = "U16X8"
+		default:
+			return nil
+		}
+	}
+	prefix := ""
+	switch inst.Mnemonic {
+	case "fadd", "add":
+		prefix = "ENI_VADD_"
+	case "fsub", "sub":
+		prefix = "ENI_VSUB_"
+	case "fmul":
+		prefix = "ENI_VMUL_"
+	case "fdiv":
+		prefix = "ENI_VDIV_"
+	default:
+		return nil
+	}
+	if (suffix == "U8X16" || suffix == "U16X8") && (inst.Mnemonic == "fmul" || inst.Mnemonic == "fdiv") {
+		return nil
+	}
+	a := l.regValue(inst.Operands[1].Reg)
+	b := l.regValue(inst.Operands[2].Reg)
+	l.consume(a)
+	l.consume(b)
+	return l.setReg(inst.Operands[0].Reg, &ir.StaticMethodCall{
+		Method: prefix + suffix,
+		Args:   []ir.Expr{a, b},
+	})
+}
+
+// liftVectorFma lifts fmla/fmls: Rd = Rd ± Rn*Rm, lane-wise.
+func (l *lifter) liftVectorFma(inst native.DetailedInstruction, negate bool) []ir.Stmt {
+	if len(inst.Operands) != 3 || !isVectorReg(inst.Operands[0]) ||
+		!isVectorReg(inst.Operands[1]) || !isVectorReg(inst.Operands[2]) {
+		return nil
+	}
+	layout := vectorLayout(inst.OpStr)
+	suffix := ""
+	switch layout {
+	case "4s":
+		suffix = "F32X4"
+	case "2d":
+		suffix = "F64X2"
+	default:
+		return nil
+	}
+	acc := l.regValue(inst.Operands[0].Reg)
+	a := l.regValue(inst.Operands[1].Reg)
+	b := l.regValue(inst.Operands[2].Reg)
+	l.consume(acc)
+	l.consume(a)
+	l.consume(b)
+	name := "ENI_VFMA_" + suffix
+	if negate {
+		name = "ENI_VFMS_" + suffix
+	}
+	return l.setReg(inst.Operands[0].Reg, &ir.StaticMethodCall{
+		Method: name,
+		Args:   []ir.Expr{acc, a, b},
+	})
+}
+
+// liftVectorDup lifts "dup vD.<arr>, Rn" by broadcasting the scalar
+// into every lane.
+func (l *lifter) liftVectorDup(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 2 || !isVectorReg(inst.Operands[0]) {
+		return nil
+	}
+	suffix := ""
+	switch vectorLayout(inst.OpStr) {
+	case "16b":
+		suffix = "U8X16"
+	case "8h":
+		suffix = "U16X8"
+	case "4s":
+		suffix = "U32X4"
+	case "2d":
+		suffix = "U64X2"
+	default:
+		return nil
+	}
+	var val ir.Expr
+	switch inst.Operands[1].Type {
+	case native.OperandReg:
+		val = l.regValue(inst.Operands[1].Reg)
+		l.consume(val)
+	case native.OperandImm:
+		val = &ir.IntLit{Value: inst.Operands[1].Imm}
+	default:
+		return nil
+	}
+	return l.setReg(inst.Operands[0].Reg, &ir.StaticMethodCall{
+		Method: "ENI_VDUP_" + suffix,
+		Args:   []ir.Expr{val},
+	})
+}
+
+// liftVectorList lifts ld1/st1 with one or more vector registers. The
+// post-index offset is carried in Mem.Disp by Capstone for these forms.
+func (l *lifter) liftVectorList(inst native.DetailedInstruction, load bool) []ir.Stmt {
+	memIdx := -1
+	var mem native.MemOperand
+	for i, op := range inst.Operands {
+		if op.Type == native.OperandMem {
+			memIdx = i
+			mem = op.Mem
+			break
+		}
+	}
+	if memIdx < 1 {
+		return nil
+	}
+	regs := inst.Operands[:memIdx]
+	for _, reg := range regs {
+		if reg.Type != native.OperandReg {
+			return nil
+		}
+	}
+
+	accessDisp := mem.Disp
+	if inst.PostIndex {
+		accessDisp = 0
+	}
+	var stmts []ir.Stmt
+	total := 0
+	for _, reg := range regs {
+		width := regWidth(reg.Reg)
+		m := mem
+		m.Disp = accessDisp + int32(total)
+		if load {
+			stmts = append(stmts, l.liftLdr(pairElementInst("ldr", reg, m), width, nil)...)
+		} else {
+			stmts = append(stmts, l.liftStr(pairElementInst("str", reg, m), width)...)
+		}
+		total += width
+	}
+
+	if inst.Writeback && mem.Base != "" && mem.Base != "sp" && mem.Base != "x29" {
+		disp := mem.Disp
+		if disp == 0 && inst.PostIndex {
+			disp = int32(total)
+		}
+		if disp != 0 {
+			base := l.memBaseExpr(mem.Base)
+			stmts = append(stmts, l.setReg(mem.Base, &ir.BinaryExpr{
+				Op:    "+",
+				Left:  base,
+				Right: &ir.IntLit{Value: int64(disp)},
+			})...)
+		}
+	}
+	return stmts
+}
+
+// Rn + rhs). A following b.cond tests the sum against zero.
+func (l *lifter) liftCmn(inst native.DetailedInstruction) {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg {
+		return
+	}
+	lhs := l.regValue(inst.Operands[0].Reg)
+	l.consume(lhs)
+	rhs := l.operandValue(inst.Operands[1])
+	if rhs == nil {
+		l.lastCmp = nil
+		return
+	}
+	l.lastCmp = &cmpOperands{
+		lhs: &ir.BinaryExpr{Op: "+", Left: lhs, Right: rhs},
+		rhs: &ir.IntLit{Value: 0},
+	}
+}
+
+// liftFcmp lifts "fcmp/fcmpe Rn, Rm" into the same comparison
+// snapshot liftCmp uses; a following b.eq/b.ne/b.lt/... tests it.
+func (l *lifter) liftFcmp(inst native.DetailedInstruction) {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg {
+		return
+	}
+	lhs := l.regValue(inst.Operands[0].Reg)
+	l.consume(lhs)
+	var rhs ir.Expr
+	switch inst.Operands[1].Type {
+	case native.OperandReg:
+		rhs = l.regValue(inst.Operands[1].Reg)
+		l.consume(rhs)
+	case native.OperandFP:
+		rhs = fpLit(inst.Operands[0].Reg, inst.Operands[1].FP)
+	default:
+		l.lastCmp = nil
+		return
+	}
+	l.lastCmp = &cmpOperands{lhs: lhs, rhs: rhs}
+}
+
+// liftFPUnary lifts fneg/fabs on FP registers. fabs has no IR node, so
+// it renders as the equivalent "< 0 ? -x : x" ternary.
+func (l *lifter) liftFPUnary(inst native.DetailedInstruction, abs bool) []ir.Stmt {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg || inst.Operands[1].Type != native.OperandReg {
+		return nil
+	}
+	dst, src := inst.Operands[0], inst.Operands[1]
+	val := l.regValue(src.Reg)
+	l.consume(val)
+	if !abs {
+		return l.setReg(dst.Reg, &ir.UnaryExpr{Op: "-", Expr: val})
+	}
+	zero := fpLit(dst.Reg, 0)
+	return l.setReg(dst.Reg, &ir.TernaryExpr{
+		Cond:      &ir.BinaryExpr{Op: "<", Left: val, Right: zero},
+		TrueExpr:  &ir.UnaryExpr{Op: "-", Expr: val},
+		FalseExpr: val,
+	})
+}
+
+// liftFPConvertToFloat lifts scvtf/ucvtf from an integer register into
+// sN/dN.
+func (l *lifter) liftFPConvertToFloat(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg || inst.Operands[1].Type != native.OperandReg {
+		return nil
+	}
+	dst := inst.Operands[0]
+	ctype := fpCType(dst.Reg)
+	if ctype == "" {
+		return nil
+	}
+	val := l.regValue(inst.Operands[1].Reg)
+	l.consume(val)
+	return l.setReg(dst.Reg, &ir.CastExpr{Type: &ir.PrimitiveType{Name: ctype}, Expr: val})
+}
+
+// liftFPConvertToInt lifts fcvtzs/fcvtzu from sN/dN into an integer
+// register.
+func (l *lifter) liftFPConvertToInt(inst native.DetailedInstruction, signed bool) []ir.Stmt {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg || inst.Operands[1].Type != native.OperandReg {
+		return nil
+	}
+	dst, src := inst.Operands[0], inst.Operands[1]
+	if fpCType(src.Reg) == "" || len(dst.Reg) < 2 {
+		return nil
+	}
+	name := "long"
+	switch dst.Reg[0] {
+	case 'w':
+		name = "int"
+	case 'x':
+		name = "long"
+	default:
+		return nil
+	}
+	if !signed {
+		if name == "int" {
+			name = "uint"
+		} else {
+			name = "ulong"
+		}
+	}
+	val := l.regValue(src.Reg)
+	l.consume(val)
+	return l.setReg(dst.Reg, &ir.CastExpr{Type: &ir.PrimitiveType{Name: name}, Expr: val})
+}
+
+// liftFmov lifts register-register and immediate forms, plus the
+// integer<->FP bitcast forms through the ENI_BITCAST_* macros.
+func (l *lifter) liftFmov(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg {
+		return nil
+	}
+	dst := inst.Operands[0]
+	dstCT := fpCType(dst.Reg)
+	src := inst.Operands[1]
+
+	switch src.Type {
+	case native.OperandFP:
+		if dstCT == "" {
+			return nil
+		}
+		return l.setReg(dst.Reg, fpLit(dst.Reg, src.FP))
+	case native.OperandReg:
+		srcCT := fpCType(src.Reg)
+		if srcCT != "" && dstCT != "" && srcCT == dstCT {
+			val := l.regValue(src.Reg)
+			l.consume(val)
+			return l.setReg(dst.Reg, val)
+		}
+		if dstCT == "" && srcCT == "" {
+			return l.liftMov(inst)
+		}
+		val := l.regValue(src.Reg)
+		l.consume(val)
+		macro := ""
+		switch {
+		case dst.Reg[0] == 's' && src.Reg[0] == 'w':
+			macro = "ENI_BITCAST_F32"
+		case dst.Reg[0] == 'w' && src.Reg[0] == 's':
+			macro = "ENI_BITCAST_U32"
+		case dst.Reg[0] == 'd' && src.Reg[0] == 'x':
+			macro = "ENI_BITCAST_F64"
+		case dst.Reg[0] == 'x' && src.Reg[0] == 'd':
+			macro = "ENI_BITCAST_U64"
+		default:
+			return nil
+		}
+		return l.setReg(dst.Reg, &ir.StaticMethodCall{Method: macro, Args: []ir.Expr{val}})
+	default:
+		return nil
+	}
+}
+
+// records the 0-vs-Rm comparison for a later condition consumer.
+func (l *lifter) liftNeg(inst native.DetailedInstruction, flags bool) []ir.Stmt {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg || inst.Operands[1].Type != native.OperandReg {
+		return nil
+	}
+	dst, src := inst.Operands[0], inst.Operands[1]
+	val := l.regValue(src.Reg)
+	l.consume(val)
+	if flags {
+		l.lastCmp = &cmpOperands{lhs: &ir.IntLit{Value: 0}, rhs: val}
+	}
+	return l.setReg(dst.Reg, &ir.BinaryExpr{Op: "-", Left: &ir.IntLit{Value: 0}, Right: val})
+}
+
+// liftBics lifts "bics Rd, Rn, <Rm|#imm>" (Rn & ~rhs), including the
+// flags snapshot for a following condition.
+func (l *lifter) liftBics(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 3 || inst.Operands[0].Type != native.OperandReg || inst.Operands[1].Type != native.OperandReg {
+		return nil
+	}
+	dst := inst.Operands[0]
+	lhs := l.regValue(inst.Operands[1].Reg)
+	l.consume(lhs)
+	rhs := l.operandValue(inst.Operands[2])
+	if rhs == nil {
+		l.lastCmp = nil
+		return nil
+	}
+	result := &ir.BinaryExpr{
+		Op:    "&",
+		Left:  lhs,
+		Right: &ir.UnaryExpr{Op: "~", Expr: rhs},
+	}
+	l.lastCmp = &cmpOperands{lhs: result, rhs: &ir.IntLit{Value: 0}}
+	if isZeroReg(dst.Reg) {
+		return nil
+	}
+	return l.setReg(dst.Reg, result)
+}
+
+// liftExtr lifts "extr Rd, Rn, Rm, #lsb": the low (bits-lsb) bits of
+// Rn joined with the high lsb bits of Rm.
+func (l *lifter) liftExtr(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 4 || inst.Operands[0].Type != native.OperandReg ||
+		inst.Operands[1].Type != native.OperandReg || inst.Operands[2].Type != native.OperandReg ||
+		inst.Operands[3].Type != native.OperandImm {
+		return nil
+	}
+	dst := inst.Operands[0]
+	bits := uint(regWidth(dst.Reg) * 8)
+	lsb := uint(inst.Operands[3].Imm)
+	if lsb >= bits {
+		return nil
+	}
+	hi := l.regValue(inst.Operands[1].Reg)
+	lo := l.regValue(inst.Operands[2].Reg)
+	l.consume(hi)
+	l.consume(lo)
+	var val ir.Expr = lo
+	if lsb > 0 {
+		val = &ir.BinaryExpr{Op: ">>", Left: lo, Right: &ir.IntLit{Value: int64(lsb)}}
+		hi = &ir.BinaryExpr{Op: "<<", Left: hi, Right: &ir.IntLit{Value: int64(bits - lsb)}}
+		val = &ir.BinaryExpr{Op: "|", Left: val, Right: hi}
+	}
+	return l.setReg(dst.Reg, val)
+}
+
+// liftBfiz lifts ubfiz/sbfiz: extract the low `width` bits of Rn and
+// insert them at #lsb, optionally sign-extending the field first.
+func (l *lifter) liftBfiz(inst native.DetailedInstruction, signed bool) []ir.Stmt {
+	if len(inst.Operands) != 4 {
+		return nil
+	}
+	dst, src := inst.Operands[0], inst.Operands[1]
+	if dst.Type != native.OperandReg || src.Type != native.OperandReg ||
+		inst.Operands[2].Type != native.OperandImm || inst.Operands[3].Type != native.OperandImm {
+		return nil
+	}
+	lsb := uint(inst.Operands[2].Imm)
+	width := uint(inst.Operands[3].Imm)
+	bits := uint(regWidth(dst.Reg) * 8)
+	if width == 0 || width > bits || lsb >= bits {
+		return nil
+	}
+
+	val := l.regValue(src.Reg)
+	l.consume(val)
+	if signed {
+		left := bits - width
+		signedType := ir.Type(&ir.PrimitiveType{Name: "long"})
+		if bits == 32 {
+			signedType = &ir.PrimitiveType{Name: "int"}
+		}
+		val = &ir.BinaryExpr{Op: ">>", Left: &ir.CastExpr{Type: signedType, Expr: &ir.BinaryExpr{
+			Op:    "<<",
+			Left:  val,
+			Right: &ir.IntLit{Value: int64(left)},
+		}}, Right: &ir.IntLit{Value: int64(left)}}
+	} else if width < 64 {
+		mask := (uint64(1) << width) - 1
+		val = &ir.BinaryExpr{Op: "&", Left: val, Right: &ir.IntLit{Value: int64(mask)}}
+	}
+	if lsb > 0 {
+		val = &ir.BinaryExpr{Op: "<<", Left: val, Right: &ir.IntLit{Value: int64(lsb)}}
+	}
+	return l.setReg(dst.Reg, val)
+}
+
+// liftBitfield lifts ubfx/sbfx (Rd, Rn, #lsb, #width). The signed form
+// shifts the field to the top and performs an arithmetic right shift
+// through a signed cast, so C's implementation-defined-but-universal
+// signed shift supplies the extension.
+func (l *lifter) liftBitfield(inst native.DetailedInstruction, signed bool) []ir.Stmt {
+	if len(inst.Operands) != 4 {
+		return nil
+	}
+	dst, src := inst.Operands[0], inst.Operands[1]
+	if dst.Type != native.OperandReg || src.Type != native.OperandReg ||
+		inst.Operands[2].Type != native.OperandImm || inst.Operands[3].Type != native.OperandImm {
+		return nil
+	}
+	lsb := uint(inst.Operands[2].Imm)
+	width := uint(inst.Operands[3].Imm)
+	bits := uint(regWidth(dst.Reg) * 8)
+	if width == 0 || lsb+width > bits {
+		return nil
+	}
+
+	val := l.regValue(src.Reg)
+	l.consume(val)
+
+	if signed {
+		left := bits - (lsb + width)
+		right := bits - width
+		signedType := ir.Type(&ir.PrimitiveType{Name: "long"})
+		if bits == 32 {
+			signedType = &ir.PrimitiveType{Name: "int"}
+		}
+		shifted := &ir.CastExpr{Type: signedType, Expr: &ir.BinaryExpr{
+			Op:    "<<",
+			Left:  val,
+			Right: &ir.IntLit{Value: int64(left)},
+		}}
+		return l.setReg(dst.Reg, &ir.BinaryExpr{
+			Op:    ">>",
+			Left:  shifted,
+			Right: &ir.IntLit{Value: int64(right)},
+		})
+	}
+
+	if lsb > 0 {
+		val = &ir.BinaryExpr{Op: ">>", Left: val, Right: &ir.IntLit{Value: int64(lsb)}}
+	}
+	if width < 64 {
+		mask := (uint64(1) << width) - 1
+		val = &ir.BinaryExpr{Op: "&", Left: val, Right: &ir.IntLit{Value: int64(mask)}}
+	}
+	return l.setReg(dst.Reg, val)
+}
+
+// fpCType returns the C scalar type for an FP/SIMD view register
+// (sN -> float, dN -> double), or "" for integer/vector registers.
+func fpCType(reg string) string {
+	if len(reg) < 2 {
+		return ""
+	}
+	switch reg[0] {
+	case 's':
+		return "float"
+	case 'd':
+		return "double"
+	}
+	return ""
+}
+
+// setAccessCType tags a memory access with an explicit scalar type so
+// the renderer emits float*/double* instead of uint32_t*/uint64_t*.
+func setAccessCType(e ir.Expr, ctype string) {
+	if ctype == "" {
+		return
+	}
+	switch v := e.(type) {
+	case *ir.FieldAccess:
+		v.CType = ctype
+	case *ir.ArrayAccess:
+		v.CType = ctype
+	}
+}
+
+func fpStackName(disp int32, ctype string) string {
+	if ctype == "float" {
+		return fmt.Sprintf("flocal_%d", disp)
+	}
+	return fmt.Sprintf("dlocal_%d", disp)
+}
+
+func signedTypeForWidth(width int) string {
+	switch width {
+	case 1:
+		return "int8_t"
+	case 2:
+		return "int16_t"
+	case 4:
+		return "int32_t"
+	default:
+		return "int64_t"
+	}
+}
+
+// noteStackWidth records an access width for a stack slot and, when no
+// DWARF/FP type already owns that slot, infers a signed C type for the
+// local from the widest access seen.
+func (l *lifter) noteStackWidth(disp int32, width int) {
+	if width <= 0 {
+		return
+	}
+	if width > l.stackWidth[disp] {
+		l.stackWidth[disp] = width
+	}
+	if l.stackTyped[disp] || l.opts.LocalTypes == nil {
+		return
+	}
+	name, ok := l.stack[disp]
+	if !ok || name == "" || strings.HasPrefix(name, "flocal_") || strings.HasPrefix(name, "dlocal_") {
+		return
+	}
+	l.opts.LocalTypes[name] = signedTypeForWidth(l.stackWidth[disp])
+}
+
+// accessWidth returns the byte width of a load/store mnemonic. The
+// byte/halfword forms override the register's natural width (a w8
+// destination for ldrb is still a 1-byte access), while plain ldr/str
+// and the unscaled ldur/stur family use the register width.
+func accessWidth(inst native.DetailedInstruction) int {
+	switch inst.Mnemonic {
+	case "ldrb", "strb", "ldurb", "sturb", "ldxrb", "ldaxrb", "stxrb", "stlxrb":
+		return 1
+	case "ldrh", "strh", "ldurh", "sturh", "ldxrh", "ldaxrh", "stxrh", "stlxrh":
+		return 2
+	}
+	if len(inst.Operands) > 0 && inst.Operands[0].Type == native.OperandReg {
+		return regWidth(inst.Operands[0].Reg)
+	}
+	return 8
 }
 
 // regWidth returns the access width in bytes implied by the register an
@@ -2530,6 +3649,12 @@ func (l *lifter) liftLdr(inst native.DetailedInstruction) []ir.Stmt {
 // width feeds the IL2CPP rewrite's cast type; unknown spellings
 // default to 8, matching the plain "ldr" the lifter understands best.
 func regWidth(reg string) int {
+	switch reg {
+	case "xzr":
+		return 8
+	case "wzr":
+		return 4
+	}
 	if len(reg) < 2 {
 		return 8
 	}
@@ -2569,6 +3694,7 @@ func (l *lifter) newFieldAccessOn(base ir.Expr, disp int32, width int) *ir.Field
 	fa := &ir.FieldAccess{
 		Object: base,
 		Name:   fmt.Sprintf("field_%d", disp),
+		Disp:   disp,
 		Width:  width,
 	}
 	if disp >= 0 {
@@ -2582,6 +3708,92 @@ func (l *lifter) newFieldAccessOn(base ir.Expr, disp int32, width int) *ir.Field
 		}
 	}
 	return fa
+}
+
+// memoryAccessTarget builds the IR lvalue/rvalue for a memory operand
+// with an optional index register. It supports the immediate-LSL form
+// ARM64 uses for arrays ([xN, xM, lsl #2]) and falls back to explicit
+// byte-offset arithmetic when the shift does not match the access
+// width. Unsupported shift forms return nil rather than emitting a
+// wrong address.
+//
+// consume controls whether embedded expressions are marked consumed:
+// a store target is always emitted as an AssignStmt (safe to consume),
+// while a load may never surface (so its base/index stay unconsumed,
+// mirroring liftLdr's existing policy).
+func (l *lifter) memoryAccessTarget(base string, mem native.MemOperand, width int, consume bool) ir.Expr {
+	if base == "" || base == "sp" {
+		return nil
+	}
+
+	baseExpr := l.memBaseExpr(base)
+	if consume {
+		l.consume(baseExpr)
+	}
+	if mem.Index == "" {
+		return l.newFieldAccessOn(baseExpr, mem.Disp, width)
+	}
+
+	shift := 0
+	switch mem.IndexShiftType {
+	case 0: // no shift
+	case 1: // AARCH64_SFT_LSL
+		shift = mem.IndexShiftValue
+	default:
+		// Register-controlled shifts and extenders cannot be
+		// represented faithfully here yet.
+		return nil
+	}
+	if shift < 0 || shift > 30 {
+		return nil
+	}
+
+	idx := l.regValue(mem.Index)
+	idx = applyIndexExtend(mem.IndexExtType, idx)
+	if consume {
+		l.consume(idx)
+	}
+
+	if mem.Disp != 0 {
+		baseExpr = &ir.BinaryExpr{Op: "+", Left: baseExpr, Right: &ir.IntLit{Value: int64(mem.Disp)}}
+	}
+
+	if width > 0 && shift <= 4 && (1<<uint(shift)) == width {
+		return &ir.ArrayAccess{Array: baseExpr, Index: idx, Width: width}
+	}
+
+	offset := idx
+	if shift > 0 {
+		offset = &ir.BinaryExpr{Op: "<<", Left: idx, Right: &ir.IntLit{Value: int64(shift)}}
+	}
+	return l.newFieldAccessOn(&ir.BinaryExpr{Op: "+", Left: baseExpr, Right: offset}, 0, width)
+}
+
+// applyIndexExtend wraps a memory index in its AArch64 extender
+// (sxtw/uxtw/sxtb/...). The C renderer's casts preserve the signedness
+// the address calculation needs; an extend of "none" is a no-op.
+func applyIndexExtend(extType int, e ir.Expr) ir.Expr {
+	if e == nil {
+		return nil
+	}
+	var name string
+	switch extType {
+	case 1:
+		name = "byte" // UXTB
+	case 2:
+		name = "ushort" // UXTH
+	case 3:
+		name = "uint" // UXTW
+	case 5:
+		name = "sbyte" // SXTB
+	case 6:
+		name = "short" // SXTH
+	case 7:
+		name = "int" // SXTW
+	default:
+		return e
+	}
+	return &ir.CastExpr{Type: &ir.PrimitiveType{Name: name}, Expr: e}
 }
 
 // isThisExpr reports whether e is the `this` pointer this lift seeded
@@ -2648,7 +3860,7 @@ func (l *lifter) liftAdd(inst native.DetailedInstruction) []ir.Stmt {
 	switch rhsOp.Type {
 	case native.OperandReg:
 		lhs := l.regValue(lhsOp.Reg)
-		rhs := l.regValue(rhsOp.Reg)
+		rhs := applyOperandShift(rhsOp, l.regValue(rhsOp.Reg))
 		l.consume(lhs)
 		l.consume(rhs)
 		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: "+", Left: lhs, Right: rhs})
@@ -2662,10 +3874,15 @@ func (l *lifter) liftAdd(inst native.DetailedInstruction) []ir.Stmt {
 		// result later gets used as a call argument - see buildCall).
 		lhs := l.regValue(lhsOp.Reg)
 		l.consume(lhs)
+		rhs := applyOperandShift(rhsOp, &ir.IntLit{Value: rhsOp.Imm})
 		base, isAddr := l.addrRegs[lhsOp.Reg]
-		var val ir.Expr = &ir.BinaryExpr{Op: "+", Left: lhs, Right: &ir.IntLit{Value: rhsOp.Imm}}
+		var val ir.Expr = &ir.BinaryExpr{Op: "+", Left: lhs, Right: rhs}
 		if isAddr {
-			newBase := base + uint64(rhsOp.Imm)
+			immVal := uint64(rhsOp.Imm)
+			if rhsOp.ShiftType == 1 { // AARCH64_SFT_LSL
+				immVal <<= uint(rhsOp.ShiftValue)
+			}
+			newBase := base + immVal
 			// The page+offset sum is now a complete address: resolve it
 			// to a string literal / symbol / section label (or, failing
 			// all three, keep it as a hex AddrLit) instead of leaving
@@ -2704,7 +3921,13 @@ var aluOps = map[string]struct {
 	// mul has no immediate-operand encoding at all in AArch64 (always
 	// register*register) - allowImm=false rejects an immediate rhs as
 	// an ISA-level fact, not an arbitrary lifter restriction.
-	"mul": {"*", false},
+	"mul":  {"*", false},
+	"udiv": {"/", false},
+	"sdiv": {"/", false},
+	"fadd": {"+", false},
+	"fsub": {"-", false},
+	"fmul": {"*", false},
+	"fdiv": {"/", false},
 }
 
 // liftALU lifts the common "Rd, Rn, Rm" (register-register) or
@@ -2730,16 +3953,58 @@ func (l *lifter) liftALU(inst native.DetailedInstruction) []ir.Stmt {
 
 	switch rhsOp.Type {
 	case native.OperandReg:
-		rhs := l.regValue(rhsOp.Reg)
+		rhs := applyOperandShift(rhsOp, l.regValue(rhsOp.Reg))
 		l.consume(rhs)
 		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: rhs})
 	case native.OperandImm:
 		if !op.allowImm {
 			return nil
 		}
-		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: &ir.IntLit{Value: rhsOp.Imm}})
+		rhs := applyOperandShift(rhsOp, &ir.IntLit{Value: rhsOp.Imm})
+		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: rhs})
+	case native.OperandFP:
+		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: fpLit(dstOp.Reg, rhsOp.FP)})
 	default:
 		return nil
+	}
+}
+
+// fpLit builds a float/double literal matching the destination
+// register's view width.
+func fpLit(reg string, v float64) ir.Expr {
+	if strings.HasPrefix(reg, "s") {
+		return &ir.FloatLit{Value: float32(v)}
+	}
+	return &ir.DoubleLit{Value: v}
+}
+
+// applyOperandShift wraps e in the shift named by an operand's own
+// detail shift field (the ", lsl #3" in "add x0, x1, x2, lsl #3" or
+// "tst x0, x1, lsr #2"). Only immediate LSL/LSR/ASR are modelled;
+// register-controlled shifts and extenders are left as-is rather than
+// guessed (their register id is not an immediate amount).
+func applyOperandShift(op native.Operand, e ir.Expr) ir.Expr {
+	if e == nil {
+		return nil
+	}
+	switch op.ShiftType {
+	case 0: // AARCH64_SFT_INVALID: no shift
+		return e
+	case 1: // AARCH64_SFT_LSL
+		if op.ShiftValue > 0 {
+			return &ir.BinaryExpr{Op: "<<", Left: e, Right: &ir.IntLit{Value: int64(op.ShiftValue)}}
+		}
+		return e
+	case 3, 4: // AARCH64_SFT_LSR / AARCH64_SFT_ASR
+		if op.ShiftValue > 0 {
+			return &ir.BinaryExpr{Op: ">>", Left: e, Right: &ir.IntLit{Value: int64(op.ShiftValue)}}
+		}
+		return e
+	default:
+		// Register-controlled shifts and ROR/MSL have no direct C
+		// equivalent in this IR; leave the value unshifted rather than
+		// inventing a wrong expression.
+		return e
 	}
 }
 
@@ -2763,6 +4028,67 @@ func (l *lifter) liftAddr(inst native.DetailedInstruction) []ir.Stmt {
 	stmts := l.setReg(dst.Reg, &ir.AddrLit{Value: uint64(imm.Imm)})
 	l.addrRegs[dst.Reg] = uint64(imm.Imm)
 	return stmts
+}
+
+// liftMovWide lifts the 16-bit immediate materialisation family:
+//
+//	movz Rd, #imm, lsl #shift   Rd = imm << shift
+//	movk Rd, #imm, lsl #shift   Rd = (Rd & ~(0xffff<<shift)) | (imm<<shift)
+//	movn Rd, #imm, lsl #shift   Rd = ~(imm << shift)
+//
+// Capstone often aliases movz/movn to plain "mov", which liftMov already
+// handles; movk is the one that really needs this path, since -O0 code
+// builds every larger constant as mov/movz followed by one or more
+// movk. Constant operands are folded; only the uncommon non-constant
+// movk target stays as explicit mask/shift arithmetic.
+func (l *lifter) liftMovWide(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 2 {
+		return nil
+	}
+	dstOp, srcOp := inst.Operands[0], inst.Operands[1]
+	if dstOp.Type != native.OperandReg || srcOp.Type != native.OperandImm {
+		return nil
+	}
+	shift := 0
+	if srcOp.ShiftType == 1 { // AARCH64_SFT_LSL
+		shift = srcOp.ShiftValue
+	}
+	if shift < 0 || shift > 48 {
+		return nil
+	}
+	bits := uint(regWidth(dstOp.Reg) * 8)
+	if bits == 0 || bits > 64 {
+		bits = 64
+	}
+	imm := uint64(srcOp.Imm) & 0xffff
+	shifted := imm << uint(shift)
+
+	switch inst.Mnemonic {
+	case "movz":
+		return l.setReg(dstOp.Reg, &ir.IntLit{Value: int64(truncateToBits(shifted, bits))})
+	case "movn":
+		return l.setReg(dstOp.Reg, &ir.IntLit{Value: int64(truncateToBits(^shifted, bits))})
+	case "movk":
+		old := l.regValue(dstOp.Reg)
+		mask := uint64(0xffff) << uint(shift)
+		if c, ok := constantOf(old); ok {
+			v := truncateToBits((c & ^mask)|shifted, bits)
+			return l.setReg(dstOp.Reg, &ir.IntLit{Value: int64(v)})
+		}
+		l.consume(old)
+		val := &ir.BinaryExpr{
+			Op: "|",
+			Left: &ir.BinaryExpr{
+				Op:    "&",
+				Left:  old,
+				Right: &ir.IntLit{Value: int64(^mask)},
+			},
+			Right: &ir.IntLit{Value: int64(shifted)},
+		}
+		return l.setReg(dstOp.Reg, val)
+	default:
+		return nil
+	}
 }
 
 // liftMov lifts "mov Rd, Rn" (register-to-register) and "mov Rd, #imm"
@@ -3113,6 +4439,80 @@ func demangle(name string) string {
 	return name
 }
 
+// flagCondition builds the expression a b.cond/cset/csel tests for the
+// given comparison operator, using the most recent cmp/ccmp/tst/subs
+// snapshot. A missing snapshot degrades to the explicit "cond"
+// placeholder, matching the branch path's own fallback.
+func (l *lifter) flagCondition(op string) ir.Expr {
+	if l.lastCmp == nil || op == "" || op == "?" {
+		return &ir.LocalVar{Name: "cond"}
+	}
+	cmp := &ir.BinaryExpr{Op: op, Left: l.lastCmp.lhs, Right: l.lastCmp.rhs}
+	if l.lastCmp.combine != nil {
+		return l.lastCmp.combine(op, cmp)
+	}
+	return cmp
+}
+
+// liftCsel lifts the conditional-select family:
+//
+//	csel  Rd, Rn, Rm, cond   Rd = cond ? Rn : Rm
+//	csinc Rd, Rn, Rm, cond   Rd = cond ? Rn : Rm + 1
+//	csinv Rd, Rn, Rm, cond   Rd = cond ? Rn : ~Rm
+//	csneg Rd, Rn, Rm, cond   Rd = cond ? Rn : -Rm
+//
+// Capstone exposes the condition only in OpStr (there is no fourth
+// structured operand for it), so it is parsed from the trailing
+// ", <cond>" exactly like liftCset does.
+func (l *lifter) liftCsel(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) != 3 {
+		return nil
+	}
+	dstOp, trueOp, falseOp := inst.Operands[0], inst.Operands[1], inst.Operands[2]
+	if dstOp.Type != native.OperandReg || trueOp.Type != native.OperandReg || falseOp.Type != native.OperandReg {
+		return nil
+	}
+
+	condText := inst.OpStr
+	if idx := strings.LastIndex(condText, ", "); idx >= 0 {
+		condText = condText[idx+2:]
+	}
+	condOp := condOpFromMnemonic("b." + condText)
+	cond := l.flagCondition(condOp)
+
+	trueExpr := l.regValue(trueOp.Reg)
+	l.consume(trueExpr)
+	falseExpr := l.regValue(falseOp.Reg)
+	l.consume(falseExpr)
+
+	bits := uint(regWidth(falseOp.Reg) * 8)
+	if bits == 0 || bits > 64 {
+		bits = 64
+	}
+	switch inst.Mnemonic {
+	case "csinc":
+		if c, ok := constantOf(falseExpr); ok {
+			falseExpr = &ir.IntLit{Value: int64(truncateToBits(c+1, bits))}
+		} else {
+			falseExpr = &ir.BinaryExpr{Op: "+", Left: falseExpr, Right: &ir.IntLit{Value: 1}}
+		}
+	case "csinv":
+		if c, ok := constantOf(falseExpr); ok {
+			falseExpr = &ir.IntLit{Value: int64(truncateToBits(^c, bits))}
+		} else {
+			falseExpr = &ir.UnaryExpr{Op: "~", Expr: falseExpr}
+		}
+	case "csneg":
+		if c, ok := constantOf(falseExpr); ok {
+			falseExpr = &ir.IntLit{Value: int64(truncateToBits(-c, bits))}
+		} else {
+			falseExpr = &ir.UnaryExpr{Op: "-", Expr: falseExpr}
+		}
+	}
+
+	return l.setReg(dstOp.Reg, &ir.TernaryExpr{Cond: cond, TrueExpr: trueExpr, FalseExpr: falseExpr})
+}
+
 // liftCset lifts "cset Rd, <cond>" - sets Rd to 1 if the condition
 // (tested against flags from the most recently lifted cmp, the same
 // mechanism liftCondition uses for b.cond) holds, 0 otherwise - the
@@ -3135,10 +4535,7 @@ func (l *lifter) liftCset(inst native.DetailedInstruction) []ir.Stmt {
 	}
 	op := condOpFromMnemonic("b." + condText)
 
-	if l.lastCmp == nil {
-		return l.setReg(dst.Reg, &ir.LocalVar{Name: "cond"})
-	}
-	return l.setReg(dst.Reg, &ir.BinaryExpr{Op: op, Left: l.lastCmp.lhs, Right: l.lastCmp.rhs})
+	return l.setReg(dst.Reg, l.flagCondition(op))
 }
 
 // consume marks e as accounted for - already embedded into some larger
@@ -3252,6 +4649,9 @@ func (l *lifter) clobberReg(reg string) []ir.Stmt {
 // "int"-width instruction is still visible to anything (buildCall,
 // liftRet) that reads the 64-bit name instead.
 func (l *lifter) setReg(reg string, val ir.Expr) []ir.Stmt {
+	if reg == "x29" {
+		l.x29Known = false
+	}
 	l.ensureRegName(reg)
 	stmts := l.clobberReg(reg)
 	l.regs[reg] = val
@@ -3292,6 +4692,105 @@ func (l *lifter) flushRemaining() []ir.Stmt {
 // any recognized write - this keeps lifting total/non-panicking on
 // instruction shapes not yet handled, at the cost of an honestly-ugly
 // "w3"-named variable in the output rather than a wrong guess).
+// operandValue reads one source operand into an expression and applies
+// its own shift (e.g. ", lsl #3"). Register values are consumed, since
+// the caller embeds them into a comparison/result that is guaranteed to
+// surface; immediate operands are already constants.
+func (l *lifter) operandValue(op native.Operand) ir.Expr {
+	switch op.Type {
+	case native.OperandReg:
+		v := applyOperandShift(op, l.regValue(op.Reg))
+		l.consume(v)
+		return v
+	case native.OperandImm:
+		return applyOperandShift(op, &ir.IntLit{Value: op.Imm})
+	default:
+		return nil
+	}
+}
+
+// liftTst lifts "tst Rn, <Rm|#imm>" (an alias of "ands xzr, ...") into
+// the same comparison snapshot liftCmp builds: the following b.cond /
+// cset / csel tests "(Rn & rhs) == 0" or "!= 0".
+func (l *lifter) liftTst(inst native.DetailedInstruction) {
+	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg {
+		return
+	}
+	lhs := l.regValue(inst.Operands[0].Reg)
+	l.consume(lhs)
+	rhs := l.operandValue(inst.Operands[1])
+	if rhs == nil {
+		l.lastCmp = nil
+		return
+	}
+	l.lastCmp = &cmpOperands{
+		lhs: &ir.BinaryExpr{Op: "&", Left: lhs, Right: rhs},
+		rhs: &ir.IntLit{Value: 0},
+	}
+}
+
+// liftFlagResult lifts the flag-writing three-operand forms
+// "subs/adds/ands Rd, Rn, <Rm|#imm>". It installs the arithmetic result
+// in Rd (unless Rd is the zero register, as in the "tst"/"cmp" aliases)
+// and records the comparison a later condition consumer should use:
+// sub's lhs/rhs for subtraction, or the computed result against zero
+// for adds/ands.
+func (l *lifter) liftFlagResult(inst native.DetailedInstruction, op string) []ir.Stmt {
+	if len(inst.Operands) != 3 {
+		return nil
+	}
+	dstOp, lhsOp, rhsOp := inst.Operands[0], inst.Operands[1], inst.Operands[2]
+	if dstOp.Type != native.OperandReg || lhsOp.Type != native.OperandReg {
+		return nil
+	}
+	lhs := l.regValue(lhsOp.Reg)
+	l.consume(lhs)
+	rhs := l.operandValue(rhsOp)
+	if rhs == nil {
+		l.lastCmp = nil
+		return nil
+	}
+	result := &ir.BinaryExpr{Op: op, Left: lhs, Right: rhs}
+
+	var stmts []ir.Stmt
+	if !isZeroReg(dstOp.Reg) {
+		stmts = l.setReg(dstOp.Reg, result)
+	}
+
+	if op == "-" {
+		l.lastCmp = &cmpOperands{lhs: lhs, rhs: rhs}
+	} else {
+		l.lastCmp = &cmpOperands{lhs: result, rhs: &ir.IntLit{Value: 0}}
+	}
+	return stmts
+}
+
+func isZeroReg(reg string) bool {
+	return reg == "xzr" || reg == "wzr"
+}
+
+// constantOf extracts a constant value from the expression forms the
+// lifter produces for immediate materialisation.
+func constantOf(e ir.Expr) (uint64, bool) {
+	switch v := e.(type) {
+	case *ir.IntLit:
+		return uint64(v.Value), true
+	case *ir.LongLit:
+		return uint64(v.Value), true
+	case *ir.AddrLit:
+		return v.Value, true
+	default:
+		return 0, false
+	}
+}
+
+func truncateToBits(v uint64, bits uint) uint64 {
+	if bits >= 64 {
+		return v
+	}
+	return v & ((uint64(1) << bits) - 1)
+}
+
 // liftCmp lifts "cmp Rn, Rm" - not into a statement of its own (a bare
 // comparison with the result discarded has no source-level meaning by
 // itself), but into l.lastCmp, for a following b.cond to build its
@@ -3313,11 +4812,11 @@ func (l *lifter) liftCmp(inst native.DetailedInstruction) {
 
 	switch rhsOp.Type {
 	case native.OperandReg:
-		rhs := l.regValue(rhsOp.Reg)
+		rhs := applyOperandShift(rhsOp, l.regValue(rhsOp.Reg))
 		l.consume(rhs)
 		l.lastCmp = &cmpOperands{lhs: lhs, rhs: rhs}
 	case native.OperandImm:
-		l.lastCmp = &cmpOperands{lhs: lhs, rhs: &ir.IntLit{Value: rhsOp.Imm}}
+		l.lastCmp = &cmpOperands{lhs: lhs, rhs: applyOperandShift(rhsOp, &ir.IntLit{Value: rhsOp.Imm})}
 	}
 }
 
@@ -3371,10 +4870,10 @@ func (l *lifter) liftCcmp(inst native.DetailedInstruction) {
 	var rhs ir.Expr
 	switch ops[1].Type {
 	case native.OperandReg:
-		rhs = l.regValue(ops[1].Reg)
+		rhs = applyOperandShift(ops[1], l.regValue(ops[1].Reg))
 		l.consume(rhs)
 	case native.OperandImm:
-		rhs = &ir.IntLit{Value: ops[1].Imm}
+		rhs = applyOperandShift(ops[1], &ir.IntLit{Value: ops[1].Imm})
 	default:
 		l.lastCmp = nil
 		return
@@ -3577,13 +5076,48 @@ func (l *lifter) memBaseExpr(base string) ir.Expr {
 // is currently in w0/x0 (the AAPCS64 return-value register) - the
 // standard C calling convention's return slot.
 func (l *lifter) liftRet() ir.Stmt {
+	// With a known DWARF return type, return s0/d0 directly instead of
+	// bitcasting the register into the generic uint64_t result.
+	switch l.opts.ReturnType {
+	case "double":
+		if v, ok := l.regs["d0"]; ok {
+			l.consume(v)
+			return &ir.ReturnStmt{Value: v}
+		}
+	case "float":
+		if v, ok := l.regs["s0"]; ok {
+			l.consume(v)
+			return &ir.ReturnStmt{Value: v}
+		}
+	}
+	// FP-returning functions leave their result in s0/d0 and never
+	// touch x0/w0. When neither integer return register was assigned,
+	// return the FP value's bit pattern through the same bitcast macro
+	// the fmov int<->FP path uses - the generated translation unit's
+	// return type is uint64_t, so this preserves the ABI bits while
+	// keeping the output valid C.
+	if _, xSet := l.regs["x0"]; !xSet {
+		if _, wSet := l.regs["w0"]; !wSet {
+			if v, ok := l.regs["d0"]; ok {
+				l.consume(v)
+				return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "ENI_BITCAST_U64", Args: []ir.Expr{v}}}
+			}
+			if v, ok := l.regs["s0"]; ok {
+				l.consume(v)
+				return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "ENI_BITCAST_U32", Args: []ir.Expr{v}}}
+			}
+		}
+	}
+
 	val := l.regValue("w0")
 	if v, ok := l.regs["x0"]; ok {
-		// Prefer x0 if it's the one that was actually written (a
-		// 64-bit-returning function would write x0, not w0) - w0 is
-		// just the default fallback for the common 32-bit-int-return
-		// case our test targets.
-		if _, w0Set := l.regs["w0"]; !w0Set {
+		// Prefer x0 unless w0 holds the SAME value (a 32-bit write
+		// mirrors into x0, so equality means either name is correct).
+		// Parameter seeding installs the same expression under both
+		// names; a later 64-bit write to x0 changes only x0's entry and
+		// must win, while a later 32-bit write updates both and keeps
+		// them equal.
+		if w0, w0Set := l.regs["w0"]; !w0Set || w0 != v {
 			val = v
 		}
 	}
@@ -3603,20 +5137,28 @@ func (l *lifter) liftRet() ir.Stmt {
 // (liftAdd/liftALU), stack-spilled parameters AND ordinary local
 // variables (liftStr/liftLdr's stack-slot handling), and general
 // (non-stack) memory access - struct field/array element dereferences
-// through an arbitrary pointer (liftStr/liftLdr's FieldAccess
-// handling). Remaining known gaps, none narrow enough yet to single
-// out as "next":
-//   - No real type system: every value is an untyped IR expression, so
-//     a synthetic name like "field_8" or "local_16" is exactly that -
-//     synthetic, not a recovered field/variable name, and there's no
-//     way to tell an int from a pointer from a bool short of the
-//     surrounding operation's own shape.
-//   - Register-indexed ("[Rn, Rm]") and pre/post-indexed
-//     ("[Rn, #disp]!"/"[Rn], #disp") addressing aren't distinguished
-//     from plain offset addressing at all (native.MemOperand doesn't
-//     currently capture either) - real -O0 code mostly avoids both in
-//     favor of explicit address arithmetic, but when they do appear,
-//     a writeback's effect on the base register is silently unmodeled.
+// through an arbitrary pointer (liftStr/liftLdr's FieldAccess and
+// ArrayAccess handling), including byte/halfword and unscaled
+// ldrb/strb/ldrh/strh/ldur/stur forms, register-indexed addressing
+// ("[Rn, Rm, lsl #N]" with sxtw/uxtw index extenders), movz/movk/movn
+// constant materialisation, the tst/subs/adds/ands +
+// csel/csinc/csinv/csneg condition family, pre/post-indexed writeback,
+// general ldp/stp, madd/msub, udiv/sdiv, ubfx/sbfx, sxtb/sxth/sxtw/
+// uxtb/uxth/uxtw, signed loads (ldrsb/ldrsh/ldrsw), basic
+// acquire/release/exclusive accesses (ldar/stlr/ldxr/stxr), x29-
+// relative stack slots, cmn/neg/negs/bics, mneg/extr/ubfiz/sbfiz, and
+// scalar FP arithmetic/conversions (fadd/fsub/fmul/fdiv, fcmp/fcsel,
+// scvtf/ucvtf, fcvtzs/fcvtzu, fmov bitcasts).
+// Remaining known gaps, none narrow enough yet to single out as "next":
+//   - No full type system: DWARF supplies function/parameter names and
+//     simple frame-local types, and stack slots get a width-derived
+//     int8/16/32/64 type, but the IR itself is still untyped and
+//     struct/array/pointer types aren't recovered.
+//   - Less common vector arrangements/lane forms (1d/2s/4h/8b,
+//     by-element), per-statement source-line comments, full
+//     struct/array/pointer types and some FP conversion modes remain.
+//     Multi-register ld1/st1, lane-wise 4s/2d/16b/8h arithmetic,
+//     fmla/fmls, dup, CAS and DWARF return types are lifted.
 //   - No real per-iteration dataflow/fixpoint analysis for loop bodies
 //     (see tryLiftWhileLoop's own doc comment) and no real merge-point
 //     /dominance analysis for if/else reconvergence (see

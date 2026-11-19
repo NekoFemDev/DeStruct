@@ -98,6 +98,11 @@ func (d *DalvikToIR) buildBlocks() {
 
 	leaders := make(map[int]bool)
 	leaders[0] = true
+	for off := range d.tryBoundaries {
+		if idx, ok := offsetToIdx[off]; ok {
+			leaders[idx] = true
+		}
+	}
 	for i := range insns {
 		inst := &insns[i]
 		if !isTerminatorInst(inst) {
@@ -352,11 +357,64 @@ func (d *DalvikToIR) structureRange(lo, hi int, ctx *structCtx) *ir.Block {
 		}
 
 		// Blocks only reachable from exception handler edges are skipped:
-		// try/catch recovery isn't implemented, and emitting their code
-		// inline after the normal body would be wrong.
-		if d.reachable != nil && !d.reachable[i] {
+		// try/catch recovery lifts them explicitly below; emitting their
+		// code inline after the normal body would be wrong.
+		if d.reachable != nil && !d.reachable[i] && !d.forceBlocks[i] {
 			i++
 			continue
+		}
+
+		if tb, ok := d.tryStartBlocks[i]; ok && !d.processedTry[i] {
+			d.processedTry[i] = true
+			endBlock := d.blockForOffset(tb.endAddr)
+			if endBlock > i {
+				body := d.structureRange(i, endBlock, ctx)
+				var catches []*ir.CatchClause
+				var finallyBody *ir.Block
+				for _, h := range tb.handlers {
+					hs := d.blockForOffset(h.addr)
+					if hs < 0 || hs >= len(d.blocks) {
+						continue
+					}
+					he := d.handlerEndBlock(hs, h.addr)
+					if he <= hs {
+						he = hs + 1
+					}
+					for j := hs; j < he; j++ {
+						d.forceBlocks[j] = true
+					}
+					prevException := d.exceptionName
+					d.exceptionName = "e"
+					handlerBody := d.structureRange(hs, he, nil)
+					d.exceptionName = prevException
+					for j := hs; j < he; j++ {
+						delete(d.forceBlocks, j)
+					}
+					if h.typeDesc == "" {
+						if fb, ok := finallyFromHandler(handlerBody); ok {
+							finallyBody = fb
+							continue
+						}
+					}
+					typ := ir.Type(&ir.ClassType{Name: "java.lang.Throwable"})
+					if h.typeDesc != "" {
+						typ = TypeFromDesc(h.typeDesc)
+					}
+					catches = append(catches, &ir.CatchClause{
+						VarName: "e",
+						VarType: typ,
+						Body:    handlerBody,
+					})
+				}
+				if len(catches) == 0 && finallyBody == nil {
+					out.Statements = append(out.Statements, body.Statements...)
+					i = endBlock
+					continue
+				}
+				out.Statements = append(out.Statements, &ir.TryStmt{Body: body, Catches: catches, Finally: finallyBody})
+				i = endBlock
+				continue
+			}
 		}
 
 		// Natural loop starting here.

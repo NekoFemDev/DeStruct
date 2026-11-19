@@ -269,9 +269,9 @@ func TestGenerateIL2CPPHeader(t *testing.T) {
 func TestSanitizeCType(t *testing.T) {
 	cases := map[string]string{
 		"Axlebolt.Bolt.Protobuf.PlayerAchievement": "Axlebolt_Bolt_Protobuf_PlayerAchievement",
-		"id_":           "id_",
-		"<>9":           "__9",
-		"2fast":         "_2fast",
+		"id_":             "id_",
+		"<>9":             "__9",
+		"2fast":           "_2fast",
 		"Achievement.<>c": "Achievement___c",
 	}
 	for in, want := range cases {

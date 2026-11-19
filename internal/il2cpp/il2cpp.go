@@ -13,6 +13,9 @@ type Options struct {
 	OutputDir    string
 	Verbose      bool
 	Dump         DumpOptions
+	// IndexOnly builds the RVA/field index and returns it without
+	// writing dump.cs. Used by `elf --decompile --il2cpp-metadata`.
+	IndexOnly bool
 }
 
 // Result reports what the dumper found.
@@ -24,6 +27,7 @@ type Result struct {
 	ImageCount           int
 	TypeDefCount         int
 	MethodCount          int
+	Index                *MetadataIndex
 }
 
 // Run parses global-metadata.dat and the IL2CPP binary, resolves the
@@ -127,6 +131,22 @@ func RunContext(ctx context.Context, opts Options) (*Result, error) {
 	executor := NewExecutorContext(ctx, metadata, ic)
 	if err := executor.Err(); err != nil {
 		return nil, fmt.Errorf("initializing executor: %w", err)
+	}
+	if opts.IndexOnly {
+		index, err := BuildIndexContext(ctx, executor)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{
+			MetadataVersion:      metadata.Version,
+			IL2CPPVersion:        ic.Version,
+			CodeRegistration:     codeRegistration,
+			MetadataRegistration: metadataRegistration,
+			ImageCount:           imageCount,
+			TypeDefCount:         int(typeDefsCount),
+			MethodCount:          len(index.Methods),
+			Index:                index,
+		}, nil
 	}
 	if err := executor.DumpCSContext(ctx, opts.Dump); err != nil {
 		return nil, err

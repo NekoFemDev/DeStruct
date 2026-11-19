@@ -259,7 +259,7 @@ var opcodeNames = map[Opcode]string{
 	Iushr: "iushr", Lushr: "lushr",
 	Iand: "iand", Land: "land", Ior: "ior", Lor: "lor", Ixor: "ixor", Lxor: "lxor",
 	Iinc: "iinc",
-	I2l: "i2l", I2f: "i2f", I2d: "i2d",
+	I2l:  "i2l", I2f: "i2f", I2d: "i2d",
 	L2i: "l2i", L2f: "l2f", L2d: "l2d",
 	F2i: "f2i", F2l: "f2l", F2d: "f2d",
 	D2i: "d2i", D2l: "d2l", D2f: "d2f",

@@ -39,20 +39,48 @@ type DalvikToIR struct {
 	// switchStack guards against re-entering the same switch while
 	// structuring its own case bodies.
 	switchStack map[int]bool
+
+	// tryBlocks/tryStartBlocks/processedTry drive try/catch
+	// reconstruction; tryBoundaries force basic-block splits at try
+	// start/end and handler addresses.
+	tryBlocks      []*dexTryBlock
+	tryStartBlocks map[int]*dexTryBlock
+	processedTry   map[int]bool
+	tryBoundaries  map[int]bool
+	forceBlocks    map[int]bool
+
+	paramRegs       []int
+	paramDebugNames []string
+	exceptionName   string
+}
+
+type dexTryBlock struct {
+	startAddr uint32
+	endAddr   uint32
+	handlers  []dexCatchHandler
+}
+
+type dexCatchHandler struct {
+	typeDesc string
+	addr     uint32
 }
 
 // NewDalvikToIR creates a new Dalvik to IR converter.
 func NewDalvikToIR(dex *DexFile, method *Method, codeItem *CodeItem) *DalvikToIR {
 	d := &DalvikToIR{
-		dex:         dex,
-		method:      method,
-		codeItem:    codeItem,
-		locals:      make(map[int]*ir.LocalVar),
-		paramNames:  make(map[int]string),
-		objRegs:     make(map[int]bool),
-		regTypes:    make(map[int]string),
-		thisReg:     -1,
-		switchStack: make(map[int]bool),
+		dex:            dex,
+		method:         method,
+		codeItem:       codeItem,
+		locals:         make(map[int]*ir.LocalVar),
+		paramNames:     make(map[int]string),
+		objRegs:        make(map[int]bool),
+		regTypes:       make(map[int]string),
+		thisReg:        -1,
+		switchStack:    make(map[int]bool),
+		tryStartBlocks: make(map[int]*dexTryBlock),
+		processedTry:   make(map[int]bool),
+		tryBoundaries:  make(map[int]bool),
+		forceBlocks:    make(map[int]bool),
 	}
 	d.methodID = dex.GetMethodId(method.MethodIdx)
 	d.isStatic = method.AccessFlags&ACC_STATIC != 0
@@ -153,15 +181,129 @@ func (d *DalvikToIR) initRegisters() {
 
 	if d.proto != nil {
 		params := d.dex.GetParameters(*d.proto)
+		d.paramDebugNames = make([]string, len(params))
 		for i, typeIdx := range params {
 			desc := d.dex.GetTypeDesc(typeIdx)
 			name := fmt.Sprintf("p%d", i)
+			d.paramDebugNames[i] = name
 			if reg < regsSize {
+				d.paramRegs = append(d.paramRegs, reg)
 				d.paramNames[reg] = name
 				d.locals[reg] = &ir.LocalVar{Name: name}
 				d.setRegType(reg, desc)
 			}
 			reg += TypeDescWidth(desc)
+		}
+	}
+	d.loadDebugInfo()
+}
+
+// loadDebugInfo applies debug_info_item parameter/local names to the
+// register file before conversion. Line numbers are decoded but not yet
+// emitted as per-statement comments.
+func (d *DalvikToIR) loadDebugInfo() {
+	if d.codeItem == nil {
+		return
+	}
+	info := d.dex.GetDebugInfo(d.codeItem)
+	if info == nil {
+		return
+	}
+	for i, name := range info.ParamNames {
+		if name == "" || i >= len(d.paramRegs) {
+			continue
+		}
+		reg := d.paramRegs[i]
+		d.paramDebugNames[i] = name
+		d.paramNames[reg] = name
+		d.locals[reg] = &ir.LocalVar{Name: name}
+	}
+	for reg, local := range info.Locals {
+		if local.Name == "" {
+			continue
+		}
+		if _, isParam := d.paramNames[reg]; !isParam {
+			d.locals[reg] = &ir.LocalVar{Name: local.Name}
+		}
+		if local.TypeDesc != "" {
+			d.setRegType(reg, local.TypeDesc)
+		}
+	}
+}
+
+// ParamNames returns parameter names in declaration order, with debug
+// names applied where available.
+func (d *DalvikToIR) ParamNames() []string {
+	out := make([]string, len(d.paramDebugNames))
+	copy(out, d.paramDebugNames)
+	return out
+}
+
+// loadTryInfo decodes try_items and their catch handlers, and records
+// every boundary that must become a basic-block leader.
+func (d *DalvikToIR) loadTryInfo() {
+	if d.codeItem == nil || d.codeItem.TriesSize == 0 {
+		return
+	}
+	for _, item := range d.dex.GetTryItems(d.codeItem) {
+		tb := &dexTryBlock{
+			startAddr: item.StartAddr,
+			endAddr:   item.StartAddr + uint32(item.InsCount),
+		}
+		for _, h := range d.dex.GetCatchHandlers(d.codeItem, item.HandlerOff) {
+			tb.handlers = append(tb.handlers, dexCatchHandler{typeDesc: h.TypeDesc, addr: h.Addr})
+		}
+		d.tryBlocks = append(d.tryBlocks, tb)
+		d.tryBoundaries[int(tb.startAddr)] = true
+		d.tryBoundaries[int(tb.endAddr)] = true
+		for _, h := range tb.handlers {
+			d.tryBoundaries[int(h.addr)] = true
+		}
+	}
+}
+
+// blockForOffset returns the block containing off, or the first block
+// starting after it, or len(blocks).
+func (d *DalvikToIR) blockForOffset(off uint32) int {
+	if bi, ok := d.offsetToBlock[int(off)]; ok {
+		return bi
+	}
+	for i, b := range d.blocks {
+		if b.start < len(d.insns) && uint32(d.insns[b.start].Offset) >= off {
+			return i
+		}
+	}
+	return len(d.blocks)
+}
+
+// handlerEndBlock returns the first block after hs that is either reachable
+// in the normal flow or starts another handler. Bounding by the next handler
+// address keeps sibling handlers from being swallowed into one body.
+func (d *DalvikToIR) handlerEndBlock(hs int, addr uint32) int {
+	limit := len(d.blocks)
+	for _, tb := range d.tryBlocks {
+		for _, h := range tb.handlers {
+			if h.addr <= addr {
+				continue
+			}
+			if bi := d.blockForOffset(h.addr); bi > hs && bi < limit {
+				limit = bi
+			}
+		}
+	}
+	he := hs
+	for he < limit && !d.reachable[he] {
+		he++
+	}
+	return he
+}
+
+// indexTryBlocks maps try start addresses to block indices after the CFG
+// has been built.
+func (d *DalvikToIR) indexTryBlocks() {
+	for _, tb := range d.tryBlocks {
+		if bi := d.blockForOffset(tb.startAddr); bi < len(d.blocks) {
+			d.tryStartBlocks[bi] = tb
 		}
 	}
 }
@@ -182,16 +324,18 @@ func (d *DalvikToIR) Convert() *ir.Block {
 		return &ir.Block{}
 	}
 
+	d.loadTryInfo()
 	d.buildBlocks()
 	d.computeDominators()
 	d.findLoops()
 	d.computeReachable()
+	d.indexTryBlocks()
 
 	block := d.structureRange(0, len(d.blocks), nil)
 	if block == nil {
 		return &ir.Block{}
 	}
-	return block
+	return reconstructSynchronized(dedupeInlinedFinally(block))
 }
 
 // convertBlock converts a straight-line instruction sequence into statements,
@@ -553,6 +697,9 @@ func (d *DalvikToIR) convertInstruction(inst *Instruction) []ir.Stmt {
 		return assign(d.getRegister(inst.A), d.getRegister(inst.B))
 
 	case OP_MOVE_EXCEPTION:
+		if d.exceptionName != "" {
+			return assign(d.getRegister(inst.A), &ir.LocalVar{Name: d.exceptionName})
+		}
 		return assign(d.getRegister(inst.A), &ir.LocalVar{Name: "exception"})
 
 	// Constants

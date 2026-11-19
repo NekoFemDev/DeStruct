@@ -112,6 +112,30 @@ static bool ds_insn_arm64_update_flags(const cs_insn *insns, size_t count,
     return true;
 }
 
+static bool ds_insn_writeback(const cs_insn *insns, size_t count, size_t i,
+                              bool *out) {
+    const cs_detail *det;
+    if (!insns || i >= count || !out)
+        return false;
+    det = insns[i].detail;
+    if (!det)
+        return false;
+    *out = det->writeback;
+    return true;
+}
+
+static bool ds_insn_arm64_post_index(const cs_insn *insns, size_t count,
+                                     size_t i, bool *out) {
+    const cs_detail *det;
+    if (!insns || i >= count || !out)
+        return false;
+    det = insns[i].detail;
+    if (!det)
+        return false;
+    *out = ds_arm64_detail(det)->post_index;
+    return true;
+}
+
 static bool ds_insn_arm64_op_count(const cs_insn *insns, size_t count,
                                    size_t i, uint8_t *out) {
     const cs_detail *det;
@@ -139,6 +163,12 @@ typedef struct ds_arm64_operand {
     int32_t mem_base;  // ARM64_OP_MEM
     int32_t mem_index; // ARM64_OP_MEM
     int64_t mem_disp;  // ARM64_OP_MEM
+    int32_t shift_type; // aarch64_shifter for this operand
+    uint32_t shift_value; // immediate shift amount (or register id for *_REG)
+    int32_t ext_type;  // aarch64_extender for this operand
+    int32_t mem_shift_type; // aarch64_shifter for the memory index
+    uint32_t mem_shift_value; // immediate shift amount for the memory index
+    int32_t mem_ext_type; // aarch64_extender for the memory index
 } ds_arm64_operand;
 
 static bool ds_insn_arm64_operand(const cs_insn *insns, size_t count,
@@ -157,6 +187,9 @@ static bool ds_insn_arm64_operand(const cs_insn *insns, size_t count,
     op = &a64->operands[j];
     memset(out, 0, sizeof(*out));
     out->op_type = (int32_t)op->type;
+    out->shift_type = (int32_t)op->shift.type;
+    out->shift_value = op->shift.value;
+    out->ext_type = (int32_t)op->ext;
     switch (op->type) {
     case AARCH64_OP_REG:
         out->reg = (int32_t)op->reg;
@@ -171,6 +204,9 @@ static bool ds_insn_arm64_operand(const cs_insn *insns, size_t count,
         out->mem_base = (int32_t)op->mem.base;
         out->mem_index = (int32_t)op->mem.index;
         out->mem_disp = op->mem.disp;
+        out->mem_shift_type = (int32_t)op->shift.type;
+        out->mem_shift_value = op->shift.value;
+        out->mem_ext_type = (int32_t)op->ext;
         break;
     default:
         break;
@@ -263,6 +299,18 @@ type MemOperand struct {
 	Base  string // register name, e.g. "sp", "x0" ("" if none)
 	Index string // register name for register-indexed addressing ("" if none)
 	Disp  int32  // constant displacement, e.g. the 12 in "[sp, #12]"
+	// IndexShiftType/IndexShiftValue describe the optional shift
+	// applied to Index ("[xN, xM, lsl #3]"). The type uses
+	// aarch64_shifter's own numbering (0 = none, 1 = LSL, 3 = LSR,
+	// 4 = ASR, 6 = LSL_REG, ...); IndexShiftValue is the immediate
+	// shift amount only for the non-REG forms.
+	IndexShiftType  int
+	IndexShiftValue int
+	// IndexExtType is the aarch64_extender applied to Index
+	// ("sxtw"/"uxtw"/...); 0 means none. The numbering is
+	// AARCH64_EXT_* (1 uxtb, 2 uxth, 3 uxtw, 4 uxtx, 5 sxtb,
+	// 6 sxth, 7 sxtw, 8 sxtx).
+	IndexExtType int
 }
 
 // Operand is one structured instruction operand - exactly one of Reg,
@@ -273,6 +321,14 @@ type Operand struct {
 	Imm  int64      // immediate value (Type == OperandImm)
 	Mem  MemOperand // memory operand (Type == OperandMem)
 	FP   float64    // floating-point immediate (Type == OperandFP)
+	// ShiftType/ShiftValue/ExtType describe the operand-level shift
+	// (e.g. the ", lsl #32" in "movk x8, #0xff80, lsl #32" or the
+	// ", lsl #3" on a shifted ALU register operand) and extension
+	// ("sxtw", "uxtw", ...). The type numbering is aarch64_shifter's
+	// (0 = none, 1 = LSL, 2 = MSL, 3 = LSR, 4 = ASR, 5 = ROR, ...).
+	ShiftType  int
+	ShiftValue int
+	ExtType    int
 }
 
 // DetailedInstruction is an Instruction plus its structured operands -
@@ -292,6 +348,11 @@ type DetailedInstruction struct {
 	// flags (NZCV) - needed to know whether a following b.cond/csel/etc.
 	// is testing the result of THIS instruction or something earlier.
 	WritesFlags bool
+	// Writeback is true for pre/post-indexed load/store forms
+	// ("[xN, #disp]!" / "[xN], #disp"); PostIndex distinguishes the
+	// second form (the address update happens after the access).
+	Writeback bool
+	PostIndex bool
 }
 
 // NewDisassembler creates a new Capstone disassembler for the given architecture
@@ -489,6 +550,18 @@ func (d *Disassembler) DisassembleDetailed(code []byte, address uint64) ([]Detai
 			}
 			di.WritesFlags = bool(updateFlags)
 
+			var writeback C.bool
+			if !C.ds_insn_writeback(insn, n, C.size_t(i), &writeback) {
+				return nil, fmt.Errorf("disasm: writeback read failed at instruction %d", i)
+			}
+			di.Writeback = bool(writeback)
+
+			var postIndex C.bool
+			if !C.ds_insn_arm64_post_index(insn, n, C.size_t(i), &postIndex) {
+				return nil, fmt.Errorf("disasm: post_index read failed at instruction %d", i)
+			}
+			di.PostIndex = bool(postIndex)
+
 			var opCount C.uint8_t
 			if !C.ds_insn_arm64_op_count(insn, n, C.size_t(i), &opCount) {
 				return nil, fmt.Errorf("disasm: op_count read failed at instruction %d", i)
@@ -513,25 +586,37 @@ func (d *Disassembler) DisassembleDetailed(code []byte, address uint64) ([]Detai
 // version-stable ds_arm64_operand layout by ds_insn_arm64_operand - into the
 // architecture-neutral Operand type.
 func convertARM64Operand(handle C.csh, op C.ds_arm64_operand) Operand {
+	base := Operand{
+		ShiftType:  int(op.shift_type),
+		ShiftValue: int(op.shift_value),
+		ExtType:    int(op.ext_type),
+	}
 	switch op.op_type {
 	case C.ARM64_OP_REG:
-		return Operand{Type: OperandReg, Reg: regName(handle, C.uint(op.reg))}
+		base.Type = OperandReg
+		base.Reg = regName(handle, C.uint(op.reg))
 	case C.ARM64_OP_IMM:
-		return Operand{Type: OperandImm, Imm: int64(op.imm)}
+		base.Type = OperandImm
+		base.Imm = int64(op.imm)
 	case C.ARM64_OP_FP:
-		return Operand{Type: OperandFP, FP: float64(op.fp)}
+		base.Type = OperandFP
+		base.FP = float64(op.fp)
 	case C.ARM64_OP_MEM:
-		m := MemOperand{Disp: int32(op.mem_disp)}
+		base.Type = OperandMem
+		base.Mem = MemOperand{
+			Disp:            int32(op.mem_disp),
+			IndexShiftType:  int(op.mem_shift_type),
+			IndexShiftValue: int(op.mem_shift_value),
+			IndexExtType:    int(op.mem_ext_type),
+		}
 		if op.mem_base != C.ARM64_REG_INVALID {
-			m.Base = regName(handle, C.uint(op.mem_base))
+			base.Mem.Base = regName(handle, C.uint(op.mem_base))
 		}
 		if op.mem_index != C.ARM64_REG_INVALID {
-			m.Index = regName(handle, C.uint(op.mem_index))
+			base.Mem.Index = regName(handle, C.uint(op.mem_index))
 		}
-		return Operand{Type: OperandMem, Mem: m}
-	default:
-		return Operand{Type: OperandInvalid}
 	}
+	return base
 }
 
 func regName(handle C.csh, reg C.uint) string {

@@ -377,6 +377,7 @@ func (p *sigParser) parseTypeParametersDecl() ([]*ir.TypeParam, bool) {
 	p.advance() // consume '>'
 	return params, true
 }
+
 // skipTypeParameters consumes a TypeParameters section ('<' TypeParameter+
 // '>') without building any representation of it - see
 // parseMethodSignature's doc comment for why. TypeParameter is

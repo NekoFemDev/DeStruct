@@ -134,7 +134,21 @@ type CodeItem struct {
 	DebugInfoOff  uint32
 	InsnsSize     uint32
 	InsnsOff      uint32
-	HandlersOff   uint32
+	// TriesOff points at the code item's try_item array (immediately
+	// after the instruction stream, 4-byte aligned).
+	TriesOff uint32
+	// HandlersOff points at the encoded_catch_handler_list (immediately
+	// after the try_item array).
+	HandlersOff uint32
+}
+
+// CatchHandler is one decoded encoded_catch_handler entry. TypeIdx is
+// -1 for a catch-all arm.
+type CatchHandler struct {
+	TypeIdx  int
+	TypeDesc string
+	Addr     uint32
+	CatchAll bool
 }
 
 // TryItem represents a try block
@@ -754,6 +768,234 @@ func (dex *DexFile) parseClassData(offset uint32) *ClassData {
 	return cd
 }
 
+// GetTryItems returns the code item's try_item array.
+func (dex *DexFile) GetTryItems(ci *CodeItem) []TryItem {
+	if ci == nil || ci.TriesSize == 0 || ci.TriesOff == 0 {
+		return nil
+	}
+	if dex.checkRange(ci.TriesOff, uint32(ci.TriesSize)*8, 4, "try items") != nil {
+		return nil
+	}
+	out := make([]TryItem, ci.TriesSize)
+	for i := 0; i < int(ci.TriesSize); i++ {
+		off := ci.TriesOff + uint32(i)*8
+		out[i] = TryItem{
+			StartAddr:  binary.LittleEndian.Uint32(dex.data[off : off+4]),
+			InsCount:   binary.LittleEndian.Uint16(dex.data[off+4 : off+6]),
+			HandlerOff: binary.LittleEndian.Uint16(dex.data[off+6 : off+8]),
+		}
+	}
+	return out
+}
+
+// GetCatchHandlers decodes one encoded_catch_handler. handlerOff is the
+// try_item's own offset relative to the encoded_catch_handler_list.
+func (dex *DexFile) GetCatchHandlers(ci *CodeItem, handlerOff uint16) []CatchHandler {
+	if ci == nil || ci.HandlersOff == 0 {
+		return nil
+	}
+	off64 := uint64(ci.HandlersOff) + uint64(handlerOff)
+	if off64 > uint64(math.MaxUint32) {
+		return nil
+	}
+	off := uint32(off64)
+	size, next, err := dex.readSLEB128(off)
+	if err != nil {
+		return nil
+	}
+	count := int(size)
+	catchAll := false
+	if size <= 0 {
+		count = -int(size)
+		catchAll = true
+	}
+	pos := next
+	var out []CatchHandler
+	for i := 0; i < count; i++ {
+		typeIdx, next, err := dex.readULEB128(pos)
+		if err != nil {
+			return out
+		}
+		addr, next, err := dex.readULEB128(next)
+		if err != nil {
+			return out
+		}
+		pos = next
+		out = append(out, CatchHandler{
+			TypeIdx:  int(typeIdx),
+			TypeDesc: dex.GetTypeDesc(typeIdx),
+			Addr:     addr,
+		})
+	}
+	if catchAll {
+		addr, _, err := dex.readULEB128(pos)
+		if err == nil {
+			out = append(out, CatchHandler{TypeIdx: -1, Addr: addr, CatchAll: true})
+		}
+	}
+	return out
+}
+
+// DebugLocal is one named local from debug_info_item.
+type DebugLocal struct {
+	Name     string
+	TypeDesc string
+}
+
+// DebugInfo is the decoded subset of a method's debug_info_item that the
+// decompiler uses.
+type DebugInfo struct {
+	ParamNames []string
+	Locals     map[int]DebugLocal
+	Lines      map[int]int
+}
+
+// GetDebugInfo decodes debug_info_item for a code item. Malformed or
+// truncated streams yield whatever was decoded so far.
+func (dex *DexFile) GetDebugInfo(ci *CodeItem) *DebugInfo {
+	if ci == nil || ci.DebugInfoOff == 0 {
+		return nil
+	}
+	off := ci.DebugInfoOff
+	_, next, err := dex.readULEB128(off) // line_start
+	if err != nil {
+		return nil
+	}
+	paramCount, next, err := dex.readULEB128(next)
+	if err != nil {
+		return nil
+	}
+	info := &DebugInfo{
+		ParamNames: make([]string, 0, paramCount),
+		Locals:     make(map[int]DebugLocal),
+		Lines:      make(map[int]int),
+	}
+	pos := next
+	for i := uint32(0); i < paramCount; i++ {
+		idx, next, err := dex.readULEB128(pos)
+		if err != nil {
+			return info
+		}
+		pos = next
+		if idx == 0 {
+			info.ParamNames = append(info.ParamNames, "")
+			continue
+		}
+		info.ParamNames = append(info.ParamNames, dex.GetString(idx-1))
+	}
+
+	address := uint32(0)
+	var line int32
+	for {
+		op, next, err := dex.readULEB128(pos)
+		if err != nil {
+			return info
+		}
+		pos = next
+		switch {
+		case op == 0x00: // DBG_END_SEQUENCE
+			return info
+		case op == 0x01: // DBG_ADVANCE_PC
+			delta, next, err := dex.readULEB128(pos)
+			if err != nil {
+				return info
+			}
+			pos = next
+			address += delta
+		case op == 0x02: // DBG_ADVANCE_LINE
+			delta, next, err := dex.readSLEB128(pos)
+			if err != nil {
+				return info
+			}
+			pos = next
+			line += delta
+		case op == 0x03 || op == 0x04: // START_LOCAL / START_LOCAL_EXTENDED
+			reg, next, err := dex.readULEB128(pos)
+			if err != nil {
+				return info
+			}
+			nameIdx, next, err := dex.readULEB128(next)
+			if err != nil {
+				return info
+			}
+			typeIdx, next, err := dex.readULEB128(next)
+			if err != nil {
+				return info
+			}
+			pos = next
+			if op == 0x04 {
+				_, next, err = dex.readULEB128(pos)
+				if err != nil {
+					return info
+				}
+				pos = next
+			}
+			if nameIdx != 0 {
+				local := DebugLocal{Name: dex.GetString(nameIdx - 1)}
+				if typeIdx != 0 {
+					local.TypeDesc = dex.GetTypeDesc(typeIdx - 1)
+				}
+				if _, exists := info.Locals[int(reg)]; !exists {
+					info.Locals[int(reg)] = local
+				}
+			}
+		case op == 0x05: // DBG_END_LOCAL
+			reg, next, err := dex.readULEB128(pos)
+			if err != nil {
+				return info
+			}
+			pos = next
+			_ = reg
+		case op == 0x06: // DBG_RESTART_LOCAL
+			reg, next, err := dex.readULEB128(pos)
+			if err != nil {
+				return info
+			}
+			pos = next
+			_ = reg
+		case op == 0x07 || op == 0x08: // prologue/epilogue markers
+		case op == 0x09: // DBG_SET_FILE
+			fileIdx, next, err := dex.readULEB128(pos)
+			if err != nil {
+				return info
+			}
+			pos = next
+			_ = fileIdx
+		default:
+			if op < 0x0a {
+				return info
+			}
+			adj := op - 0x0a
+			address += adj / 15
+			line += int32(adj%15) - 4
+			info.Lines[int(address)] = int(line)
+		}
+	}
+}
+
+// readSLEB128 reads a signed LEB128 value, returning the value and the
+// next offset.
+func (dex *DexFile) readSLEB128(offset uint32) (int32, uint32, error) {
+	var result int32
+	var shift uint32
+	pos := offset
+	for {
+		if int(pos) >= len(dex.data) || shift >= 32 {
+			return 0, pos, fmt.Errorf("truncated sleb128")
+		}
+		b := dex.data[pos]
+		pos++
+		result |= int32(b&0x7f) << shift
+		shift += 7
+		if b&0x80 == 0 {
+			if shift < 32 && b&0x40 != 0 {
+				result |= -1 << shift
+			}
+			return result, pos, nil
+		}
+	}
+}
+
 // GetCodeItem returns the code item for a method
 func (dex *DexFile) GetCodeItem(offset uint32) *CodeItem {
 	if offset == 0 {
@@ -785,9 +1027,11 @@ func (dex *DexFile) GetCodeItem(offset uint32) *CodeItem {
 			triesOff64 += 2
 		}
 		handlersOff64 := triesOff64 + uint64(ci.TriesSize)*8
-		if handlersOff64 <= uint64(math.MaxUint32) && dex.checkRange(uint32(handlersOff64), 1, 4, "code handlers") == nil {
-			handlersOff := uint32(handlersOff64)
-			ci.HandlersOff = binary.LittleEndian.Uint32(dex.data[handlersOff : handlersOff+4])
+		if triesOff64 <= uint64(math.MaxUint32) && dex.checkRange(uint32(triesOff64), 1, 8, "code tries") == nil {
+			ci.TriesOff = uint32(triesOff64)
+			if handlersOff64 <= uint64(math.MaxUint32) && dex.checkRange(uint32(handlersOff64), 1, 1, "code handlers") == nil {
+				ci.HandlersOff = uint32(handlersOff64)
+			}
 		}
 	}
 

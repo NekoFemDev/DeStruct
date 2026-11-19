@@ -82,6 +82,10 @@ func (s *BlockStmt) String() string {
 	return "{ ... }"
 }
 
+func (s *SynchronizedStmt) String() string {
+	return fmt.Sprintf("synchronized (%s) { ... }", s.Lock)
+}
+
 func (s *ThrowStmt) String() string {
 	return fmt.Sprintf("throw %s;", s.Value)
 }

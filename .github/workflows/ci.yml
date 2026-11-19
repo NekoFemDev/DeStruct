@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      # DeStruct links Capstone statically from third_party/capstone/build.
+      # Cache the pinned source tree and the built libcapstone.a keyed by
+      # the pinned version so ordinary runs skip the C build entirely.
+      - name: Cache Capstone
+        uses: actions/cache@v4
+        with:
+          path: |
+            capstone-6.0.0-Alpha11
+            third_party/capstone/build
+          key: capstone-${{ runner.os }}-6.0.0-Alpha11-v1
+
+      - name: Build Capstone
+        run: make capstone
+
+      - name: Check formatting
+        run: |
+          files="$(gofmt -l $(find . -name '*.go' \
+            -not -path './capstone-*' \
+            -not -path './third_party/*'))"
+          if [ -n "$files" ]; then
+            echo "gofmt needed for:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race)
+        run: go test -race ./...

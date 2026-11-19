@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,9 +18,9 @@ import (
 	"github.com/destruct/destruct/internal/archivelimits"
 	"github.com/destruct/destruct/internal/arm64lift"
 	"github.com/destruct/destruct/internal/atomicfile"
-	"github.com/destruct/destruct/internal/csharp"
 	"github.com/destruct/destruct/internal/dex"
 	unflutter "github.com/destruct/destruct/internal/flutter/unflutter-0.5.9/cmd/unflutter"
+	"github.com/destruct/destruct/internal/il2cpp"
 	"github.com/destruct/destruct/internal/ir"
 	javagen "github.com/destruct/destruct/internal/java"
 	"github.com/destruct/destruct/internal/jvm"
@@ -33,7 +34,6 @@ const (
 	FormatJVM Format = iota
 	FormatFlutter
 	FormatELF
-	FormatPE
 	FormatDEX
 )
 
@@ -45,7 +45,6 @@ type Options struct {
 	Deobf           bool
 	Project         bool
 	Decompile       bool
-	EnhanceComments bool
 	SourceLocations bool
 	SplitFunctions  bool
 	CrossReferences bool
@@ -56,6 +55,10 @@ type Options struct {
 	// internal/arm64lift.LoadOffsetDB). Empty means no IL2CPP metadata
 	// is loaded and the lifted output stays purely numeric.
 	IL2CPPOffsets string
+	// IL2CPPMetadata is the path to a Unity global-metadata.dat. When
+	// set (or auto-detected next to a libil2cpp.so), method names,
+	// parameter names and instance field names/offsets are recovered.
+	IL2CPPMetadata string
 	// EmitPseudo selects the unified pseudo-C rendering explicitly (the
 	// default). It exists so a caller can request the documented mode by
 	// name; it no longer has a mutually exclusive alternative.
@@ -68,6 +71,12 @@ type Options struct {
 
 type Pipeline struct {
 	opts Options
+	// dwarf is the optional debug-info index loaded for ELF
+	// decompilation; nil when the input has no usable DWARF.
+	dwarf *native.DWARFInfo
+	// il2cppIndex is the optional Unity metadata index loaded from
+	// --il2cpp-metadata (or auto-detected global-metadata.dat).
+	il2cppIndex *il2cpp.MetadataIndex
 }
 
 // Magic numbers for the cheap boundary-level signature checks below.
@@ -164,29 +173,13 @@ func (p *Pipeline) RunContext(ctx context.Context) error {
 		return p.decompileAndGenerateDEX(ctx)
 
 	case FormatELF:
-		if p.opts.Decompile && p.opts.SplitFunctions {
+		if p.opts.Decompile {
 			return p.decompileELFArm64(ctx)
-		}
-		if p.opts.Decompile && p.opts.EnhanceComments {
-			if err := p.decompileELFArm64(ctx); err != nil {
-				return err
-			}
-			return p.ApplyARM64DecompilationEnhancements()
 		}
 		return p.disassembleELF(ctx)
 
 	default:
-		prog, err := p.decompileELFOrPE(ctx)
-		if err != nil {
-			return fmt.Errorf("decompilation: %w", err)
-		}
-		gen := csharp.NewGenerator(csharp.Options{
-			OutputDir: p.opts.Output,
-			Project:   p.opts.Project,
-			Deobf:     p.opts.Deobf,
-			Verbose:   p.opts.Verbose,
-		})
-		return gen.Generate(prog)
+		return fmt.Errorf("unsupported input format")
 	}
 }
 
@@ -545,17 +538,6 @@ func (p *Pipeline) extractLibapp(ctx context.Context, apkPath string) (string, e
 	return "", fmt.Errorf("libapp.so not found in lib/arm64-v8a/")
 }
 
-func (p *Pipeline) decompileELFOrPE(ctx context.Context) (*ir.Program, error) {
-	// For now, use native disassembler for ELF files
-	ext := p.ext()
-
-	if ext == ".so" || ext == ".elf" || ext == "" {
-		return nil, p.disassembleELF(ctx)
-	}
-
-	return nil, fmt.Errorf("PE decompilation not yet implemented")
-}
-
 func (p *Pipeline) disassembleELF(ctx context.Context) error {
 	if p.opts.Decompile {
 		return p.decompileELFArm64(ctx)
@@ -644,6 +626,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	p.dwarf = nil
 	fmt.Printf("Parsing ELF file: %s\n", p.opts.Input)
 
 	elf, err := native.NewELFParserContext(ctx, p.opts.Input)
@@ -664,6 +647,45 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	strResolver := func(addr uint64) (string, bool) { return elf.ReadCString(addr) }
 	dataReader := elf.DataReader()
 
+	// Optional DWARF debug info: function/parameter names, source lines
+	// and simple frame-relative locals. A binary without debug sections
+	// is the common case and is not an error.
+	if di, derr := native.LoadDWARF(p.opts.Input); derr == nil {
+		p.dwarf = di
+		s := di.Summary()
+		fmt.Printf("DWARF: %d functions, %d lines, %d params, %d locals\n",
+			s.Functions, s.Lines, s.Params, s.Locals)
+		baseResolver := resolver
+		resolver = func(addr uint64) (string, bool) {
+			if fn, ok := di.FunctionAt(addr); ok && fn.Name != "" {
+				return fn.Name, true
+			}
+			return baseResolver(addr)
+		}
+	} else if !errors.Is(derr, native.ErrNoDWARF) {
+		fmt.Fprintf(os.Stderr, "warning: DWARF: %v\n", derr)
+	}
+
+	// Optional Unity IL2CPP metadata: method/parameter/field names.
+	p.il2cppIndex = nil
+	metadataPath := p.opts.IL2CPPMetadata
+	if metadataPath == "" {
+		metadataPath = findIL2CPPMetadata(p.opts.Input)
+	}
+	if metadataPath != "" {
+		res, ierr := il2cpp.RunContext(ctx, il2cpp.Options{
+			LibPath:      p.opts.Input,
+			MetadataPath: metadataPath,
+			Verbose:      p.opts.Verbose,
+			IndexOnly:    true,
+		})
+		if ierr != nil {
+			return fmt.Errorf("IL2CPP metadata: %w", ierr)
+		}
+		p.il2cppIndex = res.Index
+		fmt.Printf("IL2CPP metadata: %d methods from %s\n", res.MethodCount, metadataPath)
+	}
+
 	// IL2CPP mode: load the field-offset dump when one was given. The
 	// unified pseudo-C renderer always emits explicit pointer casts;
 	// register renaming remains an explicit --regs-as-vars choice.
@@ -675,11 +697,6 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 		}
 		fmt.Printf("IL2CPP offsets: %d classes loaded from %s\n", offsetDB.Count(), p.opts.IL2CPPOffsets)
 	}
-	liftOpts := arm64lift.LiftOptions{
-		Simplify:   p.opts.SimplifyCFG,
-		RegsAsVars: p.opts.RegsAsVars,
-	}
-
 	baseName := filepath.Base(p.opts.Input)
 
 	// LLVM IR mode writes every lifted function again, one LLVM define
@@ -727,6 +744,9 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	}
 
 	candidates := functionCandidatesFromSymbols(elf)
+	if p.dwarf != nil {
+		candidates = mergeDWARFCandidates(candidates, p.dwarf)
+	}
 	if len(candidates) == 0 {
 		// No usable function symbol anywhere (neither .symtab nor
 		// .dynsym has one - a stripped EXECUTABLE, most likely, since a
@@ -760,6 +780,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		liftOpts := p.liftOptionsFor(c)
 		code, codeOK := readFunctionCode(c, elf)
 		if !codeOK {
 			continue
@@ -785,6 +806,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 				Name:    c.name,
 				Size:    c.size,
 				Success: meta.Success,
+				Source:  c.source(),
 			})
 		} else {
 			func() {
@@ -794,7 +816,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 						fmt.Fprintf(f, "// %s\n// [failed to decompile: %v]\n\n", arm64lift.Demangle(c.name), r)
 					}
 				}()
-				stmts := arm64lift.LiftFunctionWithOptions(insns, nil, resolver, strResolver, dataReader, liftOpts)
+				stmts := arm64lift.LiftFunctionWithOptions(insns, c.params, resolver, strResolver, dataReader, liftOpts)
 				if len(stmts) == 0 {
 					empty++
 				} else {
@@ -828,6 +850,10 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 					ReduceGotos:         true,
 					CharConstants:       true,
 					AddressComments:     true,
+					LocalTypes:          liftOpts.LocalTypes,
+					ParamNames:          c.params,
+					ParamTypes:          c.paramTypes,
+					ReturnType:          c.returnType,
 				})
 				fmt.Fprintln(f)
 			}()
@@ -896,12 +922,40 @@ type funcCandidate struct {
 	addr uint64
 	size uint64
 	name string
+	// params are source parameter names recovered from DWARF (empty
+	// when no debug info is available).
+	params []string
+	// paramTypes are the matching C parameter types (empty strings
+	// default to uint64_t).
+	paramTypes []string
+	// returnType is the DWARF return type (empty when unknown).
+	returnType string
+	// sourceFile/sourceLine point at the DWARF declaration site.
+	sourceFile string
+	sourceLine int
+}
+
+func (c funcCandidate) source() string {
+	if c.sourceFile == "" {
+		return ""
+	}
+	if c.sourceLine > 0 {
+		return fmt.Sprintf("%s:%d", c.sourceFile, c.sourceLine)
+	}
+	return c.sourceFile
 }
 
 // writeFunctionLocation reports only known ELF virtual addresses. Lifted
 // statements can combine or reorder instructions, so a rendered C line has
 // no reliable instruction address to attach to it.
 func writeFunctionLocation(w io.Writer, c funcCandidate, insns []native.DetailedInstruction) {
+	if src := c.sourceFile; src != "" {
+		src = native.SourceName(src)
+		if c.sourceLine > 0 {
+			src = fmt.Sprintf("%s:%d", src, c.sourceLine)
+		}
+		fmt.Fprintf(w, "// Source: %s\n", src)
+	}
 	fmt.Fprintf(w, "// ELF function entry VA: 0x%x\n", c.addr)
 	if len(insns) > 0 && insns[0].Address != c.addr {
 		fmt.Fprintf(w, "// First decoded instruction VA: 0x%x\n", insns[0].Address)
@@ -914,6 +968,7 @@ type functionMeta struct {
 	Name    string `json:"name"`
 	Size    uint64 `json:"size"`
 	Success bool   `json:"success"`
+	Source  string `json:"source,omitempty"`
 }
 
 // splitFuncResult is the outcome of writing a single split-function file.
@@ -981,7 +1036,7 @@ func (p *Pipeline) writeSplitFunction(
 				fmt.Fprintf(outF, "// %s\n// [failed to decompile: %v]\n\n", arm64lift.Demangle(c.name), r)
 			}
 		}()
-		stmts := arm64lift.LiftFunctionWithOptions(insns, nil, resolver, strResolver, dataReader, liftOpts)
+		stmts := arm64lift.LiftFunctionWithOptions(insns, c.params, resolver, strResolver, dataReader, liftOpts)
 		result.Empty = len(stmts) == 0
 		result.Success = true
 		if p.opts.EmitLLVM && llMod != nil {
@@ -1006,6 +1061,10 @@ func (p *Pipeline) writeSplitFunction(
 			ReduceGotos:         true,
 			CharConstants:       true,
 			AddressComments:     true,
+			LocalTypes:          liftOpts.LocalTypes,
+			ParamNames:          c.params,
+			ParamTypes:          c.paramTypes,
+			ReturnType:          c.returnType,
 		})
 		fmt.Fprintln(outF)
 	}()
@@ -1016,6 +1075,129 @@ func (p *Pipeline) writeSplitFunction(
 	}
 
 	return result
+}
+
+// dwarfDebugInfo adapts one DWARF function to arm64lift.DebugInfo.
+type dwarfDebugInfo struct {
+	fn *native.DWARFFunction
+}
+
+func (d dwarfDebugInfo) LocalAt(off int64) (string, string, bool) {
+	if d.fn == nil {
+		return "", "", false
+	}
+	return d.fn.LocalAt(off)
+}
+
+// liftOptionsFor builds the per-function lift options, including the
+// DWARF local-name provider and the map the renderer reads type
+// declarations from.
+func (p *Pipeline) liftOptionsFor(c funcCandidate) arm64lift.LiftOptions {
+	opts := arm64lift.LiftOptions{
+		Simplify:   p.opts.SimplifyCFG,
+		RegsAsVars: p.opts.RegsAsVars,
+		LocalTypes: make(map[string]string),
+		ReturnType: c.returnType,
+	}
+	if p.dwarf != nil {
+		if fn, ok := p.dwarf.FunctionAt(c.addr); ok {
+			opts.Debug = dwarfDebugInfo{fn: fn}
+		}
+	}
+	if p.il2cppIndex != nil {
+		opts.Metadata = p.il2cppIndex
+	}
+	return opts
+}
+
+// findIL2CPPMetadata auto-detects the conventional metadata file next
+// to a libil2cpp.so.
+func findIL2CPPMetadata(input string) string {
+	if !strings.EqualFold(filepath.Base(input), "libil2cpp.so") {
+		return ""
+	}
+	path := filepath.Join(filepath.Dir(input), "global-metadata.dat")
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	return ""
+}
+
+// mergeDWARFCandidates enriches symbol-derived candidates with DWARF
+// parameter/source information and adds DWARF-only functions (static
+// helpers, stripped binaries without a usable symbol table).
+func mergeDWARFCandidates(candidates []funcCandidate, info *native.DWARFInfo) []funcCandidate {
+	byAddr := make(map[uint64]int, len(candidates))
+	for i := range candidates {
+		byAddr[candidates[i].addr] = i
+	}
+
+	for _, fn := range info.Functions {
+		if fn.HighPC <= fn.LowPC {
+			continue
+		}
+		params := make([]string, 0, len(fn.Params))
+		paramTypes := make([]string, 0, len(fn.Params))
+		for _, p := range fn.Params {
+			params = append(params, p.Name)
+			paramTypes = append(paramTypes, p.Type)
+		}
+		if idx, ok := byAddr[fn.LowPC]; ok {
+			c := &candidates[idx]
+			if c.name == "" || strings.HasPrefix(c.name, "sub_") {
+				c.name = fn.Name
+			}
+			if len(c.params) == 0 {
+				c.params = params
+				c.paramTypes = paramTypes
+				c.returnType = fn.ReturnType
+			}
+			if c.sourceFile == "" {
+				c.sourceFile = fn.DeclFile
+				c.sourceLine = fn.DeclLine
+			}
+			continue
+		}
+		candidates = append(candidates, funcCandidate{
+			addr:       fn.LowPC,
+			size:       fn.HighPC - fn.LowPC,
+			name:       fn.Name,
+			params:     params,
+			paramTypes: paramTypes,
+			returnType: fn.ReturnType,
+			sourceFile: fn.DeclFile,
+			sourceLine: fn.DeclLine,
+		})
+		byAddr[fn.LowPC] = len(candidates) - 1
+	}
+
+	// Enrich symbol candidates whose DWARF range starts elsewhere but
+	// still contains the symbol address (aliases, function sections).
+	for i := range candidates {
+		c := &candidates[i]
+		if c.sourceFile != "" && len(c.params) > 0 {
+			continue
+		}
+		if fn, ok := info.FunctionAt(c.addr); ok {
+			if len(c.params) == 0 {
+				for _, p := range fn.Params {
+					c.params = append(c.params, p.Name)
+					c.paramTypes = append(c.paramTypes, p.Type)
+				}
+				c.returnType = fn.ReturnType
+			}
+			if c.sourceFile == "" {
+				c.sourceFile = fn.DeclFile
+				c.sourceLine = fn.DeclLine
+			}
+			if c.name == "" || strings.HasPrefix(c.name, "sub_") {
+				c.name = fn.Name
+			}
+		}
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].addr < candidates[j].addr })
+	return candidates
 }
 
 // functionCandidatesFromSymbols builds the ordinary, name-bearing

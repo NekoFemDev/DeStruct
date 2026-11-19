@@ -1146,65 +1146,51 @@ func decompileControlFlowExcl(cf *ClassFile, instructions []Instruction, localVa
 
 		switch inst.Opcode {
 
-	case Ifeq, Ifne, Iflt, Ifge, Ifgt, Ifle,
-		IfIcmpeq, IfIcmpne, IfIcmplt, IfIcmpge, IfIcmpgt, IfIcmple,
-		IfAcmpeq, IfAcmpne, Ifnull, Ifnonnull:
-		if isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode) || isComp2Opcode(inst.Opcode) {
-			if links, invertedFlags, linkPreambles, linkStacks, bodyStart, bodyEnd, ok := matchOrChainGuard(cf, instructions, pc, localVars, className, stack); ok {
-				stmts, newPc := decompileOrChainGuard(cf, instructions, links, invertedFlags, linkPreambles, linkStacks, bodyStart, bodyEnd, localVars, className, boolParams, exceptionTable)
+		case Ifeq, Ifne, Iflt, Ifge, Ifgt, Ifle,
+			IfIcmpeq, IfIcmpne, IfIcmplt, IfIcmpge, IfIcmpgt, IfIcmple,
+			IfAcmpeq, IfAcmpne, Ifnull, Ifnonnull:
+			if isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode) || isComp2Opcode(inst.Opcode) {
+				if links, invertedFlags, linkPreambles, linkStacks, bodyStart, bodyEnd, ok := matchOrChainGuard(cf, instructions, pc, localVars, className, stack); ok {
+					stmts, newPc := decompileOrChainGuard(cf, instructions, links, invertedFlags, linkPreambles, linkStacks, bodyStart, bodyEnd, localVars, className, boolParams, exceptionTable)
+					if advance(newPc) {
+						result = append(result, stmts...)
+						continue
+					}
+				}
+			}
+			if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode)) && matchGuardClause(cf, instructions, pc, stack) {
+				stmts, newPc := decompileGuardClause(cf, instructions, pc, localVars, stack, className, boolParams, exceptionTable)
 				if advance(newPc) {
 					result = append(result, stmts...)
 					continue
 				}
 			}
-		}
-		if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode)) && matchGuardClause(cf, instructions, pc, stack) {
-			stmts, newPc := decompileGuardClause(cf, instructions, pc, localVars, stack, className, boolParams, exceptionTable)
-			if advance(newPc) {
-				result = append(result, stmts...)
-				continue
-			}
-		}
-		if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode)) && matchCompoundBoolean(cf, instructions, pc, localVars, stack, boolParams) {
-			mergeIdx := findCompoundBooleanEnd(instructions, pc)
-			if advance(mergeIdx) {
-				continue
-			}
-		}
-		if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode)) && matchBooleanTernary(cf, instructions, pc, stack, boolParams) {
-			mergeIdx := findBooleanTernaryEnd(instructions, pc)
-			if advance(mergeIdx) {
-				continue
-			}
-		}
-		if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode) || isComp2Opcode(inst.Opcode)) && matchGeneralTernary(cf, instructions, pc, stack, boolParams) {
-			mergeIdx := findGeneralTernaryEnd(instructions, pc)
-			if advance(mergeIdx) {
-				continue
-			}
-		}
-		if stmt, newPc := matchBoolToggle(cf, instructions, pc, stack, className, boolParams); stmt != nil {
-			if advance(newPc) {
-				result = append(result, stmt...)
-				continue
-			}
-		}
-		stmt, newPc := decompileIfElse(cf, instructions, pc, localVars, stack, className, boolParams, exceptionTable)
-		if stmt != nil {
-			if advance(newPc) {
-				if _, ok := stmt[0].(*ir.ForEachStmt); ok {
-					result = removeTrailingIteratorSetup(result)
+			if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode)) && matchCompoundBoolean(cf, instructions, pc, localVars, stack, boolParams) {
+				mergeIdx := findCompoundBooleanEnd(instructions, pc)
+				if advance(mergeIdx) {
+					continue
 				}
-				result = append(result, stmt...)
-				continue
 			}
-		}
-
-	case Goto:
-		offset := int16(inst.Operands[0])<<8 | int16(inst.Operands[1])
-		target := inst.Offset + int(offset)
-		if target < inst.Offset {
-			if stmt, newPc := tryWhileLoop(cf, instructions, pc, localVars, stack, className, boolParams, exceptionTable); stmt != nil {
+			if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode)) && matchBooleanTernary(cf, instructions, pc, stack, boolParams) {
+				mergeIdx := findBooleanTernaryEnd(instructions, pc)
+				if advance(mergeIdx) {
+					continue
+				}
+			}
+			if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode) || isComp2Opcode(inst.Opcode)) && matchGeneralTernary(cf, instructions, pc, stack, boolParams) {
+				mergeIdx := findGeneralTernaryEnd(instructions, pc)
+				if advance(mergeIdx) {
+					continue
+				}
+			}
+			if stmt, newPc := matchBoolToggle(cf, instructions, pc, stack, className, boolParams); stmt != nil {
+				if advance(newPc) {
+					result = append(result, stmt...)
+					continue
+				}
+			}
+			stmt, newPc := decompileIfElse(cf, instructions, pc, localVars, stack, className, boolParams, exceptionTable)
+			if stmt != nil {
 				if advance(newPc) {
 					if _, ok := stmt[0].(*ir.ForEachStmt); ok {
 						result = removeTrailingIteratorSetup(result)
@@ -1213,7 +1199,21 @@ func decompileControlFlowExcl(cf *ClassFile, instructions []Instruction, localVa
 					continue
 				}
 			}
-		}
+
+		case Goto:
+			offset := int16(inst.Operands[0])<<8 | int16(inst.Operands[1])
+			target := inst.Offset + int(offset)
+			if target < inst.Offset {
+				if stmt, newPc := tryWhileLoop(cf, instructions, pc, localVars, stack, className, boolParams, exceptionTable); stmt != nil {
+					if advance(newPc) {
+						if _, ok := stmt[0].(*ir.ForEachStmt); ok {
+							result = removeTrailingIteratorSetup(result)
+						}
+						result = append(result, stmt...)
+						continue
+					}
+				}
+			}
 
 		default:
 			if inst.Opcode == Tableswitch || inst.Opcode == Lookupswitch {
@@ -1790,13 +1790,13 @@ func decompileBlockBody(cf *ClassFile, instructions []Instruction, start, end in
 		if isBranchOpcode(inst.Opcode) && inst.Opcode != Goto {
 			if isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode) || isComp2Opcode(inst.Opcode) {
 				ifMatched := false
-			if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode) || isComp2Opcode(inst.Opcode)) && matchGeneralTernary(cf, instructions, j, tempStack, boolParams) {
-				mergeIdx := findGeneralTernaryEnd(instructions, j)
-				if mergeIdx > j {
-					j = mergeIdx
-					ifMatched = true
+				if (isConditionZeroOpcode(inst.Opcode) || isCompZeroOpcode(inst.Opcode) || isComp2Opcode(inst.Opcode)) && matchGeneralTernary(cf, instructions, j, tempStack, boolParams) {
+					mergeIdx := findGeneralTernaryEnd(instructions, j)
+					if mergeIdx > j {
+						j = mergeIdx
+						ifMatched = true
+					}
 				}
-			}
 				if !ifMatched {
 					if stmt, newJ := matchArrayInit(cf, instructions, j, localVars, tempStack, className); newJ > j {
 						if stmt != nil {
@@ -2089,10 +2089,10 @@ type elseIfChainLink struct {
 // if-chains) take effectively forever to decompile.
 func collectElseIfChain(cf *ClassFile, instructions []Instruction, firstCond ir.Expr, firstThenStart, firstThenEnd, chainEnd int, localVars map[uint16]string, className string, boolParams *boolTypeInfo, exceptionTable []ExceptionEntry) (ir.Stmt, int) {
 	type link struct {
-		cond      ir.Expr
+		cond          ir.Expr
 		preambleStmts []ir.Stmt
-		thenStart int
-		thenEnd   int // exclusive, does not include the trailing Goto
+		thenStart     int
+		thenEnd       int // exclusive, does not include the trailing Goto
 	}
 
 	links := []link{{cond: firstCond, thenStart: firstThenStart, thenEnd: firstThenEnd}}
@@ -2301,7 +2301,7 @@ func decompileIfElse(cf *ClassFile, instructions []Instruction, pc int, localVar
 			Then: &ir.Block{Statements: thenStmts},
 			Else: &ir.Block{Statements: elseStmts},
 		}
-	return []ir.Stmt{stmt}, elseEnd
+		return []ir.Stmt{stmt}, elseEnd
 	}
 
 	thenStmts := decompileBlockBody(cf, instructions, thenStart, elseStart, localVars, className, boolParams, exceptionTable)
@@ -2395,7 +2395,7 @@ func tryForEachLoop(cf *ClassFile, instructions []Instruction, gotoPc int, condI
 	castTypeName := cf.GetClassName(castRefIdx)
 	elemType := &ir.ClassType{Name: castTypeName}
 
- astoreInst := instructions[nextIdx+2]
+	astoreInst := instructions[nextIdx+2]
 	if astoreInst.Opcode != Astore && (astoreInst.Opcode < Astore0 || astoreInst.Opcode > Astore3) {
 		return nil, 0
 	}
@@ -2438,7 +2438,7 @@ func tryForEachLoop(cf *ClassFile, instructions []Instruction, gotoPc int, condI
 			methodName := cf.GetMethodName(refIdx)
 			if methodName == "iterator" {
 				if i+1 < len(instructions) {
-				 astoreInst2 := instructions[i+1]
+					astoreInst2 := instructions[i+1]
 					if astoreInst2.Opcode == Astore || (astoreInst2.Opcode >= Astore0 && astoreInst2.Opcode <= Astore3) {
 						var storedIdx byte
 						if astoreInst2.Opcode >= Astore0 && astoreInst2.Opcode <= Astore3 {
@@ -2934,7 +2934,7 @@ func matchBoolToggle(cf *ClassFile, instructions []Instruction, pc int, stack *e
 	}
 
 	thenBody := instructions[pc+1 : elseStart-1]
-	elseBody := instructions[elseStart : elseEnd]
+	elseBody := instructions[elseStart:elseEnd]
 
 	isBoolPush := func(body []Instruction) bool {
 		if len(body) != 1 {
@@ -3316,5 +3316,3 @@ func findSwitchMerge(instructions []Instruction, pc int, caseOffsets []int, defa
 	last := instructions[len(instructions)-1]
 	return last.Offset + instructionSize(last)
 }
-
-

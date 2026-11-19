@@ -253,6 +253,8 @@ func (p *ELFParser) parseHeader() error {
 
 	p.Header.Class = p.Data[4]
 	p.Header.Data = p.Data[5]
+	p.Header.Version = p.Data[6]
+	p.Header.OSABI = p.Data[7]
 	if p.Header.Class != ELFCLASS32 && p.Header.Class != ELFCLASS64 {
 		return fmt.Errorf("invalid ELF class %d", p.Header.Class)
 	}

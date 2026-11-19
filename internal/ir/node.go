@@ -10,6 +10,9 @@ type Class struct {
 	Access     AccessFlags
 	SuperClass string
 	Interfaces []string
+	// Annotations holds source-level annotations (e.g. @Nullable,
+	// @SuppressLint("...")) recovered from DEX metadata.
+	Annotations []*Annotation
 	// TypeParams holds this class's own generic type parameter
 	// declarations, if any - e.g. "class Box<T extends Comparable<T>>"
 	// has one: {Name: "T", Bounds: [ClassType{Comparable<T>}]}. Empty/nil
@@ -37,6 +40,8 @@ type Field struct {
 	Name   string
 	Type   Type
 	Access AccessFlags
+	// Annotations holds field-level source annotations.
+	Annotations []*Annotation
 }
 
 type Method struct {
@@ -46,15 +51,31 @@ type Method struct {
 	ReturnType Type
 	Body       *Block
 	Exceptions []string
+	// Annotations holds method-level source annotations.
+	Annotations []*Annotation
 }
 
 type Param struct {
 	Name string
 	Type Type
+	// Annotations holds parameter-level source annotations.
+	Annotations []*Annotation
 }
 
 type Block struct {
 	Statements []Stmt
+}
+
+// Annotation is one Java source annotation. Elements are already
+// rendered as Java expressions/literals.
+type Annotation struct {
+	Type     string
+	Elements []AnnotationElement
+}
+
+type AnnotationElement struct {
+	Name  string
+	Value string
 }
 
 type Stmt interface {
@@ -255,6 +276,12 @@ type (
 	BlockStmt struct {
 		Block *Block
 	}
+	// SynchronizedStmt is a Java synchronized(lock) { body } block
+	// reconstructed from monitor-enter/monitor-exit pairs.
+	SynchronizedStmt struct {
+		Lock Expr
+		Body *Block
+	}
 	ThrowStmt struct {
 		Value Expr
 	}
@@ -281,25 +308,26 @@ type (
 	}
 )
 
-func (*AssignStmt) stmtNode()    {}
-func (*ReturnStmt) stmtNode()    {}
-func (*ExprStmt) stmtNode()      {}
-func (*SuperCallStmt) stmtNode() {}
-func (*ThisCallStmt) stmtNode()  {}
-func (*IfStmt) stmtNode()        {}
-func (*WhileStmt) stmtNode()     {}
-func (*DoWhileStmt) stmtNode()   {}
-func (*ForStmt) stmtNode()       {}
-func (*SwitchStmt) stmtNode()    {}
-func (*TryStmt) stmtNode()       {}
-func (*ForEachStmt) stmtNode()   {}
-func (*BlockStmt) stmtNode()     {}
-func (*ThrowStmt) stmtNode()     {}
-func (*VarDeclStmt) stmtNode()   {}
-func (*BreakStmt) stmtNode()     {}
-func (*ContinueStmt) stmtNode()  {}
-func (*LabelStmt) stmtNode()     {}
-func (*GotoStmt) stmtNode()      {}
+func (*AssignStmt) stmtNode()       {}
+func (*ReturnStmt) stmtNode()       {}
+func (*ExprStmt) stmtNode()         {}
+func (*SuperCallStmt) stmtNode()    {}
+func (*ThisCallStmt) stmtNode()     {}
+func (*IfStmt) stmtNode()           {}
+func (*WhileStmt) stmtNode()        {}
+func (*DoWhileStmt) stmtNode()      {}
+func (*ForStmt) stmtNode()          {}
+func (*SwitchStmt) stmtNode()       {}
+func (*TryStmt) stmtNode()          {}
+func (*ForEachStmt) stmtNode()      {}
+func (*BlockStmt) stmtNode()        {}
+func (*SynchronizedStmt) stmtNode() {}
+func (*ThrowStmt) stmtNode()        {}
+func (*VarDeclStmt) stmtNode()      {}
+func (*BreakStmt) stmtNode()        {}
+func (*ContinueStmt) stmtNode()     {}
+func (*LabelStmt) stmtNode()        {}
+func (*GotoStmt) stmtNode()         {}
 
 type (
 	IntLit    struct{ Value int64 }
@@ -338,7 +366,13 @@ type (
 		// owning class. FieldName, when set, is what String renders.
 		Offset    uint64 // byte displacement from Object
 		HasOffset bool
+		// Disp is the same displacement in signed form, needed for the
+		// negative offsets ldur/stur and some ldr/str forms use. Offset
+		// remains the unsigned IL2CPP-facing value (only valid when
+		// HasOffset is true).
+		Disp      int32
 		Width     int    // access width in bytes (8/4/2/1), 0 unknown
+		CType     string // explicit C type ("float", "double"), empty = width-derived
 		FieldName string // resolved IL2CPP field name
 		TypeName  string // owning IL2CPP class full name
 	}
@@ -376,6 +410,13 @@ type (
 	ArrayAccess struct {
 		Array Expr
 		Index Expr
+		// Width is the element access width in bytes (1/2/4/8), or 0
+		// when unknown (JVM arrays use 0; the ARM64 lifter fills it from
+		// the load/store register). Renderers that need a concrete C
+		// type treat 0 as 8 (uint64_t).
+		Width int
+		// CType overrides Width for FP/SIMD accesses ("float"/"double").
+		CType string
 	}
 	CastExpr struct {
 		Type Type

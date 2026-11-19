@@ -568,7 +568,14 @@ func (e *emitter) store(target ir.Expr, val string) {
 		e.emit("store i64 %s, i64* %s", val, ptr)
 	case *ir.ArrayAccess:
 		ptr := e.elemPtr(t)
-		e.emit("store i64 %s, i64* %s", val, ptr)
+		ty := llvmIntType(t.Width)
+		storeVal := val
+		if ty != "i64" {
+			tr := e.tmp()
+			e.emit("%s = trunc i64 %s to %s", tr, val, ty)
+			storeVal = tr
+		}
+		e.emit("store %s %s, %s* %s", ty, storeVal, ty, ptr)
 	default:
 		e.emit("; store to unsupported target %T", target)
 	}
@@ -584,13 +591,32 @@ func (e *emitter) fieldPtr(f *ir.FieldAccess) string {
 func (e *emitter) elemPtr(a *ir.ArrayAccess) string {
 	base := e.expr(a.Array)
 	idx := e.expr(a.Index)
+	width := a.Width
+	if width <= 0 {
+		width = 8
+	}
 	off := e.tmp()
-	e.emit("%s = mul i64 %s, 8", off, idx)
+	e.emit("%s = mul i64 %s, %d", off, idx, width)
 	addr := e.tmp()
 	e.emit("%s = add i64 %s, %s", addr, base, off)
 	p := e.tmp()
-	e.emit("%s = inttoptr i64 %s to i64*", p, addr)
+	e.emit("%s = inttoptr i64 %s to %s*", p, addr, llvmIntType(width))
 	return p
+}
+
+// llvmIntType maps an IR access width in bytes to the matching LLVM
+// integer type. Unknown widths keep the historical i64 representation.
+func llvmIntType(width int) string {
+	switch width {
+	case 1:
+		return "i8"
+	case 2:
+		return "i16"
+	case 4:
+		return "i32"
+	default:
+		return "i64"
+	}
 }
 
 // cond lowers a condition expression to an i1 operand.
@@ -689,8 +715,14 @@ func (e *emitter) expr(x ir.Expr) string {
 		return t
 	case *ir.ArrayAccess:
 		ptr := e.elemPtr(v)
+		ty := llvmIntType(v.Width)
 		t := e.tmp()
-		e.emit("%s = load i64, i64* %s", t, ptr)
+		e.emit("%s = load %s, %s* %s", t, ty, ty, ptr)
+		if ty != "i64" {
+			z := e.tmp()
+			e.emit("%s = zext %s %s to i64", z, ty, t)
+			return z
+		}
 		return t
 	case *ir.BinaryExpr:
 		if c, ok := e.compare(v); ok {

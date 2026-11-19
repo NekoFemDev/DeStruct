@@ -1,4 +1,4 @@
-.PHONY: build clean test capstone ensure-capstone download capstone-latest update-capstone capstone-version capstone-clean install-termux uninstall-termux
+.PHONY: build clean test test-race vet lint fmt run capstone ensure-capstone download capstone-latest update-capstone capstone-version capstone-clean install-termux uninstall-termux
 
 BINARY=destruct
 MODULE=github.com/destruct/destruct
@@ -77,8 +77,14 @@ uninstall-termux:
 test:
 	go test ./...
 
+test-race:
+	go test -race ./...
+
 vet:
 	go vet ./...
+
+fmt:
+	gofmt -w $$(find . -name '*.go' -not -path './capstone-*' -not -path './third_party/*')
 
 lint:
 	golangci-lint run
@@ -87,7 +93,7 @@ run:
 	go run ./cmd/destruct
 
 help:
-	@echo "DeStruct - Decompiler to C#"
+	@echo "DeStruct - Multi-format decompiler & reverse-engineering toolkit"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make build    Build the binary (includes Capstone)"
@@ -99,7 +105,9 @@ help:
 	@echo "  make capstone-clean Remove all fetched Capstone sources"
 	@echo "  make clean    Remove build artifacts"
 	@echo "  make test     Run tests"
+	@echo "  make test-race Run tests with the race detector"
 	@echo "  make vet      Run go vet"
+	@echo "  make fmt      Format all Go sources"
 	@echo "  make lint     Run golangci-lint"
 	@echo "  make run      Run without building"
 	@echo "  make help     Show this help"

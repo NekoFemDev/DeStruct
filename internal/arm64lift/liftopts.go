@@ -27,6 +27,15 @@ type MetadataProvider interface {
 	FieldAtOffset(typeName string, offset uint64) (fieldName, fieldType string, ok bool)
 }
 
+// DebugInfo supplies source-level names for frame-relative locals from
+// DWARF. It is optional: a nil provider keeps the synthetic local_N
+// naming.
+type DebugInfo interface {
+	// LocalAt maps a DW_AT_frame_base-relative offset (DW_OP_fbreg) to
+	// a local's source name and C type.
+	LocalAt(frameOffset int64) (name, ctype string, ok bool)
+}
+
 // LiftOptions configures LiftFunctionWithOptions. All fields default to
 // the original lifter behavior.
 type LiftOptions struct {
@@ -51,4 +60,18 @@ type LiftOptions struct {
 	// declaring type of `this`) and resolves field accesses on `this`
 	// to their IL2CPP field names.
 	Metadata MetadataProvider
+
+	// Debug, when non-nil, supplies DWARF source names/types for
+	// frame-relative locals.
+	Debug DebugInfo
+
+	// LocalTypes is filled during lifting with the C type of every
+	// local recovered from Debug; the renderer consumes it to declare
+	// locals with their real types instead of the default int64_t.
+	LocalTypes map[string]string
+
+	// ReturnType is the DWARF return type. When it is "float"/"double"
+	// liftRet returns s0/d0 directly instead of bitcasting them into
+	// the generic uint64_t result.
+	ReturnType string
 }

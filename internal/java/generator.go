@@ -96,9 +96,10 @@ func (g *Generator) generateClass(class *ir.Class) error {
 	imports := collectImports(class)
 
 	tmpl, err := template.New("class").Funcs(template.FuncMap{
-		"acc":  accessStr,
-		"fmod": fieldModStr,
-		"mmod": methodModStr,
+		"acc":              accessStr,
+		"fmod":             fieldModStr,
+		"mmod":             methodModStr,
+		"renderAnnotation": renderAnnotation,
 		"typeName": func(t ir.Type) string {
 			if t == nil {
 				return "void"
@@ -107,11 +108,7 @@ func (g *Generator) generateClass(class *ir.Class) error {
 		},
 		"jtype": classNameToJava,
 		"params": func(params []*ir.Param) string {
-			var parts []string
-			for _, p := range params {
-				parts = append(parts, fmt.Sprintf("%s %s", typeName(p.Type), p.Name))
-			}
-			return strings.Join(parts, ", ")
+			return renderParams(params)
 		},
 		"typeParams": func(params []*ir.TypeParam) string {
 			if len(params) == 0 {
@@ -435,6 +432,15 @@ func renderStmt(s ir.Stmt, depth int) string {
 		}
 		result += indent + "}"
 		return result
+	case *ir.SynchronizedStmt:
+		result := indent + "synchronized (" + fmt.Sprint(v.Lock) + ") {\n"
+		if v.Body != nil {
+			for _, stmt := range v.Body.Statements {
+				result += renderStmt(stmt, depth+1) + "\n"
+			}
+		}
+		result += indent + "}"
+		return result
 	case *ir.TryStmt:
 		result := indent + "try "
 		if len(v.Resources) > 0 {
@@ -629,6 +635,12 @@ func collectImports(class *ir.Class) []string {
 
 	var walkStmt func(s ir.Stmt)
 
+	walkAnnotations := func(anns []*ir.Annotation) {
+		for _, ann := range anns {
+			addImport(ann.Type)
+		}
+	}
+
 	var walkExpr func(e ir.Expr)
 	walkExpr = func(e ir.Expr) {
 		if e == nil {
@@ -750,6 +762,19 @@ func collectImports(class *ir.Class) []string {
 			for _, arg := range v.Args {
 				walkExpr(arg)
 			}
+		case *ir.BlockStmt:
+			if v.Block != nil {
+				for _, stmt := range v.Block.Statements {
+					walkStmt(stmt)
+				}
+			}
+		case *ir.SynchronizedStmt:
+			walkExpr(v.Lock)
+			if v.Body != nil {
+				for _, stmt := range v.Body.Statements {
+					walkStmt(stmt)
+				}
+			}
 		case *ir.TryStmt:
 			for _, r := range v.Resources {
 				walkType(r.VarType)
@@ -780,11 +805,14 @@ func collectImports(class *ir.Class) []string {
 	}
 	for _, field := range class.Fields {
 		walkType(field.Type)
+		walkAnnotations(field.Annotations)
 	}
 	for _, method := range class.Methods {
 		walkType(method.ReturnType)
+		walkAnnotations(method.Annotations)
 		for _, param := range method.Params {
 			walkType(param.Type)
+			walkAnnotations(param.Annotations)
 		}
 		if method.Body != nil {
 			for _, stmt := range method.Body.Statements {
@@ -792,6 +820,7 @@ func collectImports(class *ir.Class) []string {
 			}
 		}
 	}
+	walkAnnotations(class.Annotations)
 
 	sort.Strings(imports)
 	return imports
@@ -985,10 +1014,38 @@ func renderNestedClass(class *ir.Class, g *Generator) string {
 	return b.String()
 }
 
+func renderAnnotation(a *ir.Annotation) string {
+	if a == nil || a.Type == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("@")
+	b.WriteString(classNameToJava(a.Type))
+	if len(a.Elements) > 0 {
+		b.WriteString("(")
+		for i, e := range a.Elements {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			if e.Name != "" {
+				b.WriteString(e.Name)
+				b.WriteString(" = ")
+			}
+			b.WriteString(e.Value)
+		}
+		b.WriteString(")")
+	}
+	return b.String()
+}
+
 func renderParams(params []*ir.Param) string {
 	var parts []string
 	for _, p := range params {
-		parts = append(parts, typeName(p.Type)+" "+p.Name)
+		prefix := ""
+		for _, ann := range p.Annotations {
+			prefix += renderAnnotation(ann) + " "
+		}
+		parts = append(parts, prefix+typeName(p.Type)+" "+p.Name)
 	}
 	return strings.Join(parts, ", ")
 }
@@ -1005,6 +1062,7 @@ const javaTemplate = `{{- if .Package}}package {{.Package}};
 {{end}}{{- if .Imports}}
 {{- range .Imports}}import {{.}};
 {{end}}
+{{end}}{{- range .Annotations}}{{renderAnnotation .}}
 {{end}}{{- if .Access.IsPublic}}public {{end -}}
 {{- if .Access.IsAbstract}}abstract {{end -}}
 {{- if .Access.IsFinal}}final {{end -}}
@@ -1012,9 +1070,15 @@ const javaTemplate = `{{- if .Package}}package {{.Package}};
 {{- if .Interfaces}} implements {{range $i, $iface := .Interfaces}}{{if $i}}, {{end}}{{jtype $iface}}{{end}}{{end}} {
 
 {{- range .Fields}}
+{{- range .Annotations}}
+	{{renderAnnotation .}}
+{{- end}}
 	{{acc .Access}}{{fmod .Access}}{{typeName .Type}} {{.Name}};
 {{- end}}
 {{- range .Methods}}
+{{- range .Annotations}}
+	{{renderAnnotation .}}
+{{- end}}
 {{- if eq .Name "<init>"}}
 	{{acc .Access}}{{$.Name}}({{params .Params}}) {
 		{{ctorCall .}}

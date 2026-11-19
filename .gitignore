@@ -35,11 +35,6 @@ go.work.sum
 # - see COMMANDS.md; also removed by `make clean`)
 output/
 
-# Transient enhancement-test output directories created by test scripts
-enhanced_output_*/
-test_output_*/
-test_error_output/
-
 # Keep the internal/output package used by the Flutter/libapp.so analyzer.
 !internal/flutter/unflutter-0.5.9/internal/output/
 

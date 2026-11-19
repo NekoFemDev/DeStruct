@@ -175,7 +175,9 @@ func (o *cOptimizer) expr(e ir.Expr) ir.Expr {
 			Name:      v.Name,
 			Offset:    v.Offset,
 			HasOffset: v.HasOffset,
+			Disp:      v.Disp,
 			Width:     v.Width,
+			CType:     v.CType,
 			FieldName: v.FieldName,
 			TypeName:  v.TypeName,
 		}
@@ -198,7 +200,7 @@ func (o *cOptimizer) expr(e ir.Expr) ir.Expr {
 	case *ir.ArrayInitExpr:
 		out = &ir.ArrayInitExpr{ElemType: v.ElemType, Elems: o.exprs(v.Elems)}
 	case *ir.ArrayAccess:
-		out = &ir.ArrayAccess{Array: o.expr(v.Array), Index: o.expr(v.Index)}
+		out = &ir.ArrayAccess{Array: o.expr(v.Array), Index: o.expr(v.Index), Width: v.Width, CType: v.CType}
 	default:
 		out = e
 	}

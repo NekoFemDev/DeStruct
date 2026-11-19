@@ -82,6 +82,8 @@ func CloneStmt(s Stmt) Stmt {
 		return &ForEachStmt{VarName: v.VarName, VarType: CloneType(v.VarType), Expr: CloneExpr(v.Expr), Body: CloneBlock(v.Body)}
 	case *BlockStmt:
 		return &BlockStmt{Block: CloneBlock(v.Block)}
+	case *SynchronizedStmt:
+		return &SynchronizedStmt{Lock: CloneExpr(v.Lock), Body: CloneBlock(v.Body)}
 	case *ThrowStmt:
 		return &ThrowStmt{Value: CloneExpr(v.Value)}
 	case *VarDeclStmt:
@@ -157,7 +159,9 @@ func CloneExpr(e Expr) Expr {
 			Name:      v.Name,
 			Offset:    v.Offset,
 			HasOffset: v.HasOffset,
+			Disp:      v.Disp,
 			Width:     v.Width,
+			CType:     v.CType,
 			FieldName: v.FieldName,
 			TypeName:  v.TypeName,
 		}
@@ -174,7 +178,7 @@ func CloneExpr(e Expr) Expr {
 	case *ArrayInitExpr:
 		return &ArrayInitExpr{ElemType: CloneType(v.ElemType), Elems: cloneExprs(v.Elems)}
 	case *ArrayAccess:
-		return &ArrayAccess{Array: CloneExpr(v.Array), Index: CloneExpr(v.Index)}
+		return &ArrayAccess{Array: CloneExpr(v.Array), Index: CloneExpr(v.Index), Width: v.Width, CType: v.CType}
 	case *CastExpr:
 		return &CastExpr{Type: CloneType(v.Type), Expr: CloneExpr(v.Expr)}
 	case *ThisExpr:
