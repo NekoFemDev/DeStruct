@@ -74,4 +74,22 @@ type LiftOptions struct {
 	// liftRet returns s0/d0 directly instead of bitcasting them into
 	// the generic uint64_t result.
 	ReturnType string
+
+	// CodeContains reports whether an address falls inside an executable
+	// section of the input image. liftTailCall uses it to distinguish an
+	// unresolved cross-function tail call (e.g. a context-restore
+	// trampoline with no unwind entry) from an intra-function branch
+	// target the lifter failed to model. nil keeps the old behavior of
+	// ignoring unresolved tail calls.
+	CodeContains func(uint64) bool
+
+	// KnownFunction reports whether an address is a separately decompiled
+	// function entry. liftCall uses it to avoid inlining a real function
+	// that happens to lie inside this lift's instruction range.
+	KnownFunction func(uint64) bool
+
+	// CondMiss, when non-nil, is called with the condition operator and
+	// instruction address each time a select/branch condition cannot be
+	// reconstructed (no live comparison snapshot). Diagnostics only.
+	CondMiss func(op string, addr uint64)
 }

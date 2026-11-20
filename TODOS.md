@@ -33,14 +33,21 @@ byte/halfword/unscaled loads and stores, register-indexed addressing,
 `movz/movk/movn`, the flag/select family, general `ldp/stp`,
 pre/post-indexed writeback, `madd/msub`, `udiv/sdiv`, bitfields,
 sign/zero extension, signed loads, basic acquire/release/exclusive
-accesses, x29-relative stack slots, and scalar FP arithmetic/
-conversions (`fadd/fsub/fmul/fdiv`, `fcmp`, `fcsel`, `scvtf`, `fcvtzs`,
-`fmov` bitcasts, typed float/double loads/stores). DWARF supplies
-function/parameter names, declaration source comments and simple
-frame-local names/types; slots without DWARF get a width-derived
-int8/16/32/64 type. The largest remaining gaps are SIMD vector ops
-(`ld1/st1`), `cas`-family atomics, per-statement line comments and full
-function signatures.
+accesses, x29-relative stack slots, scalar FP arithmetic/conversions
+(`fadd/fsub/fmul/fdiv`, `fcmp`, `fcsel`, `scvtf`, `fcvtzs`, `fmov`
+bitcasts, typed float/double loads/stores), the `cas` family, and
+single/multi-register `ld1/st1` with lane-wise vector arithmetic.
+DWARF supplies function/parameter names, declaration source comments
+and simple frame-local names/types; slots without DWARF get a
+width-derived int8/16/32/64 type. For stripped binaries, gap-based
+`.eh_frame` boundaries are refined using direct call targets, prologue
+shapes, return-followed-by-prologue boundaries and writable relative
+function pointers; direct `bl` targets become independently lifted
+functions and absolute data addresses are mapped through the original
+load image. Remaining gaps are exact type recovery, full signatures
+beyond the eight ABI argument slots, quad-precision arithmetic and
+behavioral fidelity for split blocks that depended on a caller's
+callee-saved registers/stack.
 
 ### P1 — instruction coverage
 
@@ -104,6 +111,49 @@ and parameter), debug_info parameter/local names and decoded line tables.
 Tests live in `internal/dex/try_debug_test.go` and
 `internal/dex/syntax_test.go`; the `zenin` fixture validates try_item,
 handler, annotation and monitor parsing.
+
+Sprint 9 (2026-11-20) is complete:
+valid C floating literals (`1.0f` instead of `1f`), integer-backed
+stack slots with `ENI_BITCAST_*` access for mixed int/FP views (so one
+slot no longer splits into `local_N`/`dlocal_N`), bitcasts for integer
+ALU ops on `d`/`s` registers, tail-call forwarding of untouched ABI
+argument registers, unresolved executable tail targets kept as calls,
+`b.mi`/`b.pl` condition mapping, and capped indentation for extremely
+deep control flow. Regression tests live in
+`internal/arm64lift/quazar_regression_test.go` and `render_test.go`.
+On `test/quazar_arm64` (761 `.eh_frame` functions) decompilation
+reports 761/761 functions with 0 empty/0 failed, all 761 generated
+translation units compile as AArch64 objects, and `elf recompile`
+links a dummy executable successfully.
+
+Sprint 10 (2026-11-20) is complete:
+original ELF load-image reconstruction (`image.bin` + `image.c`) and
+`ENI_ADDR` rewriting for absolute data references; `.rela.dyn`
+`R_AARCH64_RELATIVE` and `GLOB_DAT`/`ABS64` relocation replay in
+`image_relocs.c` (data pointers rebased into the image, function
+pointers redirected to lifted `sub_*` or generated `ext_*` stubs);
+function-address arguments render as `&sub_*` / `&ext_*`; tail calls now
+emit `return callee(...)` instead of discarding the result; `ret` with
+no explicit write returns the incoming `x0`. On `quazar_arm64`: 32,971
+absolute references map inside the 11 MiB image, 1,699 relative/GOT
+relocations are replayed at startup, and vtables/init arrays/atexit
+handlers point at decompiled functions. Remaining: 569 `bl` targets
+inside existing function ranges (outlined blocks) and ~1.5k unresolved
+`func_*` stubs.
+
+Sprint 11 (2026-11-20) is complete:
+function-boundary refinement for stripped binaries. `.eh_frame` gap
+sizes are re-split using direct `bl` targets, prologue-shaped branch
+targets, `ret`-followed-by-prologue boundaries, writable relative
+function pointers, and cross-function tail branches. Every call target,
+including tail-jump alias entries, becomes a lifted function;
+straight-line intra-function calls are inlined when not split.
+Conditional-compare coverage now includes `fccmp`/`fccmpe` and `ccmn`.
+On `quazar_arm64` this raised recovery from 761 to 1721 entries, with
+0 unresolved `func_*` targets, 0 unresolved `cond` placeholders, 8
+empty ret-only entries, 0 failed, and all 1723 generated units (plus
+image/relocation units) compiling for AArch64. Tests live in
+`internal/arm64lift/quazar_regression_test.go`.
 
 Remaining:
 - [ ] Per-statement source-line comments.

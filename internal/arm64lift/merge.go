@@ -19,6 +19,9 @@ import "math/bits"
 type cfgAnalysis struct {
 	preds map[uint64]int
 	ipdom map[uint64]uint64
+	// blocks is the set of real block starts (unlike preds, which can
+	// contain external branch targets that never became blocks).
+	blocks map[uint64]bool
 	// partialIPDom is a second, deliberately looser set of merge points:
 	// the immediate post-dominator computed while treating terminating
 	// paths (returns, unresolved tail calls) as imposing NO constraint -
@@ -51,8 +54,12 @@ const exitNode = ^uint64(0)
 // post-dominator, so they never become merge points - the safe outcome.
 func analyzeCFG(blocks []*BasicBlock) *cfgAnalysis {
 	a := &cfgAnalysis{
-		preds: computePredCounts(blocks),
-		ipdom: make(map[uint64]uint64),
+		preds:  computePredCounts(blocks),
+		ipdom:  make(map[uint64]uint64),
+		blocks: make(map[uint64]bool, len(blocks)),
+	}
+	for _, b := range blocks {
+		a.blocks[b.StartAddr] = true
 	}
 	if len(blocks) == 0 {
 		return a

@@ -24,7 +24,7 @@ import (
 	"github.com/destruct/destruct/internal/pipeline"
 )
 
-const version = "1.0.0-beta.4"
+const version = "1.0.0-beta.5"
 
 func main() {
 	// Cancel in-flight work on Ctrl-C (SIGINT) or SIGTERM. Long-running

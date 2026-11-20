@@ -263,6 +263,34 @@ func TestRenderCFunction_DeclarationsAndCasts(t *testing.T) {
 	}
 }
 
+func TestRenderCFunction_ImageAndFunctionPointers(t *testing.T) {
+	stmts := []ir.Stmt{
+		&ir.AssignStmt{Target: &ir.LocalVar{Name: "a"}, Value: &ir.AddrLit{Value: 0x2000}},
+		&ir.AssignStmt{Target: &ir.LocalVar{Name: "b"}, Value: &ir.AddrLit{Value: 0x3000}},
+	}
+	var buf bytes.Buffer
+	RenderCFunctionWithOptions(&buf, "test_fn", stmts, CRenderOptions{
+		HasImage:  true,
+		ImageBase: 0x1000,
+		FunctionPtr: func(addr uint64) (string, bool) {
+			if addr == 0x3000 {
+				return "sub_3000", true
+			}
+			return "", false
+		},
+	})
+	out := buf.String()
+	for _, want := range []string{
+		"a = ENI_ADDR(0x2000);",
+		"b = (uintptr_t)&sub_3000;",
+		"extern uint64_t sub_3000();",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in:\n%s", want, out)
+		}
+	}
+}
+
 func TestRenderCFunction_AddrLitUsesNumericCast(t *testing.T) {
 	stmts := []ir.Stmt{
 		&ir.AssignStmt{
@@ -294,6 +322,26 @@ func TestRenderCFunction_NormalizesLabels(t *testing.T) {
 	for _, want := range []string{"goto LABEL_1;", "LABEL_1:;", "LABEL_2:;", "goto LABEL_3;", "LABEL_3:;"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestCFloatLit(t *testing.T) {
+	cases := []struct {
+		v    float64
+		bits int
+		want string
+	}{
+		{1, 32, "1.0f"},
+		{0.5, 32, "0.5f"},
+		{-2, 32, "-2.0f"},
+		{1e20, 32, "1e+20f"},
+		{1, 64, "1.0"},
+		{3.25, 64, "3.25"},
+	}
+	for _, c := range cases {
+		if got := cFloatLit(c.v, c.bits); got != c.want {
+			t.Errorf("cFloatLit(%v, %d) = %q, want %q", c.v, c.bits, got, c.want)
 		}
 	}
 }

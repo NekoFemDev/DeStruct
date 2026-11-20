@@ -77,6 +77,23 @@ type Pipeline struct {
 	// il2cppIndex is the optional Unity metadata index loaded from
 	// --il2cpp-metadata (or auto-detected global-metadata.dat).
 	il2cppIndex *il2cpp.MetadataIndex
+	// codeContains reports whether an address lies in an executable
+	// section of the ELF currently being decompiled.
+	codeContains func(uint64) bool
+	// elfImageBase/elfImageSize describe the original load image emitted
+	// alongside split output for absolute-address reconstruction.
+	elfImageBase uint64
+	elfImageSize uint64
+	// functionPtr maps an address to the C symbol of a lifted or imported
+	// function, for function-pointer arguments and tables.
+	functionPtr func(uint64) (string, bool)
+	// knownFunction reports candidate function starts to the lifter so it
+	// doesn't inline a real function that happens to sit inside a larger
+	// lift range.
+	knownFunction func(uint64) bool
+	// condMiss counts unresolved condition operators for diagnostics.
+	condMiss        map[string]int
+	condMissSamples []string
 }
 
 // Magic numbers for the cheap boundary-level signature checks below.
@@ -646,6 +663,17 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	resolver := annotatedELFResolver(ctx, elf)
 	strResolver := func(addr uint64) (string, bool) { return elf.ReadCString(addr) }
 	dataReader := elf.DataReader()
+	p.codeContains = func(addr uint64) bool {
+		for _, s := range elf.Sections {
+			if s.Flags&native.SHF_EXECINSTR == 0 || s.Size == 0 || addr < s.Addr {
+				continue
+			}
+			if addr-s.Addr < s.Size {
+				return true
+			}
+		}
+		return false
+	}
 
 	// Optional DWARF debug info: function/parameter names, source lines
 	// and simple frame-relative locals. A binary without debug sections
@@ -736,17 +764,36 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 		defer f.Abort()
 	}
 
+	// Reconstruct the original load image so absolute addresses in the
+	// lifted code can index real data instead of unmapped host memory.
+	imageDir := p.opts.Output
+	if p.opts.SplitFunctions {
+		imageDir = splitDir
+	}
+	p.elfImageBase, p.elfImageSize = 0, 0
+	if imgBase, imgSize, ierr := writeELFImage(elf, imageDir); ierr != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot write ELF image: %v\n", ierr)
+	} else if imgSize > 0 {
+		p.elfImageBase, p.elfImageSize = imgBase, imgSize
+		fmt.Printf("Reconstructed %d MiB load image (base 0x%x) for absolute addresses\n", imgSize>>20, imgBase)
+	}
+
 	// The unified pseudo-C mode is a self-contained translation unit:
 	// fixed-width integer includes plus one function definition per
 	// lifted symbol. No IL2CPP class header is generated.
 	if f != nil {
-		arm64lift.WriteCFilePreamble(f, baseName)
+		if p.elfImageSize > 0 {
+			arm64lift.WriteCFilePreambleWithImage(f, baseName, p.elfImageBase, p.elfImageSize)
+		} else {
+			arm64lift.WriteCFilePreamble(f, baseName)
+		}
 	}
 
 	candidates := functionCandidatesFromSymbols(elf)
 	if p.dwarf != nil {
 		candidates = mergeDWARFCandidates(candidates, p.dwarf)
 	}
+	fromUnwindFallback := false
 	if len(candidates) == 0 {
 		// No usable function symbol anywhere (neither .symtab nor
 		// .dynsym has one - a stripped EXECUTABLE, most likely, since a
@@ -761,9 +808,67 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 			var discoveredCandidates []funcCandidate
 			discoveredCandidates, resolver = withDiscoveredFunctions(discovered, resolver)
 			candidates = append(candidates, discoveredCandidates...)
+			fromUnwindFallback = true
 			fmt.Printf("No symbol table found - recovered %d function boundaries from .eh_frame_hdr instead\n", len(candidates))
 		} else {
 			fmt.Printf("warning: no function symbols and no .eh_frame_hdr fallback available (%v) - nothing to decompile\n", discErr)
+		}
+	}
+
+	// .eh_frame gap sizes are coarse when a binary contains functions
+	// without unwind entries. Split those gaps at direct call targets,
+	// prologue-shaped entries and writable relative-pointer targets.
+	if fromUnwindFallback {
+		var split int
+		candidates, resolver, split = splitCoarseFunctions(ctx, candidates, elf, d, resolver)
+		if split > 0 {
+			fmt.Printf("Split coarse unwind gaps - recovered %d additional functions (%d total)\n", split, len(candidates))
+		}
+	}
+
+	// Function-pointer references (initializers, atexit handlers, vtables
+	// passed by address) must resolve to lifted/imported C symbols rather
+	// than a pointer into the original code bytes.
+	knownStarts := make(map[uint64]bool, len(candidates))
+	for _, c := range candidates {
+		knownStarts[c.addr] = true
+	}
+	p.knownFunction = func(addr uint64) bool { return knownStarts[addr] }
+
+	p.functionPtr = nil
+	funcNames := make(map[uint64]string, len(candidates))
+	for _, c := range candidates {
+		if name := arm64lift.FunctionCName(c.name); isCIdent(name) {
+			funcNames[c.addr] = name
+		}
+	}
+	baseResolver := resolver
+	p.functionPtr = func(addr uint64) (string, bool) {
+		if name, ok := funcNames[addr]; ok {
+			return name, true
+		}
+		if p.codeContains == nil || !p.codeContains(addr) {
+			return "", false
+		}
+		raw, ok := baseResolver(addr)
+		if !ok || raw == "" || strings.HasPrefix(raw, "sub_") || strings.HasPrefix(raw, "func_") {
+			return "", false
+		}
+		name := arm64lift.ExternalCName(raw)
+		if !isCIdent(name) {
+			return "", false
+		}
+		return name, true
+	}
+
+	// Apply the original image's relative relocations so data pointers in
+	// the blob (vtables, init_array, string tables) become host pointers,
+	// and function pointers become addresses of lifted sub_* functions.
+	if p.elfImageSize > 0 {
+		if n, rerr := writeImageRelocations(ctx, elf, imageDir, p.elfImageBase, p.elfImageSize, candidates); rerr != nil {
+			fmt.Fprintf(os.Stderr, "warning: cannot write image relocations: %v\n", rerr)
+		} else if n > 0 {
+			fmt.Printf("Applied %d relative relocations to the load image\n", n)
 		}
 	}
 
@@ -775,6 +880,8 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	}
 
 	var ok, empty, failed int
+	p.condMiss = make(map[string]int)
+	p.condMissSamples = nil
 	lastReport := time.Now()
 	for _, c := range candidates {
 		if err := ctx.Err(); err != nil {
@@ -854,6 +961,9 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 					ParamNames:          c.params,
 					ParamTypes:          c.paramTypes,
 					ReturnType:          c.returnType,
+					ImageBase:           p.elfImageBase,
+					HasImage:            p.elfImageSize > 0,
+					FunctionPtr:         p.functionPtr,
 				})
 				fmt.Fprintln(f)
 			}()
@@ -897,6 +1007,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 			fmt.Printf("LLVM IR: %s\n", filepath.Join(p.opts.Output, baseName+".decompiled.ll"))
 		}
 	}
+	p.printCondMiss()
 	if f != nil {
 		if err := f.Commit(); err != nil {
 			return fmt.Errorf("write decompiled output: %w", err)
@@ -1026,7 +1137,11 @@ func (p *Pipeline) writeSplitFunction(
 	}
 	defer outF.Abort()
 
-	arm64lift.WriteCFilePreamble(outF, filepath.Base(p.opts.Input))
+	if p.elfImageSize > 0 {
+		arm64lift.WriteCFilePreambleWithImage(outF, filepath.Base(p.opts.Input), p.elfImageBase, p.elfImageSize)
+	} else {
+		arm64lift.WriteCFilePreamble(outF, filepath.Base(p.opts.Input))
+	}
 
 	var result splitFuncResult
 	func() {
@@ -1065,6 +1180,9 @@ func (p *Pipeline) writeSplitFunction(
 			ParamNames:          c.params,
 			ParamTypes:          c.paramTypes,
 			ReturnType:          c.returnType,
+			ImageBase:           p.elfImageBase,
+			HasImage:            p.elfImageSize > 0,
+			FunctionPtr:         p.functionPtr,
 		})
 		fmt.Fprintln(outF)
 	}()
@@ -1089,15 +1207,53 @@ func (d dwarfDebugInfo) LocalAt(off int64) (string, string, bool) {
 	return d.fn.LocalAt(off)
 }
 
+func (p *Pipeline) noteCondMiss(fn, instr uint64, op string) {
+	if op == "" {
+		op = "?"
+	}
+	p.condMiss[op]++
+	if len(p.condMissSamples) < 16 {
+		p.condMissSamples = append(p.condMissSamples, fmt.Sprintf("%s at 0x%x (fn 0x%x)", op, instr, fn))
+	}
+}
+
+func (p *Pipeline) printCondMiss() {
+	total := 0
+	for _, n := range p.condMiss {
+		total += n
+	}
+	if total == 0 {
+		return
+	}
+	keys := make([]string, 0, len(p.condMiss))
+	for op := range p.condMiss {
+		keys = append(keys, op)
+	}
+	sort.Slice(keys, func(i, j int) bool { return p.condMiss[keys[i]] > p.condMiss[keys[j]] })
+	parts := make([]string, 0, len(keys))
+	for _, op := range keys {
+		parts = append(parts, fmt.Sprintf("%s:%d", op, p.condMiss[op]))
+	}
+	fmt.Printf("Unresolved conditions: %d (%s)\n", total, strings.Join(parts, ", "))
+	if len(p.condMissSamples) > 0 {
+		fmt.Printf("  first misses: %s\n", strings.Join(p.condMissSamples, "; "))
+	}
+}
+
 // liftOptionsFor builds the per-function lift options, including the
 // DWARF local-name provider and the map the renderer reads type
 // declarations from.
 func (p *Pipeline) liftOptionsFor(c funcCandidate) arm64lift.LiftOptions {
 	opts := arm64lift.LiftOptions{
-		Simplify:   p.opts.SimplifyCFG,
-		RegsAsVars: p.opts.RegsAsVars,
-		LocalTypes: make(map[string]string),
-		ReturnType: c.returnType,
+		Simplify:      p.opts.SimplifyCFG,
+		RegsAsVars:    p.opts.RegsAsVars,
+		LocalTypes:    make(map[string]string),
+		ReturnType:    c.returnType,
+		CodeContains:  p.codeContains,
+		KnownFunction: p.knownFunction,
+		CondMiss: func(op string, addr uint64) {
+			p.noteCondMiss(c.addr, addr, op)
+		},
 	}
 	if p.dwarf != nil {
 		if fn, ok := p.dwarf.FunctionAt(c.addr); ok {

@@ -284,6 +284,16 @@ func LiftFunctionWithOptions(instructions []native.DetailedInstruction, paramNam
 	}
 	l.params = paramNames
 	l.seedParams()
+	l.functionInsns = instructions
+	l.insnIndex = make(map[uint64]int, len(instructions))
+	for i, in := range instructions {
+		l.insnIndex[in.Address] = i
+	}
+	if len(instructions) > 0 {
+		l.functionStart = instructions[0].Address
+		last := instructions[len(instructions)-1]
+		l.functionEnd = last.Address + uint64(last.Size)
+	}
 
 	blocks := buildCFG(instructions)
 	if opts.Simplify {
@@ -1630,7 +1640,7 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.addrRegs {
 		addrRegs[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, stackWidth: stackWidth, stackTyped: stackTyped, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq, x29Offset: l.x29Offset, x29Known: l.x29Known}
+	return &lifter{regs: regs, stack: stack, stackWidth: stackWidth, stackTyped: stackTyped, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq, x29Offset: l.x29Offset, x29Known: l.x29Known, functionInsns: l.functionInsns, insnIndex: l.insnIndex, functionStart: l.functionStart, functionEnd: l.functionEnd, outlinedDepth: l.outlinedDepth}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1741,6 +1751,13 @@ func condOpFromMnemonic(mnemonic string) string {
 		return "!="
 	case "b.lt":
 		return "<"
+	case "b.mi":
+		// Negative: the unconditional FP-compare form compilers emit
+		// for "less than" (b.pl is its "greater or equal" counterpart,
+		// modulo NaN, where PL is also set).
+		return "<"
+	case "b.pl":
+		return ">="
 	case "b.le":
 		return "<="
 	case "b.gt":
@@ -1788,8 +1805,8 @@ type lifter struct {
 	// stackWidth records the widest access seen for each stack slot and
 	// feeds basic local type inference when no DWARF type is known.
 	stackWidth map[int32]int
-	// stackTyped marks slots whose type came from DWARF (or FP naming)
-	// and must not be overwritten by the width heuristic.
+	// stackTyped marks slots whose type came from DWARF and must not be
+	// overwritten by the width heuristic.
 	stackTyped map[int32]bool
 
 	// x29Offset/x29Known track the frame pointer's displacement from
@@ -1799,6 +1816,16 @@ type lifter struct {
 	// locals instead of raw `*(uint64_t*)((uintptr_t)x29 - 0xN)`.
 	x29Offset int32
 	x29Known  bool
+
+	// functionInsns/insnIndex are the complete instruction stream of the
+	// function being lifted, used to inline straight-line intra-function
+	// calls ("bl" to a local label) with the caller's live register state.
+	functionInsns []native.DetailedInstruction
+	insnIndex     map[uint64]int
+	functionStart uint64
+	functionEnd   uint64
+	outlinedDepth int
+	curAddr       uint64
 
 	// params holds the declared parameter names in AAPCS64 register
 	// order, as given to LiftFunction.
@@ -2192,6 +2219,7 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 	var stmts []ir.Stmt
 
 	for _, inst := range instructions {
+		l.curAddr = inst.Address
 		switch inst.Mnemonic {
 		case "sub":
 			if len(inst.Operands) > 0 && isVectorReg(inst.Operands[0]) {
@@ -2382,7 +2410,7 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			stmts = append(stmts, l.liftLoad(inst, 2, &ir.PrimitiveType{Name: "short"})...)
 		case "ldrsw":
 			stmts = append(stmts, l.liftLoad(inst, 4, &ir.PrimitiveType{Name: "int"})...)
-		case "cmp", "ccmp":
+		case "cmp", "ccmp", "ccmn", "fccmp", "fccmpe":
 			l.liftCmp(inst)
 		case "csel", "csinc", "csinv", "csneg", "fcsel":
 			stmts = append(stmts, l.liftCsel(inst)...)
@@ -2428,7 +2456,7 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 // silently test an older comparison.
 func handlesFlags(mnemonic string) bool {
 	switch mnemonic {
-	case "cmp", "ccmp", "cmn", "tst", "subs", "adds", "ands", "negs", "bics", "fcmp", "fcmpe":
+	case "cmp", "ccmp", "ccmn", "fccmp", "fccmpe", "cmn", "tst", "subs", "adds", "ands", "negs", "bics", "fcmp", "fcmpe":
 		return true
 	}
 	return false
@@ -2655,11 +2683,6 @@ func (l *lifter) liftStr(inst native.DetailedInstruction, width int) []ir.Stmt {
 			}
 			l.stack[disp] = name
 		}
-		if ctype != "" {
-			name = fpStackName(disp, ctype)
-			l.stack[disp] = name
-			l.stackTyped[disp] = true
-		}
 		if dstOp.Mem.Base == "x29" && l.opts.Debug != nil {
 			if dname, dtype, ok := l.opts.Debug.LocalAt(int64(dstOp.Mem.Disp)); ok {
 				name = dname
@@ -2669,6 +2692,14 @@ func (l *lifter) liftStr(inst native.DetailedInstruction, width int) []ir.Stmt {
 					l.opts.LocalTypes[name] = dtype
 				}
 			}
+		}
+		if ctype != "" && !stackSlotTypedFP(l.opts.LocalTypes, name) {
+			// The slot is integer-backed (possibly because it is also
+			// read/written as an x/w register); preserve the FP value's
+			// bit pattern instead of renaming the slot to a second
+			// variable, which would split the storage.
+			l.consume(srcVal)
+			srcVal = bitcastFPToInt(srcVal, ctype)
 		}
 		l.noteStackWidth(disp, width)
 		l.consume(srcVal)
@@ -2783,20 +2814,18 @@ func (l *lifter) liftLdr(inst native.DetailedInstruction, width int, cast ir.Typ
 			}
 		}
 		if name, ok := l.stack[disp]; ok {
-			if ctype != "" && !strings.HasPrefix(name, "flocal_") && !strings.HasPrefix(name, "dlocal_") {
-				name = fpStackName(disp, ctype)
-				l.stack[disp] = name
-				l.stackTyped[disp] = true
-			}
 			l.noteStackWidth(disp, width)
-			return l.setReg(dstOp.Reg, wrap(&ir.LocalVar{Name: name}))
+			val := ir.Expr(&ir.LocalVar{Name: name})
+			if ctype != "" && !stackSlotTypedFP(l.opts.LocalTypes, name) {
+				val = bitcastIntToFP(val, ctype)
+			}
+			return l.setReg(dstOp.Reg, wrap(val))
 		}
 		if ctype != "" {
-			name := fpStackName(disp, ctype)
+			name := fmt.Sprintf("local_%d", disp)
 			l.stack[disp] = name
-			l.stackTyped[disp] = true
 			l.noteStackWidth(disp, width)
-			return l.setReg(dstOp.Reg, wrap(&ir.LocalVar{Name: name}))
+			return l.setReg(dstOp.Reg, wrap(bitcastIntToFP(&ir.LocalVar{Name: name}, ctype)))
 		}
 		return l.clobberReg(dstOp.Reg)
 	}
@@ -3586,11 +3615,63 @@ func setAccessCType(e ir.Expr, ctype string) {
 	}
 }
 
-func fpStackName(disp int32, ctype string) string {
-	if ctype == "float" {
-		return fmt.Sprintf("flocal_%d", disp)
+// stackSlotTypedFP reports whether a stack slot has a real float/double
+// declaration from DWARF. Such slots can store the value directly; every
+// other slot is integer-backed and FP accesses go through bitcasts so
+// integer and FP views of the same bytes keep aliasing one variable.
+func stackSlotTypedFP(types map[string]string, name string) bool {
+	t := types[name]
+	return t == "float" || t == "double"
+}
+
+func bitcastFPToInt(e ir.Expr, ctype string) ir.Expr {
+	if e == nil {
+		return nil
 	}
-	return fmt.Sprintf("dlocal_%d", disp)
+	macro := "ENI_BITCAST_U64"
+	if ctype == "float" {
+		macro = "ENI_BITCAST_U32"
+	}
+	return &ir.StaticMethodCall{Method: macro, Args: []ir.Expr{e}}
+}
+
+func bitcastIntToFP(e ir.Expr, ctype string) ir.Expr {
+	if e == nil {
+		return nil
+	}
+	macro := "ENI_BITCAST_F64"
+	if ctype == "float" {
+		macro = "ENI_BITCAST_F32"
+	}
+	return &ir.StaticMethodCall{Method: macro, Args: []ir.Expr{e}}
+}
+
+// fpViewBitcast converts a d/s register operand to its raw integer bits
+// (or the result back into the register's C view) for integer ALU ops on
+// vector registers, e.g. NEON "orr d0, d1, d2". Non-FP-view registers
+// pass through unchanged.
+func fpViewBitcast(reg string, e ir.Expr, toBits bool) ir.Expr {
+	if e == nil || len(reg) < 2 {
+		return e
+	}
+	var macro string
+	switch reg[0] {
+	case 'd':
+		if toBits {
+			macro = "ENI_BITCAST_U64"
+		} else {
+			macro = "ENI_BITCAST_F64"
+		}
+	case 's':
+		if toBits {
+			macro = "ENI_BITCAST_U32"
+		} else {
+			macro = "ENI_BITCAST_F32"
+		}
+	default:
+		return e
+	}
+	return &ir.StaticMethodCall{Method: macro, Args: []ir.Expr{e}}
 }
 
 func signedTypeForWidth(width int) string {
@@ -3950,18 +4031,37 @@ func (l *lifter) liftALU(inst native.DetailedInstruction) []ir.Stmt {
 	}
 	lhs := l.regValue(lhsOp.Reg)
 	l.consume(lhs)
+	// fadd/fsub/fmul/fdiv operate on real FP values; every other op in
+	// aluOps is an integer/bitwise operation, so d/s register operands
+	// must be viewed as their raw bits (NEON orr/and/eor, vector shifts).
+	integerOp := !strings.HasPrefix(inst.Mnemonic, "f")
+	if integerOp {
+		lhs = fpViewBitcast(lhsOp.Reg, lhs, true)
+	}
 
 	switch rhsOp.Type {
 	case native.OperandReg:
-		rhs := applyOperandShift(rhsOp, l.regValue(rhsOp.Reg))
-		l.consume(rhs)
-		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: rhs})
+		rhsVal := l.regValue(rhsOp.Reg)
+		l.consume(rhsVal)
+		if integerOp {
+			rhsVal = fpViewBitcast(rhsOp.Reg, rhsVal, true)
+		}
+		rhs := applyOperandShift(rhsOp, rhsVal)
+		val := ir.Expr(&ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: rhs})
+		if integerOp {
+			val = fpViewBitcast(dstOp.Reg, val, false)
+		}
+		return l.setReg(dstOp.Reg, val)
 	case native.OperandImm:
 		if !op.allowImm {
 			return nil
 		}
 		rhs := applyOperandShift(rhsOp, &ir.IntLit{Value: rhsOp.Imm})
-		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: rhs})
+		val := ir.Expr(&ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: rhs})
+		if integerOp {
+			val = fpViewBitcast(dstOp.Reg, val, false)
+		}
+		return l.setReg(dstOp.Reg, val)
 	case native.OperandFP:
 		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: fpLit(dstOp.Reg, rhsOp.FP)})
 	default:
@@ -4202,6 +4302,30 @@ func (l *lifter) collectCallArgsN(n int) []ir.Expr {
 	return args
 }
 
+// collectTailCallArgs is the tail-call counterpart of collectCallArgs:
+// every ABI argument register is forwarded. Registers the callee
+// explicitly set use their current value; untouched ones fall back to
+// their incoming register (x0..x7 in the generated signature), which is
+// exactly what the hardware jump would pass through.
+func (l *lifter) collectTailCallArgs() []ir.Expr {
+	args := make([]ir.Expr, 0, len(aapcs64IntArgRegs))
+	for _, reg := range aapcs64IntArgRegs {
+		v, ok := l.regs[reg]
+		if !ok {
+			args = append(args, &ir.LocalVar{Name: l.regName(reg)})
+			continue
+		}
+		if addr, isAddr := l.addrRegs[reg]; isAddr && l.strings != nil {
+			if s, ok := l.strings(addr); ok {
+				v = &ir.StringLit{Value: s}
+			}
+		}
+		l.consume(v)
+		args = append(args, v)
+	}
+	return args
+}
+
 // buildCall resolves target to a readable name via l.resolver (falling
 // back to a "func_<address>" placeholder if resolution fails or there
 // is no resolver) and builds the call expression from whatever's
@@ -4216,7 +4340,7 @@ func (l *lifter) collectCallArgsN(n int) []ir.Expr {
 // block). Returns ok=false when requireResolved is true and resolution
 // failed - the only failure case, since an ordinary unresolved call
 // still produces a usable (if uninformative) placeholder call.
-func (l *lifter) buildCall(target uint64, requireResolved bool) (ir.Expr, bool) {
+func (l *lifter) buildCall(target uint64, requireResolved bool, tail bool) (ir.Expr, bool) {
 	rawName := fmt.Sprintf("func_%x", target)
 	resolved := false
 	if l.resolver != nil {
@@ -4233,6 +4357,13 @@ func (l *lifter) buildCall(target uint64, requireResolved bool) (ir.Expr, bool) 
 	var args []ir.Expr
 	if n, known := knownArity[rawName]; known {
 		args = l.collectCallArgsN(n)
+	} else if tail {
+		// A tail call transfers whatever is still live in the ABI
+		// argument registers, not just the prefix explicitly written.
+		// The generated signature always declares x0..x7, so filling
+		// the untouched ones with their incoming register value keeps
+		// the jump faithful (a plain forward of the caller's args).
+		args = l.collectTailCallArgs()
 	} else {
 		args = l.collectCallArgs()
 	}
@@ -4313,11 +4444,56 @@ func (l *lifter) liftCall(inst native.DetailedInstruction) []ir.Stmt {
 		return nil
 	}
 	target := uint64(inst.Operands[0].Imm)
-	call, ok := l.buildCall(target, false)
+	if stmts, ok := l.inlineOutlinedCall(target); ok {
+		return stmts
+	}
+	call, ok := l.buildCall(target, false, false)
 	if !ok {
 		return nil
 	}
 	return l.finishCall(call)
+}
+
+// inlineOutlinedCall inlines a straight-line "bl" target located inside the
+// current function (a compiler-outlined local subroutine, common in
+// obfuscated binaries). The caller's live register/stack state is used
+// directly, so no ABI wrapper or context struct is needed. Branched or
+// recursive blocks fall back to the ordinary unresolved call path.
+func (l *lifter) inlineOutlinedCall(target uint64) ([]ir.Stmt, bool) {
+	if l.insnIndex == nil || l.outlinedDepth >= 4 {
+		return nil, false
+	}
+	if target <= l.functionStart || target >= l.functionEnd {
+		return nil, false
+	}
+	if l.opts.KnownFunction != nil && l.opts.KnownFunction(target) {
+		return nil, false
+	}
+	idx, ok := l.insnIndex[target]
+	if !ok {
+		return nil, false
+	}
+	end := idx
+	for end < len(l.functionInsns) {
+		in := l.functionInsns[end]
+		if in.Mnemonic == "ret" {
+			break
+		}
+		if in.Mnemonic == "br" || (isAnyBranch(in) && in.Mnemonic != "bl") {
+			return nil, false
+		}
+		if end-idx >= 200 {
+			return nil, false
+		}
+		end++
+	}
+	if end >= len(l.functionInsns) || l.functionInsns[end].Mnemonic != "ret" {
+		return nil, false
+	}
+	l.outlinedDepth++
+	stmts := l.run(l.functionInsns[idx:end])
+	l.outlinedDepth--
+	return stmts, true
 }
 
 // liftTailCall lifts a plain "b <addr>" as a tail call when its target
@@ -4329,23 +4505,38 @@ func (l *lifter) liftCall(inst native.DetailedInstruction) []ir.Stmt {
 // branch (a loop back-edge, say - not yet understood by this lifter)
 // is never misread as a call to a bogus "func_<addr>" placeholder.
 //
-// Unlike liftCall, the resulting call is emitted as its own ExprStmt
-// immediately: by definition nothing in THIS function reads its result
-// afterward (a real "ret" would have been used instead of a bare "b"
-// if something did), so there's no reason to leave it pending for
-// flushRemaining to pick up later.
+// Unlike liftCall, the resulting call is emitted as this function's
+// ReturnStmt immediately: the callee's result is forwarded to our own
+// caller (or is discarded if the callee never returns, e.g. abort).
 func (l *lifter) liftTailCall(inst native.DetailedInstruction) []ir.Stmt {
 	target, ok := branchTarget(inst)
 	if !ok {
 		return nil
 	}
-	call, ok := l.buildCall(target, true)
+	// A "b" whose target is a basic block of THIS function is an ordinary
+	// intra-function branch, not a tail call. run() lifts the block's
+	// instructions unconditionally, so without this check the synthetic
+	// unresolved-tail-target fallback would emit a bogus func_<addr>() and
+	// truncate the rest of the function.
+	if l.cfg != nil && l.cfg.blocks[target] {
+		return nil
+	}
+	call, ok := l.buildCall(target, true, true)
+	if !ok && l.opts.CodeContains != nil && l.opts.CodeContains(target) {
+		// Targets without unwind/symbol metadata (e.g. context-restore
+		// trampolines reached only by tail branches) still represent a
+		// real cross-function call. Keep the placeholder name rather
+		// than emitting nothing and producing an empty function body.
+		call, ok = l.buildCall(target, false, true)
+	}
 	if !ok {
 		return nil
 	}
 	stmts := l.finishCall(call)
 	l.consume(call)
-	return append(stmts, &ir.ExprStmt{Expr: call})
+	// A tail call's result IS this function's result: after the callee
+	// returns, its x0 is forwarded to our caller.
+	return append(stmts, &ir.ReturnStmt{Value: call})
 }
 
 // buildIndirectCall builds a call expression whose callee is an
@@ -4385,11 +4576,8 @@ func (l *lifter) liftBlr(inst native.DetailedInstruction) []ir.Stmt {
 // a C++ virtual-dispatch thunk (load a vtable slot, tail-call through
 // it, forwarding this function's own arguments unchanged) that
 // liftTailCall's own "b <addr>" handling can't cover, since there's no
-// resolvable address here at all. Exactly like liftTailCall: by
-// definition nothing in THIS function reads the result afterward (a
-// real "ret" would have been used instead if something did), so it's
-// emitted as its own ExprStmt immediately rather than left pending for
-// flushRemaining.
+// resolvable address here at all. Exactly like liftTailCall, the call is
+// the function's own ReturnStmt, forwarding the callee's result.
 func (l *lifter) liftBr(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 1 || inst.Operands[0].Type != native.OperandReg {
 		return nil
@@ -4397,7 +4585,9 @@ func (l *lifter) liftBr(inst native.DetailedInstruction) []ir.Stmt {
 	call := l.buildIndirectCall(inst.Operands[0].Reg)
 	stmts := l.finishCall(call)
 	l.consume(call)
-	return append(stmts, &ir.ExprStmt{Expr: call})
+	// As with a direct tail call, the callee's result is forwarded as
+	// this function's own return value.
+	return append(stmts, &ir.ReturnStmt{Value: call})
 }
 
 // looksLikeInstanceMethod reports whether a raw (still-mangled) Itanium
@@ -4445,6 +4635,9 @@ func demangle(name string) string {
 // placeholder, matching the branch path's own fallback.
 func (l *lifter) flagCondition(op string) ir.Expr {
 	if l.lastCmp == nil || op == "" || op == "?" {
+		if l.opts.CondMiss != nil {
+			l.opts.CondMiss(op, l.curAddr)
+		}
 		return &ir.LocalVar{Name: "cond"}
 	}
 	cmp := &ir.BinaryExpr{Op: op, Left: l.lastCmp.lhs, Right: l.lastCmp.rhs}
@@ -4796,7 +4989,7 @@ func truncateToBits(v uint64, bits uint) uint64 {
 // itself), but into l.lastCmp, for a following b.cond to build its
 // actual condition expression from (see liftCondition).
 func (l *lifter) liftCmp(inst native.DetailedInstruction) {
-	if inst.Mnemonic == "ccmp" {
+	if inst.Mnemonic == "ccmp" || inst.Mnemonic == "ccmn" || inst.Mnemonic == "fccmp" || inst.Mnemonic == "fccmpe" {
 		l.liftCcmp(inst)
 		return
 	}
@@ -4877,6 +5070,9 @@ func (l *lifter) liftCcmp(inst native.DetailedInstruction) {
 	default:
 		l.lastCmp = nil
 		return
+	}
+	if inst.Mnemonic == "ccmn" {
+		rhs = &ir.UnaryExpr{Op: "-", Expr: rhs}
 	}
 	nzcv := int(ops[2].Imm) & 0xf
 	l.lastCmp = &cmpOperands{lhs: lhs, rhs: rhs, combine: func(op string, cmp ir.Expr) ir.Expr {
@@ -5106,6 +5302,10 @@ func (l *lifter) liftRet() ir.Stmt {
 				l.consume(v)
 				return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "ENI_BITCAST_U32", Args: []ir.Expr{v}}}
 			}
+			// Neither integer return register was written: the ABI value
+			// is the incoming x0 argument unchanged (e.g. a "cbz x0;
+			// ...; ret" thunk that forwards its first argument).
+			return &ir.ReturnStmt{Value: &ir.LocalVar{Name: l.regName("x0")}}
 		}
 	}
 

@@ -2057,13 +2057,13 @@ func TestLiftFunction_IndirectTailCall(t *testing.T) {
 	if len(stmts) != 1 {
 		t.Fatalf("expected exactly 1 top-level statement (the tail call), got %v", stmts)
 	}
-	exprStmt, ok := stmts[0].(*ir.ExprStmt)
+	retStmt, ok := stmts[0].(*ir.ReturnStmt)
 	if !ok {
-		t.Fatalf("expected an ExprStmt, got %T: %v", stmts[0], stmts[0])
+		t.Fatalf("expected a ReturnStmt, got %T: %v", stmts[0], stmts[0])
 	}
-	call, ok := exprStmt.Expr.(*ir.IndirectCall)
+	call, ok := retStmt.Value.(*ir.IndirectCall)
 	if !ok {
-		t.Fatalf("expected an IndirectCall, got %#v", exprStmt.Expr)
+		t.Fatalf("expected an IndirectCall, got %#v", retStmt.Value)
 	}
 	outer, ok := call.Callee.(*ir.FieldAccess)
 	if !ok || outer.Name != "field_64" {

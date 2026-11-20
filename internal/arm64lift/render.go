@@ -82,8 +82,24 @@ func renderIfChainTail(w io.Writer, s *ir.IfStmt, depth int, indent string) {
 // whole-binary decompile (internal/pipeline) - so both stay in sync
 // automatically with any future ir.Stmt addition instead of drifting
 // into two, subtly different printers.
+// maxRenderIndentDepth caps indentation for pathologically deep control
+// flow (obfuscated binaries can nest hundreds of blocks). Without a cap a
+// single line can carry tens of thousands of spaces; the braces still show
+// the exact nesting.
+const maxRenderIndentDepth = 32
+
+func renderIndent(depth int) string {
+	if depth > maxRenderIndentDepth {
+		depth = maxRenderIndentDepth
+	}
+	if depth < 0 {
+		depth = 0
+	}
+	return strings.Repeat("    ", depth)
+}
+
 func RenderStmts(w io.Writer, stmts []ir.Stmt, depth int) {
-	indent := strings.Repeat("    ", depth)
+	indent := renderIndent(depth)
 	for _, s := range stmts {
 		prelude, s := hoistSharedExprs(s)
 		for _, p := range prelude {
@@ -271,6 +287,17 @@ static inline eni_uint128 name(T x) { \
 	io.WriteString(w, "\n")
 }
 
+// WriteCFilePreambleWithImage is WriteCFilePreamble plus the original ELF
+// load-image mapping used by ENI_ADDR. imageBase is the lowest virtual
+// address covered by the linked eni_image blob.
+func WriteCFilePreambleWithImage(w io.Writer, sourceName string, imageBase, imageSize uint64) {
+	WriteCFilePreamble(w, sourceName)
+	fmt.Fprintf(w, "extern unsigned char eni_image[];\n")
+	fmt.Fprintf(w, "#define ENI_IMAGE_BASE ((uintptr_t)0x%x)\n", imageBase)
+	fmt.Fprintf(w, "#define ENI_IMAGE_SIZE ((size_t)0x%x)\n", imageSize)
+	io.WriteString(w, "#define ENI_ADDR(a) ((uintptr_t)(eni_image + ((uintptr_t)(a) - ENI_IMAGE_BASE)))\n\n")
+}
+
 // CRenderOptions controls the readability passes applied while emitting
 // the unified pseudo-C translation unit.
 type CRenderOptions struct {
@@ -300,6 +327,16 @@ type CRenderOptions struct {
 	ParamTypes []string
 	// ReturnType optionally overrides the default uint64_t return type.
 	ReturnType string
+	// ImageBase, when HasImage is true, is the lowest virtual address of
+	// the original ELF load image. Absolute address constants render as
+	// ENI_ADDR(orig), indexing the eni_image blob linked by elf recompile
+	// instead of pointing at an unmapped host address.
+	ImageBase uint64
+	HasImage  bool
+	// FunctionPtr resolves an address that names a callable entry point
+	// to its emitted C symbol. Such addresses render as &sub_<addr> /
+	// &ext_<name> instead of a pointer into the image blob.
+	FunctionPtr func(uint64) (string, bool)
 }
 
 // RenderCFunction writes one lifted function as a complete C function
@@ -329,6 +366,9 @@ func RenderCFunctionWithOptions(w io.Writer, name string, stmts []ir.Stmt, opts 
 	r.paramNames = opts.ParamNames
 	r.paramTypes = opts.ParamTypes
 	r.returnType = opts.ReturnType
+	r.imageBase = opts.ImageBase
+	r.hasImage = opts.HasImage
+	r.functionPtr = opts.FunctionPtr
 	r.scanStmts(stmts)
 
 	var body bytes.Buffer
@@ -393,6 +433,9 @@ type cRenderer struct {
 	offsetComments  bool
 	charConstants   bool
 	addressComments bool
+	imageBase       uint64
+	hasImage        bool
+	functionPtr     func(uint64) (string, bool)
 }
 
 func newCRenderer(name string) *cRenderer {
@@ -697,6 +740,18 @@ func (r *cRenderer) emitMissingLabels(w *bytes.Buffer, indent string) {
 	}
 }
 
+// FunctionCName returns the C identifier emitted for a lifted function
+// name (DWARF names may contain namespace separators).
+func FunctionCName(raw string) string {
+	return safeCIdent(raw)
+}
+
+// ExternalCName returns the C symbol used for an imported function in the
+// generated pseudo-C (the "ext_" prefix avoids colliding with builtins).
+func ExternalCName(raw string) string {
+	return "ext_" + safeCIdent(raw)
+}
+
 func (r *cRenderer) callName(raw string) string {
 	name := safeCIdent(raw)
 	if name == "" {
@@ -775,7 +830,7 @@ func (r *cRenderer) scanStmts(stmts []ir.Stmt) {
 }
 
 func (r *cRenderer) stmtList(w *bytes.Buffer, stmts []ir.Stmt, depth int) {
-	indent := strings.Repeat("    ", depth)
+	indent := renderIndent(depth)
 	for _, s := range stmts {
 		if s == nil {
 			continue
@@ -1022,12 +1077,37 @@ func (r *cRenderer) exprParen(e ir.Expr) string {
 	return s
 }
 
+// addrExpr renders an AddrLit. With an image blob attached it indexes the
+// original ELF load image; otherwise it stays a plain numeric pointer.
+func (r *cRenderer) addrExpr(v *ir.AddrLit) string {
+	if r.functionPtr != nil {
+		if name, ok := r.functionPtr(v.Value); ok && name != "" {
+			r.calls[name] = true
+			s := "(uintptr_t)&" + name
+			if r.addressComments && v.Value >= 0x10000 {
+				s += " /* ADDR */"
+			}
+			return s
+		}
+	}
+	var s string
+	if r.hasImage {
+		s = fmt.Sprintf("ENI_ADDR(0x%x)", v.Value)
+	} else {
+		s = fmt.Sprintf("((uintptr_t)0x%x)", v.Value)
+	}
+	if r.addressComments && v.Value >= 0x10000 {
+		s += " /* ADDR */"
+	}
+	return s
+}
+
 func (r *cRenderer) addressBase(e ir.Expr, rendered string) string {
 	switch v := e.(type) {
 	case *ir.LocalVar:
 		return "(uintptr_t)" + r.useVar(v.Name)
 	case *ir.AddrLit:
-		return fmt.Sprintf("(uintptr_t)0x%x", v.Value)
+		return r.addrExpr(v)
 	default:
 		return "(uintptr_t)(" + rendered + ")"
 	}
@@ -1181,11 +1261,7 @@ func (r *cRenderer) expr(e ir.Expr) string {
 	case *ir.NullLit:
 		return "0"
 	case *ir.AddrLit:
-		s := fmt.Sprintf("((uintptr_t)0x%x)", v.Value)
-		if r.addressComments && v.Value >= 0x10000 {
-			s += " /* ADDR */"
-		}
-		return s
+		return r.addrExpr(v)
 	case *ir.LocalVar:
 		return r.useVar(v.Name)
 	case *ir.FieldAccess:
@@ -1260,6 +1336,11 @@ func cFloatLit(v float64, bits int) string {
 		return "0.0"
 	}
 	s := strconv.FormatFloat(v, 'g', -1, bits)
+	// A C floating constant needs a decimal point or exponent; "1f"
+	// is an invalid integer suffix rather than a float literal.
+	if !strings.ContainsAny(s, ".eE") {
+		s += ".0"
+	}
 	if bits == 32 {
 		return s + "f"
 	}

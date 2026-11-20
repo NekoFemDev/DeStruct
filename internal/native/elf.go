@@ -1351,6 +1351,50 @@ func (p *ELFParser) parseDynsym(ctx context.Context) ([]SymbolEntry, uint16, err
 	return syms, uint16(dynsymSec.Link), nil
 }
 
+// DynamicSymbol is one .dynsym entry with its name resolved.
+type DynamicSymbol struct {
+	Name  string
+	Info  uint8
+	Value uint64
+	Size  uint64
+}
+
+// DynamicSymbols resolves the complete .dynsym table to names. The
+// relocation pass uses it to distinguish imported functions (which can be
+// redirected to generated ext_* stubs) from data symbols.
+func (p *ELFParser) DynamicSymbols(ctx context.Context) []DynamicSymbol {
+	syms, strNdx, err := p.parseDynsym(ctx)
+	if err != nil || int(strNdx) >= len(p.Sections) {
+		return nil
+	}
+	strSec := p.Sections[strNdx]
+	out := make([]DynamicSymbol, len(syms))
+	for i, sym := range syms {
+		name := ""
+		start := strSec.Offset + uint64(sym.Name)
+		if start < uint64(len(p.Data)) {
+			if end := bytes.IndexByte(p.Data[start:], 0); end >= 0 {
+				name = string(p.Data[start : start+uint64(end)])
+			}
+		}
+		out[i] = DynamicSymbol{Name: name, Info: sym.Info, Value: sym.Value, Size: sym.Size}
+	}
+	return out
+}
+
+// DynamicRelocations returns the parsed .rela.dyn entries. Android PIE
+// images store most data pointers as R_AARCH64_RELATIVE relocations there
+// rather than as pre-relocated absolute values.
+func (p *ELFParser) DynamicRelocations(ctx context.Context) []RelaEntry {
+	for _, sec := range p.Sections {
+		if sec.Type != SHT_RELA || p.getSectionName(sec) != ".rela.dyn" {
+			continue
+		}
+		return p.parseRelaSection(ctx, sec)
+	}
+	return nil
+}
+
 // parseRelaSection parses any SHT_RELA section (.rela.plt or .rela.dyn)
 // into its individual relocation entries.
 func (p *ELFParser) parseRelaSection(ctx context.Context, sec SectionHeader) []RelaEntry {

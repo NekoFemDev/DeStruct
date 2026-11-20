@@ -272,7 +272,12 @@ Prints a readelf-style triage summary without decompiling:
 **`--decompile`** (AArch64 only): instead of assembly listing, lifts every function
 through the ARM64→pseudocode lifter (`internal/arm64lift`) and writes one file —
 `<name>.decompiled.c` — containing all functions in sequence, each under its own
-`// symbol_name`.
+`// symbol_name`. For stripped binaries, `.eh_frame` gap boundaries are refined
+using direct `bl` targets, prologue shapes, `ret`-followed-by-prologue
+boundaries, writable relative function pointers and cross-function tail
+branches, so the output routinely contains many more functions than the raw
+unwind table. A final `Unresolved conditions:` summary reports any
+select/branch flags that could not be reconstructed.
 
 **`--split-functions`** / **`-sf`** (AArch64 + `--decompile` only): creates a
 `<input_name>_decompiled/` directory, writes each function to its own `.c` file
@@ -302,9 +307,23 @@ function stubs, variable stubs and a dummy `main`), then invokes:
 clang -std=c11 -w -o <binary> <all .c files>
 ```
 
-The output binary is a dummy executable suitable for link-time validation, not
-a functional reimplementation of the original library. If `-o` is omitted the
-binary is written to `<decompiled_dir>/decompiled_dummy`.
+Split ELF decompilation also writes:
+
+- `image.bin` — the original load image (allocated section contents, gaps
+  zero-filled, bss zeroed);
+- `image.c` — an `.incbin` wrapper defining `eni_image`;
+- `image_relocs.c` — a constructor replaying `.rela.dyn` relative/GOT
+  relocations against that image at startup.
+
+Absolute data addresses in the generated C render through
+`ENI_ADDR(orig_va)` instead of a raw pointer, function-address arguments
+render as `&sub_*`/`&ext_*`, and data pointers in vtables/init arrays are
+rebased to host addresses before `main` runs. This makes global reads and
+writes land in the reconstructed image rather than an unmapped address.
+
+The output binary is still a dummy executable (stubbed imports, dummy
+`main`) suitable for link-time and structural validation, not a functional
+reimplementation of the original application.
 
 **`--emit-llvm`** (AArch64 only; implies `--decompile`): in addition to
 `.decompiled.c`, writes `<name>.decompiled.ll` — each lifted function as LLVM IR
