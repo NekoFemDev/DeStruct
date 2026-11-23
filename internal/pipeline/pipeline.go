@@ -91,9 +91,9 @@ type Pipeline struct {
 	// doesn't inline a real function that happens to sit inside a larger
 	// lift range.
 	knownFunction func(uint64) bool
-	// outlinedContexts maps outlined entry points to the callee-saved
-	// registers they inherit from their dispatcher.
-	outlinedContexts map[uint64][]string
+	// outlinedContexts maps outlined entry points to the caller state
+	// (registers and stack) they inherit from their dispatcher.
+	outlinedContexts map[uint64]arm64lift.OutlinedContext
 	// condMiss counts unresolved condition operators for diagnostics.
 	condMiss        map[string]int
 	condMissSamples []string
@@ -886,6 +886,9 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 			fmt.Printf("Applied %d relative relocations to the load image\n", n)
 		}
 	}
+	if err := writeTargetResolver(imageDir, candidates, p.elfImageBase, p.elfImageSize); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot write target resolver: %v\n", err)
+	}
 
 	// Optional cross-reference pre-pass: discover callers/callees before
 	// emitting output so each function can carry XREF comments.
@@ -1266,7 +1269,8 @@ func (p *Pipeline) liftOptionsFor(c funcCandidate) arm64lift.LiftOptions {
 		ReturnType:             c.returnType,
 		CodeContains:           p.codeContains,
 		KnownFunction:          p.knownFunction,
-		OutlinedContextRegs:    p.outlinedContexts[c.addr],
+		OutlinedContextRegs:    p.outlinedContexts[c.addr].Regs,
+		OutlinedStack:          p.outlinedContexts[c.addr].Stack,
 		OutlinedContextTargets: p.outlinedContexts,
 		CondMiss: func(op string, addr uint64) {
 			p.noteCondMiss(c.addr, addr, op)

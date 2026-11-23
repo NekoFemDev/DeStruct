@@ -14,7 +14,29 @@ import (
 // them. The dispatcher stores the live x19..x28 values here immediately
 // before the indirect branch; the outlined entry reloads them on entry.
 // Index i corresponds to x(19+i).
-const eniOutlinedCtx = "eni_outlined_ctx"
+const (
+	eniOutlinedCtx        = "eni_outlined_ctx"
+	eniOutlinedStackLabel = "ENI_OUTLINED_STACK"
+	eniOutlinedStackSP    = "ENI_OUTLINED_STACK_SP"
+	eniOutlinedSP         = "eni_outlined_sp"
+	eniOutlinedFP         = "eni_outlined_fp"
+)
+
+// OutlinedContext describes the caller state an outlined entry inherits.
+// Regs lists the callee-saved registers read before being written; Stack
+// reports that the entry also addresses its dispatcher's stack frame
+// through sp/x29.
+type OutlinedContext struct {
+	Regs  []string
+	Stack bool
+}
+
+// outlinedDispatch is the per-"br" form of OutlinedContext used while
+// lifting a dispatcher.
+type outlinedDispatch struct {
+	regs  []string
+	stack bool
+}
 
 var outlinedContextRegs = []string{
 	"x19", "x20", "x21", "x22", "x23",
@@ -58,6 +80,27 @@ func CallerContextRegs(insns []native.DetailedInstruction) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// CallerStackUsed reports whether a block addresses the caller's stack
+// frame through sp or x29. Outlined entries with this property need the
+// dispatcher's frame, not just its callee-saved registers.
+func CallerStackUsed(insns []native.DetailedInstruction) bool {
+	for _, in := range insns {
+		for _, op := range in.Operands {
+			switch op.Type {
+			case native.OperandMem:
+				if op.Mem.Base == "sp" || op.Mem.Base == "x29" {
+					return true
+				}
+			case native.OperandReg:
+				if normalizeXReg(op.Reg) == "sp" || normalizeXReg(op.Reg) == "x29" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // instructionRegAccess reports the integer registers an instruction
@@ -179,17 +222,13 @@ func normalizeXReg(reg string) string {
 // instruction's address; only those sites need a context save.
 func analyzeJumpTableContext(
 	insns []native.DetailedInstruction,
-	targets map[uint64][]string,
+	targets map[uint64]OutlinedContext,
 	reader func(uint64, int) ([]byte, bool),
-) map[uint64][]string {
+) map[uint64]outlinedDispatch {
 	if len(targets) == 0 || reader == nil {
 		return nil
 	}
-	byAddr := make(map[uint64]int, len(insns))
-	for i, in := range insns {
-		byAddr[in.Address] = i
-	}
-	out := make(map[uint64][]string)
+	out := make(map[uint64]outlinedDispatch)
 	for i, in := range insns {
 		if in.Mnemonic != "br" || len(in.Operands) != 1 {
 			continue
@@ -266,6 +305,7 @@ func analyzeJumpTableContext(
 			continue
 		}
 		needed := make(map[string]bool)
+		needStack := false
 		entries := 0
 		for off := 0; off+loadWidth <= len(data) && entries < 512; off += loadWidth {
 			var v uint64
@@ -279,13 +319,14 @@ func analyzeJumpTableContext(
 				break
 			}
 			entries++
-			if regs, ok := targets[target]; ok {
-				for _, reg := range regs {
+			if ctx, ok := targets[target]; ok {
+				for _, reg := range ctx.Regs {
 					needed[reg] = true
 				}
+				needStack = needStack || ctx.Stack
 			}
 		}
-		if len(needed) == 0 {
+		if len(needed) == 0 && !needStack {
 			continue
 		}
 		regs := make([]string, 0, len(needed))
@@ -294,7 +335,7 @@ func analyzeJumpTableContext(
 				regs = append(regs, reg)
 			}
 		}
-		out[in.Address] = regs
+		out[in.Address] = outlinedDispatch{regs: regs, stack: needStack}
 	}
 	return out
 }
@@ -384,6 +425,108 @@ func (l *lifter) saveOutlinedContext(regs []string) []ir.Stmt {
 			Value:  &ir.LocalVar{Name: reg},
 		})
 	}
+	return stmts
+}
+
+// directTargetNeedsOutlinedStack reports whether a direct "bl"/"b" in
+// insns calls an outlined entry that inherits stack context.
+func directTargetNeedsOutlinedStack(insns []native.DetailedInstruction, targets map[uint64]OutlinedContext) bool {
+	if len(targets) == 0 {
+		return false
+	}
+	for _, in := range insns {
+		if in.Mnemonic != "bl" && in.Mnemonic != "b" {
+			continue
+		}
+		if len(in.Operands) != 1 || in.Operands[0].Type != native.OperandImm {
+			continue
+		}
+		if ctx, ok := targets[uint64(in.Operands[0].Imm)]; ok && ctx.Stack {
+			return true
+		}
+	}
+	return false
+}
+
+// saveOutlinedTarget is saveOutlinedDispatch for a directly named target.
+func (l *lifter) saveOutlinedTarget(ctx OutlinedContext) []ir.Stmt {
+	return l.saveOutlinedDispatch(outlinedDispatch{regs: ctx.Regs, stack: ctx.Stack})
+}
+
+// saveOutlinedDispatch saves everything a dispatcher's outlined target
+// inherits: the callee-saved registers and, when requested, the stack
+// pointer/frame pointer into the shared outlined stack block.
+func (l *lifter) saveOutlinedDispatch(d outlinedDispatch) []ir.Stmt {
+	stmts := l.saveOutlinedContext(d.regs)
+	if d.stack && l.outlinedStack {
+		stmts = append(stmts, l.saveOutlinedStack()...)
+	}
+	return stmts
+}
+
+// saveOutlinedStack materializes the current sp/x29 values and stores
+// them for the outlined entry. Materialization matters because x29 is
+// often still the lazy "sp + frameOffset" expression at this point.
+func (l *lifter) saveOutlinedStack() []ir.Stmt {
+	var stmts []ir.Stmt
+	for _, reg := range []string{"sp", "x29"} {
+		val := l.regValue(reg)
+		l.consume(val)
+		if lv, ok := val.(*ir.LocalVar); !ok || lv.Name != reg {
+			stmts = append(stmts, &ir.AssignStmt{
+				Target: &ir.LocalVar{Name: reg},
+				Value:  val,
+			})
+			l.regs[reg] = &ir.LocalVar{Name: reg}
+			l.markWritten(reg)
+			l.regWidths[reg] = 64
+		}
+	}
+	stmts = append(stmts, &ir.AssignStmt{
+		Target: &ir.LocalVar{Name: eniOutlinedSP},
+		Value:  &ir.LocalVar{Name: "sp"},
+	})
+	stmts = append(stmts, &ir.AssignStmt{
+		Target: &ir.LocalVar{Name: eniOutlinedFP},
+		Value:  &ir.LocalVar{Name: "x29"},
+	})
+	return stmts
+}
+
+// seedOutlinedStack prepares stack context. An outlined entry reloads
+// its dispatcher's sp/x29; a dispatcher gets a fresh zeroed frame in the
+// shared outlined stack block and points sp at it.
+func (l *lifter) seedOutlinedStack() []ir.Stmt {
+	if !l.outlinedStack {
+		return nil
+	}
+	var stmts []ir.Stmt
+	if l.opts.OutlinedStack {
+		stmts = append(stmts, &ir.AssignStmt{
+			Target: &ir.LocalVar{Name: "sp"},
+			Value:  &ir.LocalVar{Name: eniOutlinedSP},
+		})
+		stmts = append(stmts, &ir.AssignStmt{
+			Target: &ir.LocalVar{Name: "x29"},
+			Value:  &ir.LocalVar{Name: eniOutlinedFP},
+		})
+		l.regs["sp"] = &ir.LocalVar{Name: "sp"}
+		l.regs["x29"] = &ir.LocalVar{Name: "x29"}
+		l.markWritten("sp")
+		l.markWritten("x29")
+		l.regWidths["sp"] = 64
+		l.regWidths["x29"] = 64
+		l.x29Known = false
+		return stmts
+	}
+	stmts = append(stmts, &ir.ExprStmt{Expr: &ir.StaticMethodCall{Method: "ENI_OUTLINED_STACK_RESET"}})
+	stmts = append(stmts, &ir.AssignStmt{
+		Target: &ir.LocalVar{Name: "sp"},
+		Value:  &ir.AddrLit{Label: eniOutlinedStackSP},
+	})
+	l.regs["sp"] = &ir.LocalVar{Name: "sp"}
+	l.markWritten("sp")
+	l.regWidths["sp"] = 64
 	return stmts
 }
 

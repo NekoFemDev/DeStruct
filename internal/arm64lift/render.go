@@ -207,7 +207,7 @@ func renderSwitch(w io.Writer, v *ir.SwitchStmt, depth int, indent string) {
 func WriteCFilePreamble(w io.Writer, sourceName string) {
 	sourceName = strings.ReplaceAll(sourceName, "*/", "* /")
 	fmt.Fprintf(w, "/*\n * DeStruct pseudo-C output for %s.\n * Unified --emit-pseudo mode: syntactically valid C, generated for\n * analysis/recompilation only (not intended to link as-is).\n */\n", sourceName)
-	io.WriteString(w, "#include <stdint.h>\n#include <stddef.h>\n\n")
+	io.WriteString(w, "#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n\n")
 	io.WriteString(w, "#if defined(__SIZEOF_INT128__)\ntypedef unsigned __int128 eni_uint128;\n#else\ntypedef struct { uint64_t lo; uint64_t hi; } eni_uint128;\n#endif\n\n")
 	// Virtual-dispatch helper. The body is exactly the lifted shape:
 	// vtable = *(uint64_t**)obj; method = vtable[off/8]; method(args...).
@@ -227,7 +227,14 @@ func WriteCFilePreamble(w io.Writer, sourceName string) {
 	// offsets stay inside the array.
 	io.WriteString(w, "extern unsigned char eni_tls[];\n")
 	io.WriteString(w, "#define ENI_TLS_BASE ((uintptr_t)(eni_tls + 0x8000))\n")
-	io.WriteString(w, "extern uint64_t eni_outlined_ctx[10];\n\n")
+	io.WriteString(w, "extern uint64_t eni_outlined_ctx[10];\n")
+	io.WriteString(w, "extern unsigned char eni_outlined_stack[];\n")
+	io.WriteString(w, "extern uint64_t ENI_TARGET(uintptr_t);\n")
+	io.WriteString(w, "extern uintptr_t eni_outlined_sp;\n")
+	io.WriteString(w, "extern uintptr_t eni_outlined_fp;\n")
+	io.WriteString(w, "#define ENI_OUTLINED_STACK ((uintptr_t)eni_outlined_stack)\n")
+	io.WriteString(w, "#define ENI_OUTLINED_STACK_SP ((uintptr_t)(eni_outlined_stack + 0x8000))\n")
+	io.WriteString(w, "static inline void ENI_OUTLINED_STACK_RESET(void) { memset(eni_outlined_stack, 0, 0x10000); }\n\n")
 	// Lane-wise vector helpers. The IR keeps q-registers as eni_uint128,
 	// so these reinterpret the same 16 bytes with the arrangement named
 	// in the suffix (4s, 2d, 8h, 16b).
@@ -577,9 +584,9 @@ func (r *cRenderer) useVar(raw string) string {
 	if raw == "" {
 		raw = "_unnamed"
 	}
-	// eni_outlined_ctx is an extern global declared by the preamble, not
-	// a synthesized local.
-	if raw == eniOutlinedCtx {
+	// eni_outlined_* names are extern globals declared by the preamble,
+	// not synthesized locals.
+	if raw == eniOutlinedCtx || raw == eniOutlinedSP || raw == eniOutlinedFP {
 		r.varNames[raw] = raw
 		r.origByMapped[raw] = raw
 		r.usedOrig[raw] = true
@@ -658,7 +665,8 @@ func (r *cRenderer) chooseParams() {
 func (r *cRenderer) writePrototypes(w io.Writer) {
 	names := make([]string, 0, len(r.calls))
 	for name := range r.calls {
-		if name == r.funcName || name == "CALL_VTABLE" || strings.HasPrefix(name, "ENI_") || r.paramSet[name] {
+		if name == r.funcName || name == "CALL_VTABLE" || strings.HasPrefix(name, "ENI_") ||
+			strings.HasPrefix(name, "eni_v") || r.paramSet[name] {
 			continue
 		}
 		if _, isVar := r.varTypes[name]; isVar {
@@ -783,6 +791,18 @@ func ExternalCName(raw string) string {
 	return "ext_" + safeCIdent(raw)
 }
 
+func isVectorHelper(name string) bool {
+	for _, prefix := range []string{
+		"eni_vadd_", "eni_vsub_", "eni_vmul_", "eni_vdiv_",
+		"eni_vfma_", "eni_vfms_", "eni_vdup_",
+	} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *cRenderer) callName(raw string) string {
 	name := safeCIdent(raw)
 	if name == "" {
@@ -794,6 +814,20 @@ func (r *cRenderer) callName(raw string) string {
 	// external calls a distinct prefix. Calls to lifted sub_/func_
 	// symbols keep their names, matching the dummy definitions and the
 	// existing pseudo-C vocabulary.
+	// Generated helper names from the preamble are not unresolved
+	// external symbols. Vector helpers are declared there in lowercase
+	// (eni_vadd_f32x4, ...), while the IR spells them ENI_VADD_F32X4.
+	if strings.HasPrefix(name, "ENI_V") {
+		lower := strings.ToLower(name)
+		if isVectorHelper(lower) {
+			r.calls[lower] = true
+			return lower
+		}
+	}
+	if strings.HasPrefix(name, "ENI_") {
+		r.calls[name] = true
+		return name
+	}
 	if name != "CALL_VTABLE" && !strings.HasPrefix(name, "sub_") && !strings.HasPrefix(name, "func_") {
 		name = "ext_" + name
 	}
@@ -1117,6 +1151,9 @@ const eniTLSBaseLabel = "ENI_TLS_BASE"
 func (r *cRenderer) addrExpr(v *ir.AddrLit) string {
 	if v.Label == eniTLSBaseLabel {
 		return eniTLSBaseLabel
+	}
+	if v.Label == eniOutlinedStackLabel || v.Label == eniOutlinedStackSP {
+		return v.Label
 	}
 	if r.functionPtr != nil {
 		if name, ok := r.functionPtr(v.Value); ok && name != "" {

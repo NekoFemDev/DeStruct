@@ -78,11 +78,61 @@ func TestJumpTableDispatchSavesOutlinedContext(t *testing.T) {
 		return data, true
 	}
 	stmts := LiftFunctionWithOptions(insns, nil, nil, nil, reader, LiftOptions{
-		OutlinedContextTargets: map[uint64][]string{0x104c: {"x19"}},
+		OutlinedContextTargets: map[uint64]OutlinedContext{
+			0x104c: {Regs: []string{"x19"}, Stack: true},
+		},
 	})
 	out := renderForTest(stmts)
-	if !strings.Contains(out, "eni_outlined_ctx[0] = x19;") {
-		t.Fatalf("jump-table dispatch did not save outlined context:\n%s", out)
+	for _, want := range []string{
+		"eni_outlined_ctx[0] = x19;",
+		"ENI_OUTLINED_STACK_RESET();",
+		"sp = ENI_OUTLINED_STACK_SP;",
+		"eni_outlined_sp = sp;",
+		"eni_outlined_fp = x29;",
+		"ENI_TARGET(",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("jump-table dispatch missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestOutlinedStackFrameAdjustments(t *testing.T) {
+	insns := disassembleWords(t, 0, []uint32{
+		0xd10083ff, // sub sp, sp, #0x20
+		0x910003fd, // mov x29, sp
+		0xaa0003f3, // mov x19, x0
+		0xd0000009, // adrp x9, 0x2000
+		0x91040129, // add x9, x9, #0x100
+		0x1000800a, // adr x10, 0x1014
+		0x7868792b, // ldrh w11, [x9, x8, lsl #1]
+		0x8b0b094a, // add x10, x10, x11, lsl #2
+		0xd61f0140, // br x10
+	})
+	reader := func(addr uint64, size int) ([]byte, bool) {
+		if addr != 0x2100 {
+			return nil, false
+		}
+		data := make([]byte, size)
+		data[0] = 0x10 // 0x1014 + 0x10*4 = 0x1054
+		return data, true
+	}
+	stmts := LiftFunctionWithOptions(insns, nil, nil, nil, reader, LiftOptions{
+		OutlinedContextTargets: map[uint64]OutlinedContext{
+			0x1054: {Regs: []string{"x19"}, Stack: true},
+		},
+	})
+	out := renderForTest(stmts)
+	for _, want := range []string{
+		"sp = ENI_OUTLINED_STACK_SP;",
+		"sp = sp - 32;",
+		"x29 = sp;",
+		"eni_outlined_sp = sp;",
+		"eni_outlined_fp = x29;",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("outlined stack frame missing %q:\n%s", want, out)
+		}
 	}
 }
 
@@ -119,8 +169,8 @@ func TestAnalyzeJumpTableContext(t *testing.T) {
 			{Type: native.OperandReg, Reg: "x10"},
 		}},
 	}
-	targets := map[uint64][]string{
-		targetBase + 0x10*4: {"x19", "x24"},
+	targets := map[uint64]OutlinedContext{
+		targetBase + 0x10*4: {Regs: []string{"x19", "x24"}, Stack: true},
 	}
 	reader := func(addr uint64, size int) ([]byte, bool) {
 		if addr != tableBase {
@@ -131,8 +181,41 @@ func TestAnalyzeJumpTableContext(t *testing.T) {
 		return data, true
 	}
 	got := analyzeJumpTableContext(insns, targets, reader)
-	regs := got[brAddr]
-	if len(regs) != 2 || regs[0] != "x19" || regs[1] != "x24" {
-		t.Fatalf("analyzeJumpTableContext = %v, want [x19 x24]", got)
+	d := got[brAddr]
+	if len(d.regs) != 2 || d.regs[0] != "x19" || d.regs[1] != "x24" || !d.stack {
+		t.Fatalf("analyzeJumpTableContext = %+v, want regs [x19 x24] and stack", d)
+	}
+}
+
+func TestOutlinedStackEntry(t *testing.T) {
+	insns := disassembleWords(t, 0x1000, []uint32{
+		0x910043e0, // add x0, sp, #0x10
+		0xd65f03c0, // ret
+	})
+	out := renderForTest(LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{OutlinedStack: true}))
+	for _, want := range []string{"sp = eni_outlined_sp;", "x29 = eni_outlined_fp;"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("outlined stack entry missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestCallerStackUsed(t *testing.T) {
+	if !CallerStackUsed([]native.DetailedInstruction{
+		{Mnemonic: "add", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandReg, Reg: "sp"},
+			{Type: native.OperandImm, Imm: 0x10},
+		}},
+	}) {
+		t.Fatal("CallerStackUsed did not detect sp")
+	}
+	if CallerStackUsed([]native.DetailedInstruction{
+		{Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandReg, Reg: "x1"},
+		}},
+	}) {
+		t.Fatal("CallerStackUsed false positive")
 	}
 }

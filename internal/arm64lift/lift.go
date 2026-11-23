@@ -299,7 +299,17 @@ func LiftFunctionWithOptions(instructions []native.DetailedInstruction, paramNam
 		l.functionEnd = last.Address + uint64(last.Size)
 	}
 	l.jumpTableCtx = analyzeJumpTableContext(instructions, opts.OutlinedContextTargets, dataReader)
-	ctxStmts := l.seedOutlinedContext()
+	l.outlinedStack = opts.OutlinedStack || directTargetNeedsOutlinedStack(instructions, opts.OutlinedContextTargets)
+	if !l.outlinedStack {
+		for _, d := range l.jumpTableCtx {
+			if d.stack {
+				l.outlinedStack = true
+				break
+			}
+		}
+	}
+	stackStmts := l.seedOutlinedStack()
+	ctxStmts := append(stackStmts, l.seedOutlinedContext()...)
 
 	blocks := buildCFG(instructions)
 	if opts.Simplify {
@@ -1673,7 +1683,7 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.regWidths {
 		regWidths[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, stackWidth: stackWidth, stackTyped: stackTyped, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq, x29Offset: l.x29Offset, x29Known: l.x29Known, functionInsns: l.functionInsns, insnIndex: l.insnIndex, functionStart: l.functionStart, functionEnd: l.functionEnd, outlinedDepth: l.outlinedDepth, jumpTableCtx: l.jumpTableCtx, written: written, seedRefs: seedRefs, regWidths: regWidths}
+	return &lifter{regs: regs, stack: stack, stackWidth: stackWidth, stackTyped: stackTyped, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq, x29Offset: l.x29Offset, x29Known: l.x29Known, functionInsns: l.functionInsns, insnIndex: l.insnIndex, functionStart: l.functionStart, functionEnd: l.functionEnd, outlinedDepth: l.outlinedDepth, jumpTableCtx: l.jumpTableCtx, outlinedStack: l.outlinedStack, written: written, seedRefs: seedRefs, regWidths: regWidths}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1858,10 +1868,14 @@ type lifter struct {
 	functionStart uint64
 	functionEnd   uint64
 	outlinedDepth int
-	// jumpTableCtx maps a "br" dispatch address to the callee-saved
-	// context registers its outlined targets inherit.
-	jumpTableCtx map[uint64][]string
-	curAddr      uint64
+	// jumpTableCtx maps a "br" dispatch address to the outlined context
+	// its targets inherit.
+	jumpTableCtx map[uint64]outlinedDispatch
+	// outlinedStack is true when this function either is an outlined
+	// stack-context entry or dispatches to one. Stack slots are then
+	// modeled as raw memory through sp/x29 instead of separate locals.
+	outlinedStack bool
+	curAddr       uint64
 
 	// written tracks registers explicitly written since function entry
 	// (seeded incoming parameter registers do not count). seedRefs keeps
@@ -2298,11 +2312,18 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			// a meaningless "sp = sp - 16" statement. Any other "sub"
 			// shape is ordinary arithmetic - see liftALU.
 			if off, ok := framePointerSubOffset(inst); ok {
-				l.x29Offset = off
-				l.x29Known = true
+				if l.outlinedStack {
+					stmts = append(stmts, l.x29FromSP(off)...)
+				} else {
+					l.x29Offset = off
+					l.x29Known = true
+				}
 				continue
 			}
 			if isSpAdjust(inst) {
+				if l.outlinedStack {
+					stmts = append(stmts, l.adjustSP(-int32(inst.Operands[2].Imm))...)
+				}
 				continue
 			}
 			stmts = append(stmts, l.liftALU(inst)...)
@@ -2314,13 +2335,20 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 				continue
 			}
 			if off, ok := framePointerAddOffset(inst); ok {
-				l.x29Offset = off
-				l.x29Known = true
+				if l.outlinedStack {
+					stmts = append(stmts, l.x29FromSP(off)...)
+				} else {
+					l.x29Offset = off
+					l.x29Known = true
+				}
 				continue
 			}
 			if isSpAdjust(inst) {
 				// "add sp, sp, #N" is the matching -O0 epilogue - same
 				// reasoning as the sub case above.
+				if l.outlinedStack {
+					stmts = append(stmts, l.adjustSP(int32(inst.Operands[2].Imm))...)
+				}
 				continue
 			}
 			stmts = append(stmts, l.liftAdd(inst)...)
@@ -2411,6 +2439,10 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			// case above. Every other pair is a real two-register
 			// memory access.
 			if isFramePointerSave(inst) {
+				if l.outlinedStack && inst.Writeback && len(inst.Operands) == 3 &&
+					inst.Operands[2].Type == native.OperandMem {
+					stmts = append(stmts, l.adjustSP(inst.Operands[2].Mem.Disp)...)
+				}
 				continue
 			}
 			if isCalleeSavedPair(inst) {
@@ -2421,6 +2453,10 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			// "ldp x29, x30, [sp], #N" is the matching -O0
 			// frame-pointer epilogue - same reasoning as stp above.
 			if isFramePointerRestore(inst) {
+				if l.outlinedStack && len(inst.Operands) == 4 &&
+					inst.Operands[3].Type == native.OperandImm {
+					stmts = append(stmts, l.adjustSP(int32(inst.Operands[3].Imm))...)
+				}
 				continue
 			}
 			if isCalleeSavedPair(inst) {
@@ -2434,8 +2470,12 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			// genuine register-to-register or register-immediate move;
 			// see liftMov.
 			if isFramePointerEstablish(inst) {
-				l.x29Offset = 0
-				l.x29Known = true
+				if l.outlinedStack {
+					stmts = append(stmts, l.x29FromSP(0)...)
+				} else {
+					l.x29Offset = 0
+					l.x29Known = true
+				}
 				continue
 			}
 			stmts = append(stmts, l.liftMov(inst)...)
@@ -2644,7 +2684,7 @@ func isFramePointerRestore(inst native.DetailedInstruction) bool {
 // access through sp or a known frame pointer (x29). Indexed accesses
 // are not stack slots.
 func (l *lifter) stackSlotDisp(base string, mem native.MemOperand) (int32, bool) {
-	if mem.Index != "" {
+	if mem.Index != "" || l.outlinedStack {
 		return 0, false
 	}
 	switch {
@@ -2655,6 +2695,54 @@ func (l *lifter) stackSlotDisp(base string, mem native.MemOperand) (int32, bool)
 	default:
 		return 0, false
 	}
+}
+
+// x29FromSP materializes "x29 = sp + off" in outlined-stack mode, where
+// x29 must be a real pointer into the shared outlined stack block rather
+// than an offset used only for local-slot naming.
+func (l *lifter) x29FromSP(off int32) []ir.Stmt {
+	sp := l.regValue("sp")
+	val := addSPOffset(sp, off)
+	stmts := l.setReg("x29", val)
+	// Materialize immediately: a later "sub sp, sp, #N" must not move an
+	// x29 that was established as "x29 = sp".
+	stmts = append(stmts, &ir.AssignStmt{
+		Target: &ir.LocalVar{Name: "x29"},
+		Value:  val,
+	})
+	l.regs["x29"] = &ir.LocalVar{Name: "x29"}
+	l.markWritten("x29")
+	l.regWidths["x29"] = 64
+	l.x29Offset = off
+	l.x29Known = true
+	return stmts
+}
+
+// adjustSP materializes a stack-pointer adjustment in outlined-stack
+// mode. Keeping sp as an ordinary local makes every later stack access
+// use the adjusted pointer rather than a growing expression tree.
+func (l *lifter) adjustSP(delta int32) []ir.Stmt {
+	sp := l.regValue("sp")
+	val := addSPOffset(sp, delta)
+	stmts := l.setReg("sp", val)
+	stmts = append(stmts, &ir.AssignStmt{
+		Target: &ir.LocalVar{Name: "sp"},
+		Value:  val,
+	})
+	l.regs["sp"] = &ir.LocalVar{Name: "sp"}
+	l.markWritten("sp")
+	l.regWidths["sp"] = 64
+	return stmts
+}
+
+func addSPOffset(sp ir.Expr, off int32) ir.Expr {
+	if off == 0 {
+		return sp
+	}
+	if off > 0 {
+		return &ir.BinaryExpr{Op: "+", Left: sp, Right: &ir.IntLit{Value: int64(off)}}
+	}
+	return &ir.BinaryExpr{Op: "-", Left: sp, Right: &ir.IntLit{Value: int64(-off)}}
 }
 
 // framePointerAddOffset recognizes the -O0 frame-pointer setup
@@ -3953,7 +4041,7 @@ func (l *lifter) newFieldAccessOn(base ir.Expr, disp int32, width int) *ir.Field
 // while a load may never surface (so its base/index stay unconsumed,
 // mirroring liftLdr's existing policy).
 func (l *lifter) memoryAccessTarget(base string, mem native.MemOperand, width int, consume bool) ir.Expr {
-	if base == "" || base == "sp" {
+	if base == "" || (base == "sp" && !l.outlinedStack) {
 		return nil
 	}
 
@@ -4702,7 +4790,7 @@ func (l *lifter) liftCall(inst native.DetailedInstruction) []ir.Stmt {
 	if !ok {
 		return nil
 	}
-	stmts := l.saveOutlinedContext(l.opts.OutlinedContextTargets[target])
+	stmts := l.saveOutlinedTarget(l.opts.OutlinedContextTargets[target])
 	return append(stmts, l.finishCall(call)...)
 }
 
@@ -4784,7 +4872,7 @@ func (l *lifter) liftTailCall(inst native.DetailedInstruction) []ir.Stmt {
 	if !ok {
 		return nil
 	}
-	stmts := l.saveOutlinedContext(l.opts.OutlinedContextTargets[target])
+	stmts := l.saveOutlinedTarget(l.opts.OutlinedContextTargets[target])
 	stmts = append(stmts, l.finishCall(call)...)
 	l.consume(call)
 	// A tail call's result IS this function's result: after the callee
@@ -4839,8 +4927,18 @@ func (l *lifter) liftBr(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 1 || inst.Operands[0].Type != native.OperandReg {
 		return nil
 	}
+	d := l.jumpTableCtx[inst.Address]
 	call := l.buildIndirectCall(inst.Operands[0].Reg, true)
-	stmts := l.saveOutlinedContext(l.jumpTableCtx[inst.Address])
+	if ic, ok := call.(*ir.IndirectCall); ok && (len(d.regs) > 0 || d.stack) {
+		// A jump table that reaches an outlined entry must dispatch to the
+		// lifted C function, not raw image bytes, so the saved register
+		// and stack context is actually consumed.
+		ic.Callee = &ir.StaticMethodCall{
+			Method: "ENI_TARGET",
+			Args:   []ir.Expr{ic.Callee},
+		}
+	}
+	stmts := l.saveOutlinedDispatch(d)
 	stmts = append(stmts, l.finishCall(call)...)
 	l.consume(call)
 	// As with a direct tail call, the callee's result is forwarded as

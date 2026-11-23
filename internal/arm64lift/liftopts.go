@@ -99,9 +99,14 @@ type LiftOptions struct {
 	// body so the generated C no longer treats them as zero.
 	OutlinedContextRegs []string
 
-	// OutlinedContextTargets maps each outlined entry to the
-	// callee-saved registers it inherits. Callers use it to save their
-	// live x19..x28 values into eni_outlined_ctx immediately before a
-	// direct or jump-table call to that entry.
-	OutlinedContextTargets map[uint64][]string
+	// OutlinedStack marks this function as an outlined entry that also
+	// inherits its dispatcher's stack frame. sp/x29 are loaded from the
+	// shared eni_outlined_stack block.
+	OutlinedStack bool
+
+	// OutlinedContextTargets maps each outlined entry to the caller state
+	// it inherits. Callers use it to save registers and/or the stack
+	// pointer immediately before a direct or jump-table call to that
+	// entry.
+	OutlinedContextTargets map[uint64]OutlinedContext
 }

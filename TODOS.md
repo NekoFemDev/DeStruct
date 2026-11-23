@@ -242,6 +242,21 @@ pointer-only matches from 28 to 67, and reduced both-faulted functions
 from 246 to 219 and host faults from 1,211 to 1,057 (1,666 tested functions
 after fragment folding).
 
+Sprint 15 (2026-11-23) is complete:
+outlined stack-context recovery. A dispatcher that reaches a stack-using
+outlined entry now gets a fresh zeroed `eni_outlined_stack` frame and
+models sp/x29 as real pointers; `sub sp`/`add sp` and frame-pointer
+save/restore adjustments are materialized so frame slots stay
+addressable. The entry reloads sp/x29 from `eni_outlined_sp`/
+`eni_outlined_fp` and addresses the same bytes as its dispatcher.
+`ENI_TARGET` resolves jump-table targets back from host image pointers
+to original VAs and calls the lifted `sub_*` function, so the saved
+context is actually consumed. Generated helper calls now use the
+preamble's `ENI_V*`/`ENI_BITCAST_*` definitions instead of unresolved
+`ext_` stubs, and link-stub generation recognizes the support globals.
+The zero-argument `quazar_arm64` profile reports 325 exact matches, 70
+pointer-only, 217 both-faulted and 1,050 host faults.
+
 - [x] Optional Unicorn backend behind the `unicorn` build tag
       (`make unicorn build-unicorn`).
 - [x] `elf emulate` with image/relocation/import setup.
@@ -253,8 +268,17 @@ after fragment folding).
 - [x] Fold prologue-less direct-branch fragments into their surrounding
       function.
 - [x] Preserve fixed-address table bases in indexed accesses.
+- [x] Outlined stack context (`eni_outlined_stack`): dispatchers model
+      sp/x29 as real pointers, materialize prologue/epilogue sp
+      adjustments, and entries reload the same frame.
+- [x] Jump-table dispatcher resolver (`ENI_TARGET`) so an outlined
+      entry is called as lifted C instead of raw image bytes.
+- [ ] Per-depth outlined stack frames (a nested dispatcher currently
+      reuses the single shared frame).
 - [ ] Extend outlined context recovery to non-`bti j` outlined
-      subroutines and stack slots.
+      subroutines.
+- [ ] Reconstruct jump-table switches whose case bodies branch back into
+      the dispatcher (e.g. `sub_94242c`).
 - [ ] Structured fuzzing with pointer/struct argument profiles.
 - [ ] Memory-effects comparison (writable image hash) in verify.
 

@@ -44,6 +44,9 @@ var (
 	linkExternVarRe = regexp.MustCompile(`(?m)^\s*extern\s+[A-Za-z_][A-Za-z0-9_]*\s+([A-Za-z_][A-Za-z0-9_]*)\s*;`)
 	// uint64_t sub_123(...) {  /  int main(void) {
 	linkDefRe = regexp.MustCompile(`(?m)^\s*(?:uint64_t|int|void)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{`)
+	// File-scope variable definitions (the generated support file uses
+	// these for eni_tls/eni_outlined_*): uintptr_t eni_outlined_sp;
+	linkDefVarRe = regexp.MustCompile(`(?m)^(?:unsigned char|signed char|char|unsigned short|short|unsigned int|int|unsigned long|long|uint8_t|uint16_t|uint32_t|uint64_t|uintptr_t|size_t)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;`)
 	// any identifier followed by "(" after extern declarations are stripped
 	linkCallRe = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
 )
@@ -145,6 +148,9 @@ func generateLinkStubs(files []string, outPath string, addMain, noop bool) (*Lin
 			externVars[m[1]] = true
 		}
 		for _, m := range linkDefRe.FindAllStringSubmatch(content, -1) {
+			defined[m[1]] = true
+		}
+		for _, m := range linkDefVarRe.FindAllStringSubmatch(content, -1) {
 			defined[m[1]] = true
 		}
 

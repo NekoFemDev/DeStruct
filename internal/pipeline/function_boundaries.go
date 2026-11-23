@@ -19,11 +19,11 @@ func computeOutlinedContexts(
 	candidates []funcCandidate,
 	elf *native.ELFParser,
 	d *native.Disassembler,
-) map[uint64][]string {
+) map[uint64]arm64lift.OutlinedContext {
 	if d == nil {
 		return nil
 	}
-	out := make(map[uint64][]string)
+	out := make(map[uint64]arm64lift.OutlinedContext)
 	// bti j: d503249f, little-endian.
 	btiJ := []byte{0x9f, 0x24, 0x03, 0xd5}
 	for _, c := range candidates {
@@ -39,8 +39,9 @@ func computeOutlinedContexts(
 			continue
 		}
 		regs := arm64lift.CallerContextRegs(insns)
-		if len(regs) > 0 {
-			out[c.addr] = regs
+		stack := arm64lift.CallerStackUsed(insns)
+		if len(regs) > 0 || stack {
+			out[c.addr] = arm64lift.OutlinedContext{Regs: regs, Stack: stack}
 		}
 	}
 	return out

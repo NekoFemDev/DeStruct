@@ -363,9 +363,13 @@ The generated C models `TPIDR_EL0` as a zero-initialized `eni_tls` block, so
 stack-canary and TLS reads match the emulator instead of dereferencing host
 NULL. `bti j` jump-table case bodies that inherit callee-saved registers reload
 them from `eni_outlined_ctx`; the dispatcher saves x19..x28 immediately before
-the indirect branch. Prologue-less direct-branch fragments are folded back into
-the surrounding function instead of being emitted as standalone context-less
-entries.
+the indirect branch. Stack-using entries also reload sp/x29 from
+`eni_outlined_stack`/`eni_outlined_sp`/`eni_outlined_fp`, and the dispatcher
+materializes its frame adjustments and saves the same frame. `eni_targets.c`
+resolves indirect jump-table addresses back to original VAs so the dispatcher
+calls a lifted `sub_*` function rather than raw image bytes. Prologue-less
+direct-branch fragments are folded back into the surrounding function instead
+of being emitted as standalone context-less entries.
 
 **`--emit-llvm`** (AArch64 only; implies `--decompile`): in addition to
 `.decompiled.c`, writes `<name>.decompiled.ll` — each lifted function as LLVM IR
