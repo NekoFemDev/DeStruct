@@ -91,6 +91,9 @@ type Pipeline struct {
 	// doesn't inline a real function that happens to sit inside a larger
 	// lift range.
 	knownFunction func(uint64) bool
+	// outlinedContexts maps outlined entry points to the callee-saved
+	// registers they inherit from their dispatcher.
+	outlinedContexts map[uint64][]string
 	// condMiss counts unresolved condition operators for diagnostics.
 	condMiss        map[string]int
 	condMissSamples []string
@@ -770,6 +773,9 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	if p.opts.SplitFunctions {
 		imageDir = splitDir
 	}
+	if ierr := writeTLSSupport(imageDir); ierr != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot write TLS support file: %v\n", ierr)
+	}
 	p.elfImageBase, p.elfImageSize = 0, 0
 	if imgBase, imgSize, ierr := writeELFImage(elf, imageDir); ierr != nil {
 		fmt.Fprintf(os.Stderr, "warning: cannot write ELF image: %v\n", ierr)
@@ -824,6 +830,15 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 		if split > 0 {
 			fmt.Printf("Split coarse unwind gaps - recovered %d additional functions (%d total)\n", split, len(candidates))
 		}
+	}
+
+	// Jump-table case bodies and similar compiler-outlined entries read
+	// callee-saved registers set by their dispatcher. Identify them before
+	// lifting so callers can save that context and the entries can reload
+	// it instead of starting from zero.
+	p.outlinedContexts = computeOutlinedContexts(candidates, elf, d)
+	if n := len(p.outlinedContexts); n > 0 {
+		fmt.Printf("Recovered caller context for %d outlined blocks\n", n)
 	}
 
 	// Function-pointer references (initializers, atexit handlers, vtables
@@ -1245,12 +1260,14 @@ func (p *Pipeline) printCondMiss() {
 // declarations from.
 func (p *Pipeline) liftOptionsFor(c funcCandidate) arm64lift.LiftOptions {
 	opts := arm64lift.LiftOptions{
-		Simplify:      p.opts.SimplifyCFG,
-		RegsAsVars:    p.opts.RegsAsVars,
-		LocalTypes:    make(map[string]string),
-		ReturnType:    c.returnType,
-		CodeContains:  p.codeContains,
-		KnownFunction: p.knownFunction,
+		Simplify:               p.opts.SimplifyCFG,
+		RegsAsVars:             p.opts.RegsAsVars,
+		LocalTypes:             make(map[string]string),
+		ReturnType:             c.returnType,
+		CodeContains:           p.codeContains,
+		KnownFunction:          p.knownFunction,
+		OutlinedContextRegs:    p.outlinedContexts[c.addr],
+		OutlinedContextTargets: p.outlinedContexts,
 		CondMiss: func(op string, addr uint64) {
 			p.noteCondMiss(c.addr, addr, op)
 		},

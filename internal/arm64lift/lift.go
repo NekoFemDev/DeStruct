@@ -298,6 +298,8 @@ func LiftFunctionWithOptions(instructions []native.DetailedInstruction, paramNam
 		last := instructions[len(instructions)-1]
 		l.functionEnd = last.Address + uint64(last.Size)
 	}
+	l.jumpTableCtx = analyzeJumpTableContext(instructions, opts.OutlinedContextTargets, dataReader)
+	ctxStmts := l.seedOutlinedContext()
 
 	blocks := buildCFG(instructions)
 	if opts.Simplify {
@@ -317,14 +319,14 @@ func LiftFunctionWithOptions(instructions []native.DetailedInstruction, paramNam
 			insts = blocks[0].Instructions
 		}
 		stmts := l.run(insts)
-		return l.finishFunction(append(stmts, l.flushRemaining()...))
+		return l.finishFunction(append(ctxStmts, append(stmts, l.flushRemaining()...)...))
 	}
 
 	byAddr := make(map[uint64]*BasicBlock, len(blocks))
 	for _, b := range blocks {
 		byAddr[b.StartAddr] = b
 	}
-	return l.finishFunction(l.liftBlockGraph(blocks[0], byAddr, make(map[uint64]bool), nil))
+	return l.finishFunction(append(ctxStmts, l.liftBlockGraph(blocks[0], byAddr, make(map[uint64]bool), nil)...))
 }
 
 // finishFunction makes every lifted C function well-defined: if the last
@@ -1671,7 +1673,7 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.regWidths {
 		regWidths[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, stackWidth: stackWidth, stackTyped: stackTyped, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq, x29Offset: l.x29Offset, x29Known: l.x29Known, functionInsns: l.functionInsns, insnIndex: l.insnIndex, functionStart: l.functionStart, functionEnd: l.functionEnd, outlinedDepth: l.outlinedDepth, written: written, seedRefs: seedRefs, regWidths: regWidths}
+	return &lifter{regs: regs, stack: stack, stackWidth: stackWidth, stackTyped: stackTyped, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq, x29Offset: l.x29Offset, x29Known: l.x29Known, functionInsns: l.functionInsns, insnIndex: l.insnIndex, functionStart: l.functionStart, functionEnd: l.functionEnd, outlinedDepth: l.outlinedDepth, jumpTableCtx: l.jumpTableCtx, written: written, seedRefs: seedRefs, regWidths: regWidths}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1856,7 +1858,10 @@ type lifter struct {
 	functionStart uint64
 	functionEnd   uint64
 	outlinedDepth int
-	curAddr       uint64
+	// jumpTableCtx maps a "br" dispatch address to the callee-saved
+	// context registers its outlined targets inherit.
+	jumpTableCtx map[uint64][]string
+	curAddr      uint64
 
 	// written tracks registers explicitly written since function entry
 	// (seeded incoming parameter registers do not count). seedRefs keeps
@@ -2434,7 +2439,12 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 				continue
 			}
 			stmts = append(stmts, l.liftMov(inst)...)
+		case "mrs":
+			stmts = append(stmts, l.liftMRS(inst)...)
 		case "str", "stur", "strb", "strh", "sturb", "sturh", "stlr":
+			if isCalleeSavedSpill(inst) {
+				continue
+			}
 			stmts = append(stmts, l.liftStore(inst, accessWidth(inst))...)
 		case "stxr", "stlxr", "stxrb", "stxrh", "stlxrb", "stlxrh":
 			width := 8
@@ -2465,6 +2475,9 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 		case "st1":
 			stmts = append(stmts, l.liftVectorList(inst, false)...)
 		case "ldr", "ldur", "ldrb", "ldrh", "ldurb", "ldurh", "ldar", "ldaxr", "ldxr", "ldaxrb", "ldaxrh", "ldxrb", "ldxrh":
+			if isCalleeSavedSpill(inst) {
+				continue
+			}
 			stmts = append(stmts, l.liftLoad(inst, accessWidth(inst), nil)...)
 		case "ldrsb":
 			stmts = append(stmts, l.liftLoad(inst, 1, &ir.PrimitiveType{Name: "sbyte"})...)
@@ -2539,6 +2552,21 @@ func isCalleeSavedPair(inst native.DetailedInstruction) bool {
 		return false
 	}
 	return isCalleeSavedReg(inst.Operands[0].Reg) && isCalleeSavedReg(inst.Operands[1].Reg)
+}
+
+// isCalleeSavedSpill reports whether inst is a single-register
+// "str xN, [sp, #d]" / "ldr xN, [sp, #d]" save or restore of a
+// callee-saved register. These are compiler ABI bookkeeping, like the
+// isCalleeSavedPair forms, and carry no source-level meaning.
+func isCalleeSavedSpill(inst native.DetailedInstruction) bool {
+	if len(inst.Operands) != 2 {
+		return false
+	}
+	dst, mem := inst.Operands[0], inst.Operands[1]
+	if dst.Type != native.OperandReg || !isCalleeSavedReg(dst.Reg) {
+		return false
+	}
+	return mem.Type == native.OperandMem && mem.Mem.Base == "sp" && mem.Mem.Index == ""
 }
 
 func isCalleeSavedReg(reg string) bool {
@@ -4388,6 +4416,35 @@ func (l *lifter) liftMov(inst native.DetailedInstruction) []ir.Stmt {
 	}
 }
 
+// liftMRS models reads from the system registers this lifter understands.
+// TPIDR_EL0 is the AArch64 user thread pointer: Android code uses it for
+// the stack canary ([TPIDR_EL0, #0x28]) and TLS variables. Rendering it as
+// ENI_TLS_BASE lets the generated C, the host verifier and the Unicorn
+// oracle all share one zero-initialized TLS block instead of treating the
+// thread pointer as an uninitialized register (which made every canary
+// check a null dereference in host C).
+func (l *lifter) liftMRS(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) < 1 || inst.Operands[0].Type != native.OperandReg {
+		return nil
+	}
+	sys := systemRegisterName(inst.OpStr)
+	switch strings.ToUpper(sys) {
+	case "TPIDR_EL0":
+		return l.setReg(inst.Operands[0].Reg, &ir.AddrLit{Label: eniTLSBaseLabel})
+	}
+	return nil
+}
+
+// systemRegisterName extracts "TPIDR_EL0" from Capstone's
+// "x19, TPIDR_EL0" operand string.
+func systemRegisterName(opStr string) string {
+	idx := strings.LastIndex(opStr, ",")
+	if idx < 0 {
+		return ""
+	}
+	return strings.TrimSpace(opStr[idx+1:])
+}
+
 // collectCallArgs gathers a call's own arguments from x0-x7 (AAPCS64's
 // integer/pointer argument registers) as they stand right now, before
 // the call overwrites any of them with its own return value - shared
@@ -4645,7 +4702,8 @@ func (l *lifter) liftCall(inst native.DetailedInstruction) []ir.Stmt {
 	if !ok {
 		return nil
 	}
-	return l.finishCall(call)
+	stmts := l.saveOutlinedContext(l.opts.OutlinedContextTargets[target])
+	return append(stmts, l.finishCall(call)...)
 }
 
 // inlineOutlinedCall inlines a straight-line "bl" target located inside the
@@ -4726,7 +4784,8 @@ func (l *lifter) liftTailCall(inst native.DetailedInstruction) []ir.Stmt {
 	if !ok {
 		return nil
 	}
-	stmts := l.finishCall(call)
+	stmts := l.saveOutlinedContext(l.opts.OutlinedContextTargets[target])
+	stmts = append(stmts, l.finishCall(call)...)
 	l.consume(call)
 	// A tail call's result IS this function's result: after the callee
 	// returns, its x0 is forwarded to our caller.
@@ -4781,7 +4840,8 @@ func (l *lifter) liftBr(inst native.DetailedInstruction) []ir.Stmt {
 		return nil
 	}
 	call := l.buildIndirectCall(inst.Operands[0].Reg, true)
-	stmts := l.finishCall(call)
+	stmts := l.saveOutlinedContext(l.jumpTableCtx[inst.Address])
+	stmts = append(stmts, l.finishCall(call)...)
 	l.consume(call)
 	// As with a direct tail call, the callee's result is forwarded as
 	// this function's own return value.
@@ -5482,13 +5542,18 @@ func (l *lifter) memBaseExpr(base string) ir.Expr {
 	}
 	v := l.regValue(base)
 	switch v.(type) {
-	case *ir.IntLit, *ir.LongLit, *ir.FloatLit, *ir.DoubleLit, *ir.StringLit, *ir.BoolLit, *ir.NullLit, *ir.AddrLit:
-		// The register currently holds a raw constant (the merge-point
-		// state approximation leaving 0, an adrp page, ...), so the
-		// pointed-to value can't be expressed as a field access on it -
-		// fall back to the register's own placeholder name.
+	case *ir.IntLit, *ir.LongLit, *ir.FloatLit, *ir.DoubleLit, *ir.StringLit, *ir.BoolLit, *ir.NullLit:
+		// The register currently holds a raw scalar (the merge-point state
+		// approximation leaving 0, ...), so the pointed-to value can't be
+		// expressed as a field access on it - fall back to the register's
+		// own placeholder name.
 		return &ir.LocalVar{Name: l.regName(base)}
 	}
+	// AddrLit deliberately stays an address expression: adrp/add-built
+	// tables (jump tables, arrays at a fixed VA) must keep their concrete
+	// base. Rendering it through ENI_ADDR is valid C, while falling back to
+	// a placeholder register silently turned the access into a null
+	// dereference.
 	return v
 }
 

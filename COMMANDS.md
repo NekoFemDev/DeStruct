@@ -359,6 +359,14 @@ image address) are counted separately from semantic mismatches. Host faults and
 both-faulted cases are reported independently; many are caused by zero-argument
 dereferences or by split outlined blocks that still need caller context.
 
+The generated C models `TPIDR_EL0` as a zero-initialized `eni_tls` block, so
+stack-canary and TLS reads match the emulator instead of dereferencing host
+NULL. `bti j` jump-table case bodies that inherit callee-saved registers reload
+them from `eni_outlined_ctx`; the dispatcher saves x19..x28 immediately before
+the indirect branch. Prologue-less direct-branch fragments are folded back into
+the surrounding function instead of being emitted as standalone context-less
+entries.
+
 **`--emit-llvm`** (AArch64 only; implies `--decompile`): in addition to
 `.decompiled.c`, writes `<name>.decompiled.ll` — each lifted function as LLVM IR
 (`internal/llvm`): all values modeled as `i64`, locals as allocas in `entry`

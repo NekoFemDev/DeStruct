@@ -37,6 +37,36 @@ func renderForTest(stmts []ir.Stmt) string {
 	return buf.String()
 }
 
+// TestThreadPointerTLS checks that TPIDR_EL0 is modeled as the TLS block
+// base, so the stack-canary load does not become a null dereference.
+func TestThreadPointerTLS(t *testing.T) {
+	insns := disassembleWords(t, 0x90fa54, []uint32{
+		0xd53bd053, // mrs x19, TPIDR_EL0
+		0xf9401660, // ldr x0, [x19, #0x28]
+		0xd65f03c0, // ret
+	})
+	out := renderForTest(LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{}))
+	if !strings.Contains(out, "ENI_TLS_BASE + 0x28") {
+		t.Fatalf("TPIDR_EL0 was not lifted to the TLS base:\n%s", out)
+	}
+}
+
+// TestFixedAddressIndexedLoad checks that an adrp/add-built table base
+// survives into an indexed access instead of degrading to a placeholder
+// register (the old jump-table/x23-is-zero failure).
+func TestFixedAddressIndexedLoad(t *testing.T) {
+	insns := disassembleWords(t, 0x1000, []uint32{
+		0xb0000017, // adrp x23, 0x1000
+		0x910042f7, // add x23, x23, #0x10
+		0x78607ae0, // ldrh w0, [x23, x0, lsl #1]
+		0xd65f03c0, // ret
+	})
+	out := renderForTest(LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{}))
+	if strings.Contains(out, "x23") || !strings.Contains(out, ")[x0]") {
+		t.Fatalf("fixed table base was lost:\n%s", out)
+	}
+}
+
 // TestTailThunkWithoutUnwindEntry reproduces a real quazar_arm64 thunk:
 // bti; add x0, x0, #0x10; b 0x9442bc, where the branch target has no
 // .eh_frame entry. The target must still become a call, and untouched

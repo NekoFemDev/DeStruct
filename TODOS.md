@@ -223,20 +223,38 @@ two-operand immediate shifts (`asr/lsl/lsr #imm`), correct GOT/data-slot
 loads when the resolver only has a section label, a default `return x0`
 for functions that end without an explicit return, and zero-initialized
 synthesized locals/registers. On `quazar_arm64`, `sub_9e002c`,
-`sub_90f934`, `sub_916820` and `sub_90f9bc` now match the oracle. The
-zero-argument verification profile currently reports 226 exact return
-matches, 28 pointer-only differences, 246 both-faulted functions and
-1,221 execution mismatches (1,211 host faults, 10 original faults);
-host faults are dominated by split outlined blocks that still lack caller
-register/stack context and by zero-argument pointer dereferences.
+`sub_90f934`, `sub_916820` and `sub_90f9bc` now match the oracle.
+
+Sprint 14 (2026-11-23) is complete:
+emulation-guided outlined-context recovery. `mrs xN, TPIDR_EL0` now maps
+to a zero-initialized `eni_tls` block (`ENI_TLS_BASE`) on both the host
+and the Unicorn side, so Android stack-canary/TLS reads no longer become
+null dereferences. Direct-branch targets that have no prologue/BTI entry
+evidence are folded back into the surrounding function instead of being
+emitted as context-less fragments. Fixed-address table bases (`adrp`/`add`
+followed by an indexed load) keep their `ENI_ADDR` expression instead of
+degrading to an uninitialized placeholder register. `bti j` jump-table
+case bodies that read inherited callee-saved registers now reload them
+from `eni_outlined_ctx`; their dispatcher materializes and saves x19..x28
+immediately before the indirect branch. On the zero-argument
+`quazar_arm64` profile this raised exact return matches from 226 to 321,
+pointer-only matches from 28 to 67, and reduced both-faulted functions
+from 246 to 219 and host faults from 1,211 to 1,057 (1,666 tested functions
+after fragment folding).
 
 - [x] Optional Unicorn backend behind the `unicorn` build tag
       (`make unicorn build-unicorn`).
 - [x] `elf emulate` with image/relocation/import setup.
 - [x] `elf verify` host-vs-emulator differential runner.
 - [x] 32-bit parameter-view seeding and zero-extended returns.
-- [ ] Emulation-guided outlined-block context recovery (callee-saved
-      registers and stack slots).
+- [x] TPIDR_EL0 / TLS modeling.
+- [x] Outlined jump-table context (`eni_outlined_ctx`) for callee-saved
+      registers.
+- [x] Fold prologue-less direct-branch fragments into their surrounding
+      function.
+- [x] Preserve fixed-address table bases in indexed accesses.
+- [ ] Extend outlined context recovery to non-`bti j` outlined
+      subroutines and stack slots.
 - [ ] Structured fuzzing with pointer/struct argument profiles.
 - [ ] Memory-effects comparison (writable image hash) in verify.
 

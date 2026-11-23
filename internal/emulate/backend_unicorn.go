@@ -78,6 +78,8 @@ func (b *unicornBackend) Reg(name string) (int, error) {
 		return int(C.UC_ARM64_REG_PC), nil
 	case "nzcv":
 		return int(C.UC_ARM64_REG_NZCV), nil
+	case "tpidr_el0":
+		return int(C.UC_ARM64_REG_TPIDR_EL0), nil
 	case "lr":
 		return int(C.UC_ARM64_REG_X30), nil
 	case "fp":

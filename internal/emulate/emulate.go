@@ -72,6 +72,11 @@ func DefaultConfig() Config {
 const (
 	emuStubBase = 0x6fffff000000
 	emuZeroBase = 0x6ffffe000000
+	// emuTLSBase is a dedicated zero-filled TLS block. TPIDR_EL0 points at
+	// its middle so both positive (canary at 0x28) and negative (errno)
+	// thread-local offsets stay mapped.
+	emuTLSBase = 0x6ffffd000000
+	emuTLSSize = 0x10000
 )
 
 // Machine is one emulated process image plus a stack and return sentinel.
@@ -240,6 +245,9 @@ func (m *Machine) Prepare() error {
 	if err := m.backend.Write(m.sentinel, []byte{0xc0, 0x03, 0x5f, 0xd6}); err != nil {
 		return fmt.Errorf("write return sentinel: %w", err)
 	}
+	if err := m.backend.Map(emuTLSBase, emuTLSSize, ProtRead|ProtWrite); err != nil {
+		return fmt.Errorf("map TLS block: %w", err)
+	}
 	m.prepared = true
 	return nil
 }
@@ -281,6 +289,15 @@ func (m *Machine) Call(addr uint64, args []uint64) (*Result, error) {
 		return nil, err
 	}
 	if err := m.setReg("nzcv", 0); err != nil {
+		return nil, err
+	}
+	// Each Call starts the way a fresh host process does: zeroed TLS.
+	// TPIDR_EL0 is the AArch64 user thread pointer used by Android code
+	// for the stack canary and thread-local variables.
+	if err := m.backend.Write(emuTLSBase, make([]byte, emuTLSSize)); err != nil {
+		return nil, fmt.Errorf("reset TLS block: %w", err)
+	}
+	if err := m.setReg("tpidr_el0", emuTLSBase+emuTLSSize/2); err != nil {
 		return nil, err
 	}
 

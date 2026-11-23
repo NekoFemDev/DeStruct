@@ -221,6 +221,13 @@ func WriteCFilePreamble(w io.Writer, sourceName string) {
 	io.WriteString(w, "#define ENI_BITCAST_U32(v) eni_f2b((float)(v))\n")
 	io.WriteString(w, "#define ENI_BITCAST_F64(v) eni_b2d((uint64_t)(v))\n")
 	io.WriteString(w, "#define ENI_BITCAST_U64(v) eni_d2b((double)(v))\n\n")
+	// TPIDR_EL0 accesses (Android TLS: stack canary, errno, thread-local
+	// variables) become indexes into this zero-initialized block. The
+	// pointer sits in the middle so both positive and negative TLS
+	// offsets stay inside the array.
+	io.WriteString(w, "extern unsigned char eni_tls[];\n")
+	io.WriteString(w, "#define ENI_TLS_BASE ((uintptr_t)(eni_tls + 0x8000))\n")
+	io.WriteString(w, "extern uint64_t eni_outlined_ctx[10];\n\n")
 	// Lane-wise vector helpers. The IR keeps q-registers as eni_uint128,
 	// so these reinterpret the same 16 bytes with the arrangement named
 	// in the suffix (4s, 2d, 8h, 16b).
@@ -569,6 +576,15 @@ func cTypeForWidth(width int) string {
 func (r *cRenderer) useVar(raw string) string {
 	if raw == "" {
 		raw = "_unnamed"
+	}
+	// eni_outlined_ctx is an extern global declared by the preamble, not
+	// a synthesized local.
+	if raw == eniOutlinedCtx {
+		r.varNames[raw] = raw
+		r.origByMapped[raw] = raw
+		r.usedOrig[raw] = true
+		r.explicit[raw] = true
+		return raw
 	}
 	if mapped, ok := r.varNames[raw]; ok {
 		r.usedOrig[raw] = true
@@ -1092,9 +1108,16 @@ func (r *cRenderer) exprParen(e ir.Expr) string {
 	return s
 }
 
+// eniTLSBaseLabel marks a TPIDR_EL0-derived address. The renderer spells it
+// as the ENI_TLS_BASE macro instead of a numeric address.
+const eniTLSBaseLabel = "ENI_TLS_BASE"
+
 // addrExpr renders an AddrLit. With an image blob attached it indexes the
 // original ELF load image; otherwise it stays a plain numeric pointer.
 func (r *cRenderer) addrExpr(v *ir.AddrLit) string {
+	if v.Label == eniTLSBaseLabel {
+		return eniTLSBaseLabel
+	}
 	if r.functionPtr != nil {
 		if name, ok := r.functionPtr(v.Value); ok && name != "" {
 			r.calls[name] = true
@@ -1328,6 +1351,9 @@ func (r *cRenderer) expr(e ir.Expr) string {
 	case *ir.IndirectCall:
 		return "((uint64_t (*)())(" + r.expr(v.Callee) + "))(" + r.exprList(v.Args) + ")"
 	case *ir.ArrayAccess:
+		if lv, ok := v.Array.(*ir.LocalVar); ok && lv.Name == eniOutlinedCtx && v.Width == 8 {
+			return eniOutlinedCtx + "[" + r.expr(v.Index) + "]"
+		}
 		ctype := cTypeForWidth(v.Width)
 		if v.CType != "" {
 			ctype = v.CType

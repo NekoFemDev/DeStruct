@@ -6,8 +6,45 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/destruct/destruct/internal/arm64lift"
 	"github.com/destruct/destruct/internal/native"
 )
+
+// computeOutlinedContexts finds "bti j" jump-table landing pads that read
+// callee-saved state produced by their dispatcher. A normal BTI call target
+// is "bti c" (or a conventional prologue); "bti j" is specifically the
+// branch-target entry a compiler emits for a jump-table case, so those are
+// the entries that need inherited x19..x28.
+func computeOutlinedContexts(
+	candidates []funcCandidate,
+	elf *native.ELFParser,
+	d *native.Disassembler,
+) map[uint64][]string {
+	if d == nil {
+		return nil
+	}
+	out := make(map[uint64][]string)
+	// bti j: d503249f, little-endian.
+	btiJ := []byte{0x9f, 0x24, 0x03, 0xd5}
+	for _, c := range candidates {
+		code, ok := readFunctionCode(c, elf)
+		if !ok || len(code) < len(btiJ) {
+			continue
+		}
+		if code[0] != btiJ[0] || code[1] != btiJ[1] || code[2] != btiJ[2] || code[3] != btiJ[3] {
+			continue
+		}
+		insns, err := d.DisassembleDetailed(code, c.addr)
+		if err != nil || len(insns) == 0 {
+			continue
+		}
+		regs := arm64lift.CallerContextRegs(insns)
+		if len(regs) > 0 {
+			out[c.addr] = regs
+		}
+	}
+	return out
+}
 
 // directBranchTarget returns the destination of an unconditional
 // "b #imm" (Capstone resolves the PC-relative immediate).
@@ -139,6 +176,16 @@ func splitCoarseFunctions(
 			// are alias/outlined entries that C cannot express as a local
 			// goto. Intra-function branches stay inside their function.
 			if containingCandidate(list, target) == site.caller || containingCandidate(list, target) == 0 {
+				continue
+			}
+			// A cross-branch into a candidate that has no prologue shape is
+			// usually not a real entry point: coarse .eh_frame gaps and
+			// split fragments make one function look like several
+			// candidates, and a loop/switch branch between them would
+			// otherwise be emitted as a context-less standalone function.
+			// Keep such targets inside their surrounding function so the
+			// register/stack state that reaches them is preserved.
+			if entryScore(elf, d, target) < 2 {
 				continue
 			}
 			newAddrs = append(newAddrs, target)

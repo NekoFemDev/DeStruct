@@ -92,4 +92,16 @@ type LiftOptions struct {
 	// instruction address each time a select/branch condition cannot be
 	// reconstructed (no live comparison snapshot). Diagnostics only.
 	CondMiss func(op string, addr uint64)
+
+	// OutlinedContextRegs, when non-empty, marks this function as an
+	// outlined entry that inherits these callee-saved registers from its
+	// dispatcher. The lifter loads them from eni_outlined_ctx before the
+	// body so the generated C no longer treats them as zero.
+	OutlinedContextRegs []string
+
+	// OutlinedContextTargets maps each outlined entry to the
+	// callee-saved registers it inherits. Callers use it to save their
+	// live x19..x28 values into eni_outlined_ctx immediately before a
+	// direct or jump-table call to that entry.
+	OutlinedContextTargets map[uint64][]string
 }
