@@ -120,6 +120,11 @@ Commands:
   elf recompile <decompiled_dir> -o <binary>
               Generate link stubs and recompile all .c files into a dummy
               executable with clang
+  elf emulate <file> <function|0xaddr>
+              Run an AArch64 function in the optional Unicorn backend
+              (build with: make unicorn build-unicorn)
+  elf verify <original> <decompiled_dir>
+              Compare decompiled functions against the original under Unicorn
   il2cpp      Dump Unity IL2CPP metadata (global-metadata.dat + libil2cpp.so) to dump.cs
   version     Show version
   help        Show this help
@@ -194,6 +199,8 @@ Examples:
   destruct elf libnative.so -o output/ --emit-pseudo --split-functions
   destruct elf info libnative.so
   destruct elf recompile output/libnative.so_decompiled/ -o dummy
+  destruct elf emulate libnative.so 0x1234 --args 1,2,3
+  destruct elf emulate libnative.so sub_1234 --json
   destruct flutter libapp.so -o output/
   destruct il2cpp libil2cpp.so global-metadata.dat -o output/
   destruct elf libnative.so -o output/
@@ -549,6 +556,10 @@ func handleELF(ctx context.Context, args []string) error {
 			return handleELFRecompile(ctx, args[1:])
 		case "info":
 			return handleELFInfo(ctx, args[1:])
+		case "emulate":
+			return handleELFEmulate(ctx, args[1:])
+		case "verify":
+			return handleELFVerify(ctx, args[1:])
 		}
 	}
 	opts, input, err := parseFlags(args)
@@ -730,6 +741,10 @@ func collectCFiles(dir, exclude string) ([]string, error) {
 			return nil
 		}
 		if strings.EqualFold(filepath.Ext(path), ".c") {
+			base := filepath.Base(path)
+			if base == "verify_driver.c" || base == "verify_stubs.c" {
+				return nil
+			}
 			absPath, err := filepath.Abs(path)
 			if err != nil {
 				return err

@@ -29,11 +29,15 @@ func commandUsageLine(cmd string) string {
 	case "flutter":
 		return "Usage: destruct flutter <libapp.so|app.apk> [-o <dir>] [-v]"
 	case "elf":
-		return "Usage: destruct elf [info|recompile] <file.so> [-o <dir>] [--decompile] [-v]"
+		return "Usage: destruct elf [info|recompile|emulate|verify] <file.so> [-o <dir>] [--decompile] [-v]"
 	case "elf info":
 		return "Usage: destruct elf info <file.so>"
 	case "elf recompile":
 		return "Usage: destruct elf recompile <decompiled_dir> -o <binary>"
+	case "elf emulate":
+		return "Usage: destruct elf emulate <file.so> <function|0xaddress> [--args a0,a1,...] [--json]"
+	case "elf verify":
+		return "Usage: destruct elf verify <original.so> <decompiled_dir> [--function f] [--limit N] [--json]"
 	case "il2cpp":
 		return "Usage: destruct il2cpp <libil2cpp.so> <global-metadata.dat> [-o <dir>] [-v]"
 	default:
@@ -171,6 +175,36 @@ RELRO, stack canary).`)
 
 Generates <decompiled_dir>/stubs.c for unresolved externs and links every
 .c file in the directory into a dummy executable with clang.`)
+	case "elf emulate":
+		fmt.Println(`Usage: destruct elf emulate <file.so> <function|0xaddress> [options]
+
+Runs one AArch64 function from the original ELF in the optional Unicorn
+emulation backend and prints the final register state.
+
+Options:
+      --args a0,a1,...   initial x0..xN values (decimal or 0x...)
+      --max-insns N      instruction limit (default 10000000)
+      --timeout MS       wall-clock timeout in milliseconds (default 5000)
+      --json             machine-readable output
+
+Requires a build with Unicorn: make unicorn build-unicorn.`)
+	case "elf verify":
+		fmt.Println(`Usage: destruct elf verify <original.so> <decompiled_dir> [options]
+
+Differentially checks decompiled C against the original function under
+Unicorn. Builds a host driver once, then compares the return value for
+each function (or a selected one).
+
+Options:
+      --function F       function name or 0xaddress
+      --args a0,...      fixed argument values (default: zeros)
+      --limit N          stop after N functions
+      --max-insns N      emulator instruction limit
+      --timeout MS       per-call timeout
+      --rebuild          rebuild the host verification driver
+      --json             machine-readable summary
+
+Requires a build with Unicorn and clang on PATH.`)
 	case "il2cpp":
 		fmt.Println(`Usage: destruct il2cpp <libil2cpp.so> <global-metadata.dat> [-o <dir>] [-v]
 

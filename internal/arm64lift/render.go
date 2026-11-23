@@ -677,7 +677,7 @@ func (r *cRenderer) writeDecls(w io.Writer) {
 			continue
 		}
 		sort.Strings(names)
-		fmt.Fprintf(w, "    %s %s;\n", typ, strings.Join(names, ", "))
+		fmt.Fprintf(w, "    %s %s;\n", typ, initializedDeclList(names, typ))
 	}
 	// Any unexpected declaration type (a VarDeclStmt-inferred type, say)
 	// still gets a deterministic line rather than being dropped.
@@ -691,8 +691,23 @@ func (r *cRenderer) writeDecls(w io.Writer) {
 	for _, typ := range extra {
 		names := groups[typ]
 		sort.Strings(names)
-		fmt.Fprintf(w, "    %s %s;\n", typ, strings.Join(names, ", "))
+		fmt.Fprintf(w, "    %s %s;\n", typ, initializedDeclList(names, typ))
 	}
+}
+
+// initializedDeclList renders "a = 0, b = 0": every synthesized local and
+// register placeholder starts zeroed, matching Unicorn's zero-filled
+// registers/stack and avoiding nondeterministic garbage reads.
+func initializedDeclList(names []string, typ string) string {
+	zero := " = 0"
+	if typ == "eni_uint128" {
+		zero = " = {0}"
+	}
+	parts := make([]string, len(names))
+	for i, name := range names {
+		parts[i] = name + zero
+	}
+	return strings.Join(parts, ", ")
 }
 
 func (r *cRenderer) labelFor(orig string) string {

@@ -185,10 +185,10 @@ func TestLiftFunction_MetadataFieldName(t *testing.T) {
 	}
 	stmts := LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{Metadata: stubMeta{}})
 	out := renderStmts(t, stmts)
-	if !strings.Contains(out, "this.progressTarget_ = other;") {
+	if !strings.Contains(out, "this.progressTarget_ = (uint)other;") {
 		t.Errorf("expected named field assignment, got:\n%s", out)
 	}
-	if got := renderStmts(t, RewriteForIL2CPP(stmts)); !strings.Contains(got, "->progressTarget_ = other;") {
+	if got := renderStmts(t, RewriteForIL2CPP(stmts)); !strings.Contains(got, "->progressTarget_ = (uint)other;") {
 		t.Errorf("expected arrow field in IL2CPP mode, got:\n%s", got)
 	}
 }
@@ -206,7 +206,7 @@ func TestLiftFunction_MetadataSeedsParams(t *testing.T) {
 	out := renderStmts(t, stmts)
 	// Field 0 isn't in the stub, so the access stays synthetic - but
 	// the base must be the seeded `this` from the metadata binding.
-	if !strings.Contains(out, "return this.field_0;") {
+	if !strings.Contains(out, "return (uint)this.field_0;") {
 		t.Errorf("expected seeded this base, got:\n%s", out)
 	}
 }

@@ -12,13 +12,6 @@ import (
 	"github.com/destruct/destruct/internal/native"
 )
 
-// maxELFImageSize bounds the reconstructed load image so a pathological
-// ET_EXEC with high virtual addresses cannot make `elf --decompile` write
-// a huge blob.
-const maxELFImageSize = 512 << 20
-
-const shtNobits = 8
-
 // writeImageRelocations emits image_relocs.c: a constructor that applies
 // .rela.dyn R_AARCH64_RELATIVE entries to the reconstructed image using
 // host pointers. Data targets are rebased into eni_image; targets that are
@@ -142,71 +135,11 @@ func isCIdent(s string) bool {
 // ENI_ADDR so data reads/writes land in this reconstructed image instead
 // of an unmapped host address.
 func writeELFImage(elf *native.ELFParser, dir string) (base, size uint64, err error) {
-	minAddr := ^uint64(0)
-	maxAddr := uint64(0)
-	for _, s := range elf.Sections {
-		if s.Flags&native.SHF_ALLOC == 0 || s.Size == 0 {
-			continue
-		}
-		if s.Addr < minAddr {
-			minAddr = s.Addr
-		}
-		end := s.Addr + s.Size
-		if end < s.Addr {
-			continue
-		}
-		if end > maxAddr {
-			maxAddr = end
-		}
+	base, img, err := elf.LoadImage()
+	if err != nil || len(img) == 0 {
+		return 0, 0, err
 	}
-	if minAddr == ^uint64(0) || maxAddr <= minAddr {
-		return 0, 0, nil
-	}
-
-	// PIE/DSO addresses are link-time offsets from zero; for ordinary
-	// low-address executables mapping from zero too avoids a base constant
-	// that user code might index below. High-address ET_EXEC keeps its
-	// lowest section address (rounded down) instead.
-	base = 0
-	if elf.Header.Type != native.ET_DYN && maxAddr > maxELFImageSize {
-		base = minAddr &^ 0xfff
-	}
-	size = maxAddr - base
-	if size == 0 || size > maxELFImageSize {
-		return 0, 0, fmt.Errorf("ELF image span 0x%x exceeds the %d MiB limit", size, maxELFImageSize>>20)
-	}
-
-	img := make([]byte, size)
-	// A PIE's first PT_LOAD includes the ELF header and program header
-	// table at virtual address 0. The section-based copy below starts at
-	// the first section (.interp usually), so copy the prefix too.
-	if base == 0 && elf.Header.Type == native.ET_DYN {
-		n := minAddr
-		if n > uint64(len(elf.Data)) {
-			n = uint64(len(elf.Data))
-		}
-		copy(img, elf.Data[:n])
-	}
-	for _, s := range elf.Sections {
-		if s.Flags&native.SHF_ALLOC == 0 || s.Size == 0 || s.Addr < base {
-			continue
-		}
-		off := s.Addr - base
-		if off >= size {
-			continue
-		}
-		n := s.Size
-		if off+n > size {
-			n = size - off
-		}
-		if s.Type == shtNobits {
-			continue
-		}
-		if s.Offset > uint64(len(elf.Data)) || s.Offset+s.Size > uint64(len(elf.Data)) {
-			continue
-		}
-		copy(img[off:off+n], elf.Data[s.Offset:s.Offset+n])
-	}
+	size = uint64(len(img))
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return 0, 0, err

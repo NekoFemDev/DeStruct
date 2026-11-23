@@ -1359,6 +1359,17 @@ type DynamicSymbol struct {
 	Size  uint64
 }
 
+// PLTRelocations returns the parsed .rela.plt entries (JUMP_SLOT imports).
+func (p *ELFParser) PLTRelocations(ctx context.Context) []RelaEntry {
+	for _, sec := range p.Sections {
+		if sec.Type != SHT_RELA || p.getSectionName(sec) != ".rela.plt" {
+			continue
+		}
+		return p.parseRelaSection(ctx, sec)
+	}
+	return nil
+}
+
 // DynamicSymbols resolves the complete .dynsym table to names. The
 // relocation pass uses it to distinguish imported functions (which can be
 // redirected to generated ext_* stubs) from data symbols.

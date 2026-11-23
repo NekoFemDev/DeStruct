@@ -18,6 +18,7 @@ package arm64lift
 import (
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/destruct/destruct/internal/ir"
@@ -269,6 +270,9 @@ func LiftFunctionWithOptions(instructions []native.DetailedInstruction, paramNam
 		regNames:     make(map[string]string),
 		regSeq:       &regSeq,
 		simdSeq:      &simdSeq,
+		written:      make(map[string]bool),
+		seedRefs:     make(map[string]ir.Expr),
+		regWidths:    make(map[string]int),
 	}
 	if opts.Metadata != nil && len(instructions) > 0 {
 		if typeName, params, isStatic, ok := opts.Metadata.MethodAtRVA(instructions[0].Address); ok {
@@ -313,14 +317,29 @@ func LiftFunctionWithOptions(instructions []native.DetailedInstruction, paramNam
 			insts = blocks[0].Instructions
 		}
 		stmts := l.run(insts)
-		return reconstructTryCatch(append(stmts, l.flushRemaining()...))
+		return l.finishFunction(append(stmts, l.flushRemaining()...))
 	}
 
 	byAddr := make(map[uint64]*BasicBlock, len(blocks))
 	for _, b := range blocks {
 		byAddr[b.StartAddr] = b
 	}
-	return reconstructTryCatch(l.liftBlockGraph(blocks[0], byAddr, make(map[uint64]bool), nil))
+	return l.finishFunction(l.liftBlockGraph(blocks[0], byAddr, make(map[uint64]bool), nil))
+}
+
+// finishFunction makes every lifted C function well-defined: if the last
+// top-level statement is not a return, append "return x0" using the ABI
+// return register. This covers trailing noreturn calls and paths whose
+// ret is only reachable through nested control flow.
+func (l *lifter) finishFunction(stmts []ir.Stmt) []ir.Stmt {
+	stmts = reconstructTryCatch(stmts)
+	if len(stmts) == 0 {
+		return stmts
+	}
+	if _, ok := stmts[len(stmts)-1].(*ir.ReturnStmt); ok {
+		return stmts
+	}
+	return append(stmts, &ir.ReturnStmt{Value: &ir.LocalVar{Name: l.regName("x0")}})
 }
 
 // loopCtx identifies the innermost enclosing loop a liftBlockGraph
@@ -1640,7 +1659,19 @@ func (l *lifter) fork() *lifter {
 	for k, v := range l.addrRegs {
 		addrRegs[k] = v
 	}
-	return &lifter{regs: regs, stack: stack, stackWidth: stackWidth, stackTyped: stackTyped, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq, x29Offset: l.x29Offset, x29Known: l.x29Known, functionInsns: l.functionInsns, insnIndex: l.insnIndex, functionStart: l.functionStart, functionEnd: l.functionEnd, outlinedDepth: l.outlinedDepth}
+	written := make(map[string]bool, len(l.written))
+	for k, v := range l.written {
+		written[k] = v
+	}
+	seedRefs := make(map[string]ir.Expr, len(l.seedRefs))
+	for k, v := range l.seedRefs {
+		seedRefs[k] = v
+	}
+	regWidths := make(map[string]int, len(l.regWidths))
+	for k, v := range l.regWidths {
+		regWidths[k] = v
+	}
+	return &lifter{regs: regs, stack: stack, stackWidth: stackWidth, stackTyped: stackTyped, params: l.params, lastCmp: l.lastCmp, resolver: l.resolver, strings: l.strings, addrRegs: addrRegs, calls: calls, consumed: consumed, resultRegs: resultRegs, budget: l.budget, searchBudget: l.searchBudget, dataReader: l.dataReader, cfg: l.cfg, stops: l.stops, mergeUsed: l.mergeUsed, labelSeq: l.labelSeq, mergeLabels: l.mergeLabels, opts: l.opts, thisType: l.thisType, regNames: l.regNames, regSeq: l.regSeq, simdSeq: l.simdSeq, x29Offset: l.x29Offset, x29Known: l.x29Known, functionInsns: l.functionInsns, insnIndex: l.insnIndex, functionStart: l.functionStart, functionEnd: l.functionEnd, outlinedDepth: l.outlinedDepth, written: written, seedRefs: seedRefs, regWidths: regWidths}
 }
 
 // liftCondition lifts a conditional branch instruction (b.cond or
@@ -1826,6 +1857,13 @@ type lifter struct {
 	functionEnd   uint64
 	outlinedDepth int
 	curAddr       uint64
+
+	// written tracks registers explicitly written since function entry
+	// (seeded incoming parameter registers do not count). seedRefs keeps
+	// the exact expression each argument register was seeded with.
+	written   map[string]bool
+	seedRefs  map[string]ir.Expr
+	regWidths map[string]int
 
 	// params holds the declared parameter names in AAPCS64 register
 	// order, as given to LiftFunction.
@@ -2159,6 +2197,17 @@ func suggestedVarName(e ir.Expr) string {
 	return ""
 }
 
+// localVarOf unwraps integer-width casts to the underlying local.
+func localVarOf(e ir.Expr) (*ir.LocalVar, bool) {
+	switch v := e.(type) {
+	case *ir.LocalVar:
+		return v, true
+	case *ir.CastExpr:
+		return localVarOf(v.Expr)
+	}
+	return nil, false
+}
+
 // paramNameForReg returns the declared parameter name for a register if
 // it's one of the AAPCS64 integer argument registers within range of
 // the caller-supplied paramNames, and ok=false otherwise (a register
@@ -2205,13 +2254,24 @@ func (l *lifter) isParam(name string) bool {
 // back to the parameter, which is exactly the bug this comment is
 // warning against re-introducing.
 func (l *lifter) seedParams() {
-	for i, name := range l.params {
-		if i >= len(aapcs64IntArgRegs) {
-			break
+	for i := 0; i < len(aapcs64IntArgRegs); i++ {
+		xReg := aapcs64IntArgRegs[i]
+		wReg := aapcs64IntArgRegs32[i]
+		name := l.regName(xReg)
+		if i < len(l.params) && l.params[i] != "" {
+			name = l.params[i]
 		}
-		ref := &ir.LocalVar{Name: name}
-		l.regs[aapcs64IntArgRegs[i]] = ref
-		l.regs[aapcs64IntArgRegs32[i]] = ref
+		xRef := &ir.LocalVar{Name: name}
+		// wN is the low 32-bit view of xN, so seed it as an explicit
+		// cast rather than a second unrelated variable.
+		wRef := ir.Expr(&ir.CastExpr{
+			Type: &ir.PrimitiveType{Name: "uint"},
+			Expr: xRef,
+		})
+		l.regs[xReg] = xRef
+		l.regs[wReg] = wRef
+		l.seedRefs[xReg] = xRef
+		l.seedRefs[wReg] = wRef
 	}
 }
 
@@ -2279,6 +2339,8 @@ func (l *lifter) run(instructions []native.DetailedInstruction) []ir.Stmt {
 			stmts = append(stmts, l.liftVectorFma(inst, true)...)
 		case "dup":
 			stmts = append(stmts, l.liftVectorDup(inst)...)
+		case "movi":
+			stmts = append(stmts, l.liftVectorZero(inst)...)
 		case "madd":
 			stmts = append(stmts, l.liftMadd(inst, false)...)
 		case "msub":
@@ -2673,7 +2735,7 @@ func (l *lifter) liftStr(inst native.DetailedInstruction, width int) []ir.Stmt {
 	if disp, ok := l.stackSlotDisp(dstOp.Mem.Base, dstOp.Mem); ok {
 		name, exists := l.stack[disp]
 		if !exists {
-			if lv, ok := srcVal.(*ir.LocalVar); ok && l.isParam(lv.Name) {
+			if lv, ok := localVarOf(srcVal); ok && l.isParam(lv.Name) {
 				l.stack[disp] = lv.Name
 				return nil
 			}
@@ -2835,15 +2897,18 @@ func (l *lifter) liftLdr(inst native.DetailedInstruction, width int, cast ir.Typ
 			addr := base + uint64(srcOp.Mem.Disp)
 			if name, ok := l.resolver(addr); ok {
 				name = demangle(name)
-				// Section-relative labels (".data+0x0", ".got+0x8") are
-				// addresses, not variables: keep the numeric value too so
-				// the C renderer can spell them as ((uintptr_t)0x...).
-				// Plain symbol names stay LocalVars, preserving the
-				// resolved-name rendering existing callers expect.
-				if isSectionLabel(name) {
-					return l.setReg(dstOp.Reg, wrap(&ir.AddrLit{Value: addr, Label: name}))
+				// A real symbol name here is the object whose address
+				// the GOT/data slot holds. Section labels (".got+0x8")
+				// only describe the SLOT itself, so load from the slot's
+				// absolute address instead.
+				if !isSectionLabel(name) {
+					return l.setReg(dstOp.Reg, wrap(&ir.LocalVar{Name: name}))
 				}
-				return l.setReg(dstOp.Reg, wrap(&ir.LocalVar{Name: name}))
+				target := l.newFieldAccessOn(&ir.AddrLit{Value: addr, Label: name}, 0, width)
+				if target != nil {
+					setAccessCType(target, ctype)
+					return l.setReg(dstOp.Reg, wrap(target))
+				}
 			}
 		}
 	}
@@ -3178,6 +3243,63 @@ func (l *lifter) liftVectorFma(inst native.DetailedInstruction, negate bool) []i
 		Method: name,
 		Args:   []ir.Expr{acc, a, b},
 	})
+}
+
+// liftVectorZero handles "movi vD.<arr>, #0" and its q/d/s aliases.
+// Non-zero vector immediates are left to the existing vector paths.
+func (l *lifter) liftVectorZero(inst native.DetailedInstruction) []ir.Stmt {
+	if len(inst.Operands) < 1 || !isVectorReg(inst.Operands[0]) {
+		return nil
+	}
+	zero := len(inst.Operands) >= 2 && inst.Operands[1].Type == native.OperandImm && inst.Operands[1].Imm == 0
+	if !zero {
+		txt := inst.OpStr
+		if i := strings.LastIndex(txt, "#"); i >= 0 {
+			v := strings.TrimSpace(txt[i+1:])
+			if j := strings.IndexAny(v, ", "); j >= 0 {
+				v = v[:j]
+			}
+			if n, err := strconv.ParseUint(v, 0, 64); err == nil && n == 0 {
+				zero = true
+			}
+		}
+	}
+	if !zero {
+		return nil
+	}
+	n := vectorRegNumber(inst.Operands[0].Reg)
+	if n < 0 {
+		return nil
+	}
+	var stmts []ir.Stmt
+	for _, reg := range []string{
+		fmt.Sprintf("b%d", n), fmt.Sprintf("h%d", n), fmt.Sprintf("s%d", n),
+		fmt.Sprintf("d%d", n), fmt.Sprintf("q%d", n), fmt.Sprintf("v%d", n),
+	} {
+		stmts = append(stmts, l.setReg(reg, &ir.IntLit{Value: 0})...)
+	}
+	return stmts
+}
+
+func vectorRegNumber(name string) int {
+	digits := ""
+	for _, r := range name {
+		if r >= '0' && r <= '9' {
+			digits += string(r)
+			continue
+		}
+		if digits != "" {
+			break
+		}
+	}
+	if digits == "" {
+		return -1
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n < 0 || n > 31 {
+		return -1
+	}
+	return n
 }
 
 // liftVectorDup lifts "dup vD.<arr>, Rn" by broadcasting the scalar
@@ -4022,7 +4144,29 @@ var aluOps = map[string]struct {
 // return, a call argument, ...) actually consumes it.
 func (l *lifter) liftALU(inst native.DetailedInstruction) []ir.Stmt {
 	op, ok := aluOps[inst.Mnemonic]
-	if !ok || len(inst.Operands) != 3 {
+	if !ok {
+		return nil
+	}
+	// Capstone reports immediate shifts ("asr x8, x8, #3") as two
+	// structured operands with the amount only in OpStr, unlike add/sub
+	// which expose a third immediate operand.
+	if len(inst.Operands) == 2 && (inst.Mnemonic == "lsl" || inst.Mnemonic == "lsr" || inst.Mnemonic == "asr") {
+		dstOp, srcOp := inst.Operands[0], inst.Operands[1]
+		if dstOp.Type != native.OperandReg || srcOp.Type != native.OperandReg {
+			return nil
+		}
+		shift, ok := trailingImmediate(inst.OpStr)
+		if !ok {
+			return nil
+		}
+		lhs := l.regValue(srcOp.Reg)
+		l.consume(lhs)
+		if !strings.HasPrefix(inst.Mnemonic, "f") {
+			lhs = fpViewBitcast(srcOp.Reg, lhs, true)
+		}
+		return l.setReg(dstOp.Reg, &ir.BinaryExpr{Op: op.irOp, Left: lhs, Right: &ir.IntLit{Value: shift}})
+	}
+	if len(inst.Operands) != 3 {
 		return nil
 	}
 	dstOp, lhsOp, rhsOp := inst.Operands[0], inst.Operands[1], inst.Operands[2]
@@ -4076,6 +4220,21 @@ func fpLit(reg string, v float64) ir.Expr {
 		return &ir.FloatLit{Value: float32(v)}
 	}
 	return &ir.DoubleLit{Value: v}
+}
+
+// trailingImmediate parses the last "#N" from an operand string such as
+// "x8, x8, #3".
+func trailingImmediate(opStr string) (int64, bool) {
+	idx := strings.LastIndex(opStr, "#")
+	if idx < 0 {
+		return 0, false
+	}
+	txt := strings.TrimSpace(opStr[idx+1:])
+	if j := strings.IndexAny(txt, ", "); j >= 0 {
+		txt = txt[:j]
+	}
+	n, err := strconv.ParseInt(txt, 0, 64)
+	return n, err == nil
 }
 
 // applyOperandShift wraps e in the shift named by an operand's own
@@ -4282,6 +4441,12 @@ func (l *lifter) collectCallArgsN(n int) []ir.Expr {
 		if l.resultRegs[reg] {
 			break
 		}
+		// Seeded incoming arguments that this function never wrote were
+		// not explicitly set up for this call; stop here rather than
+		// spraying xN placeholders into every unresolved call.
+		if l.isSeedReg(reg) {
+			break
+		}
 		// If this register currently holds a known address (from
 		// adrp/adr, possibly via a following add - see addrRegs' own
 		// doc comment) and it resolves to an actual string literal,
@@ -4296,10 +4461,38 @@ func (l *lifter) collectCallArgsN(n int) []ir.Expr {
 				v = &ir.StringLit{Value: s}
 			}
 		}
+		v = l.zeroExtend(reg, v)
 		l.consume(v)
 		args = append(args, v)
 	}
 	return args
+}
+
+// zeroExtend wraps a 32-bit register write's value when read through its
+// 64-bit alias, matching AArch64's W->X zero-extension.
+func (l *lifter) zeroExtend(reg string, v ir.Expr) ir.Expr {
+	if v == nil || l.regWidths[reg] != 32 {
+		return v
+	}
+	switch v.(type) {
+	case *ir.StringLit, *ir.AddrLit:
+		return v
+	}
+	return &ir.CastExpr{Type: &ir.PrimitiveType{Name: "uint"}, Expr: v}
+}
+
+// isSeedReg reports whether reg still holds exactly the value it was
+// seeded with at function entry.
+func (l *lifter) isSeedReg(reg string) bool {
+	if l.written[reg] {
+		return false
+	}
+	seed, ok := l.seedRefs[reg]
+	if !ok {
+		return false
+	}
+	cur, ok := l.regs[reg]
+	return ok && seed == cur
 }
 
 // collectTailCallArgs is the tail-call counterpart of collectCallArgs:
@@ -4320,6 +4513,7 @@ func (l *lifter) collectTailCallArgs() []ir.Expr {
 				v = &ir.StringLit{Value: s}
 			}
 		}
+		v = l.zeroExtend(reg, v)
 		l.consume(v)
 		args = append(args, v)
 	}
@@ -4550,10 +4744,14 @@ func (l *lifter) liftTailCall(inst native.DetailedInstruction) []ir.Stmt {
 // comment) when this lifter never learned anything more specific about
 // it - most often, in real -O0 C++ code, a vtable slot loaded through a
 // chain of FieldAccess dereferences (see liftLdr's own doc comment).
-func (l *lifter) buildIndirectCall(calleeReg string) ir.Expr {
+func (l *lifter) buildIndirectCall(calleeReg string, tail bool) ir.Expr {
 	callee := l.regValue(calleeReg)
 	l.consume(callee)
-	return &ir.IndirectCall{Callee: callee, Args: l.collectCallArgs()}
+	args := l.collectCallArgs()
+	if tail {
+		args = l.collectTailCallArgs()
+	}
+	return &ir.IndirectCall{Callee: callee, Args: args}
 }
 
 // liftBlr lifts "blr Rn" - an ordinary call through a register - into
@@ -4565,7 +4763,7 @@ func (l *lifter) liftBlr(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 1 || inst.Operands[0].Type != native.OperandReg {
 		return nil
 	}
-	call := l.buildIndirectCall(inst.Operands[0].Reg)
+	call := l.buildIndirectCall(inst.Operands[0].Reg, false)
 	return l.finishCall(call)
 }
 
@@ -4582,7 +4780,7 @@ func (l *lifter) liftBr(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 1 || inst.Operands[0].Type != native.OperandReg {
 		return nil
 	}
-	call := l.buildIndirectCall(inst.Operands[0].Reg)
+	call := l.buildIndirectCall(inst.Operands[0].Reg, true)
 	stmts := l.finishCall(call)
 	l.consume(call)
 	// As with a direct tail call, the callee's result is forwarded as
@@ -4806,12 +5004,14 @@ func wRegToX(reg string) (string, bool) {
 
 func (l *lifter) clobberReg(reg string) []ir.Stmt {
 	var stmts []ir.Stmt
+	l.markWritten(reg)
 	if old, ok := l.regs[reg]; ok && l.isOrphanCandidate(old, reg) {
 		stmts = append(stmts, &ir.ExprStmt{Expr: old})
 		l.consumed[old] = true
 	}
 	delete(l.regs, reg)
 	delete(l.resultRegs, reg)
+	delete(l.regWidths, reg)
 	// Whatever reg is about to hold next, it isn't the address this
 	// entry recorded any more - a caller that DOES know the new value
 	// is (or extends) a known address, e.g. liftAddr or liftAdd's
@@ -4849,11 +5049,35 @@ func (l *lifter) setReg(reg string, val ir.Expr) []ir.Stmt {
 	stmts := l.clobberReg(reg)
 	l.regs[reg] = val
 	delete(l.resultRegs, reg)
+	l.markWritten(reg)
+	switch {
+	case strings.HasPrefix(reg, "w"):
+		l.regWidths[reg] = 32
+	case strings.HasPrefix(reg, "x"):
+		l.regWidths[reg] = 64
+	}
 	if xReg, ok := wRegToX(reg); ok {
 		l.regs[xReg] = val
 		delete(l.resultRegs, xReg)
+		l.markWritten(xReg)
+		l.regWidths[xReg] = 32
 	}
 	return stmts
+}
+
+// markWritten records an explicit write to reg and its x/w alias.
+func (l *lifter) markWritten(reg string) {
+	if l.written == nil {
+		l.written = make(map[string]bool)
+	}
+	l.written[reg] = true
+	if xReg, ok := wRegToX(reg); ok {
+		l.written[xReg] = true
+		return
+	}
+	if strings.HasPrefix(reg, "x") {
+		l.written["w"+reg[1:]] = true
+	}
 }
 
 // flushRemaining returns an ExprStmt for every call this lifter (or an
@@ -5292,21 +5516,18 @@ func (l *lifter) liftRet() ir.Stmt {
 	// the fmov int<->FP path uses - the generated translation unit's
 	// return type is uint64_t, so this preserves the ABI bits while
 	// keeping the output valid C.
-	if _, xSet := l.regs["x0"]; !xSet {
-		if _, wSet := l.regs["w0"]; !wSet {
-			if v, ok := l.regs["d0"]; ok {
-				l.consume(v)
-				return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "ENI_BITCAST_U64", Args: []ir.Expr{v}}}
-			}
-			if v, ok := l.regs["s0"]; ok {
-				l.consume(v)
-				return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "ENI_BITCAST_U32", Args: []ir.Expr{v}}}
-			}
-			// Neither integer return register was written: the ABI value
-			// is the incoming x0 argument unchanged (e.g. a "cbz x0;
-			// ...; ret" thunk that forwards its first argument).
-			return &ir.ReturnStmt{Value: &ir.LocalVar{Name: l.regName("x0")}}
+	if !l.written["x0"] && !l.written["w0"] {
+		if v, ok := l.regs["d0"]; ok {
+			l.consume(v)
+			return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "ENI_BITCAST_U64", Args: []ir.Expr{v}}}
 		}
+		if v, ok := l.regs["s0"]; ok {
+			l.consume(v)
+			return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "ENI_BITCAST_U32", Args: []ir.Expr{v}}}
+		}
+		// Neither integer return register was written: the ABI value
+		// is the incoming x0 argument unchanged.
+		return &ir.ReturnStmt{Value: &ir.LocalVar{Name: l.regName("x0")}}
 	}
 
 	val := l.regValue("w0")
@@ -5322,7 +5543,7 @@ func (l *lifter) liftRet() ir.Stmt {
 		}
 	}
 	l.consume(val)
-	return &ir.ReturnStmt{Value: val}
+	return &ir.ReturnStmt{Value: l.zeroExtend("x0", val)}
 }
 
 // TODO(next iterations): this lifter now handles - across many rounds,

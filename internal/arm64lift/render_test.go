@@ -252,9 +252,9 @@ func TestRenderCFunction_DeclarationsAndCasts(t *testing.T) {
 
 	for _, want := range []string{
 		"uint64_t sub_90f98c(uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7)",
-		"uint64_t x8, x9;",
-		"uint32_t w0;",
-		"int64_t local_16;",
+		"uint64_t x8 = 0, x9 = 0;",
+		"uint32_t w0 = 0;",
+		"int64_t local_16 = 0;",
 		"*(uint64_t*)((uintptr_t)x8 + 0x3b8) = x9;",
 	} {
 		if !strings.Contains(out, want) {

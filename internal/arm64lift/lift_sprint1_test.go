@@ -20,11 +20,36 @@ func firstReturn(t *testing.T, stmts []ir.Stmt) *ir.ReturnStmt {
 	t.Helper()
 	for _, s := range stmts {
 		if r, ok := s.(*ir.ReturnStmt); ok {
+			r.Value = unwrapCasts(r.Value)
 			return r
 		}
 	}
 	t.Fatalf("no ReturnStmt in %v", stmts)
 	return nil
+}
+
+func rawFirstReturn(t *testing.T, stmts []ir.Stmt) *ir.ReturnStmt {
+	t.Helper()
+	for _, s := range stmts {
+		if r, ok := s.(*ir.ReturnStmt); ok {
+			return r
+		}
+	}
+	t.Fatalf("no ReturnStmt in %v", stmts)
+	return nil
+}
+
+func unwrapCasts(e ir.Expr) ir.Expr {
+	for {
+		c, ok := e.(*ir.CastExpr)
+		if !ok {
+			return e
+		}
+		if p, ok := c.Type.(*ir.PrimitiveType); !ok || p.Name != "uint" {
+			return e
+		}
+		e = c.Expr
+	}
 }
 
 func firstAssign(t *testing.T, stmts []ir.Stmt) *ir.AssignStmt {

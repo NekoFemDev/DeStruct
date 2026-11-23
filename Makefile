@@ -1,8 +1,9 @@
-.PHONY: build clean test test-race vet lint fmt run capstone ensure-capstone download capstone-latest update-capstone capstone-version capstone-clean install-termux uninstall-termux
+.PHONY: build build-unicorn clean test test-race vet lint fmt run capstone ensure-capstone download download-unicorn capstone-latest update-capstone capstone-version capstone-clean unicorn ensure-unicorn unicorn-clean install-termux uninstall-termux
 
 BINARY=destruct
 MODULE=github.com/destruct/destruct
 CAPSTONE_DIR=third_party/capstone
+UNICORN_DIR=third_party/unicorn
 # Pinned default. Override on the command line:
 #   make build CAPSTONE_VERSION=6.0.0-Alpha10
 # or roll forward to whatever is newest upstream:
@@ -15,8 +16,18 @@ CAPSTONE_URL=https://github.com/capstone-engine/capstone/archive/refs/tags/$(CAP
 # .../archive/refs/tags/$version without a suffix returns 404.
 FETCH_SCRIPT=$(CAPSTONE_DIR)/fetch-capstone.sh
 
+# Optional Unicorn emulation (GPLv2). Only linked by build-unicorn.
+UNICORN_VERSION ?= 2.1.4
+UNICORN_SRC=unicorn-$(UNICORN_VERSION)
+UNICORN_SYMLINK=unicorn-src
+UNICORN_FETCH=$(UNICORN_DIR)/fetch-unicorn.sh
+
 build: capstone
 	go build -o $(BINARY) ./cmd/destruct
+
+# GPLv2 binary: includes Unicorn-based AArch64 emulation.
+build-unicorn: unicorn
+	go build -tags unicorn -o $(BINARY) ./cmd/destruct
 
 capstone: ensure-capstone
 	$(MAKE) -C $(CAPSTONE_DIR) CAPSTONE_DIR=../../$(CAPSTONE_SYMLINK)
@@ -59,10 +70,29 @@ capstone-clean:
 	rm -rf capstone-*/ $(CAPSTONE_SYMLINK)
 	$(MAKE) -C $(CAPSTONE_DIR) clean
 
+# Optional Unicorn emulation (GPLv2).
+unicorn: ensure-unicorn
+	$(MAKE) -C $(UNICORN_DIR) UNICORN_DIR=../../$(UNICORN_SYMLINK)
+
+ensure-unicorn:
+	@if [ "$$(readlink $(UNICORN_SYMLINK) 2>/dev/null)" != "$(UNICORN_SRC)" ]; then \
+		echo "Downloading Unicorn $(UNICORN_VERSION)..."; \
+		sh $(UNICORN_FETCH) $(UNICORN_VERSION); \
+	fi
+
+$(UNICORN_SYMLINK): ensure-unicorn
+
+download-unicorn: $(UNICORN_SYMLINK)
+
+unicorn-clean:
+	rm -rf unicorn-*/ $(UNICORN_SYMLINK)
+	$(MAKE) -C $(UNICORN_DIR) clean
+
 clean:
 	rm -f $(BINARY)
 	rm -rf output/
 	$(MAKE) -C $(CAPSTONE_DIR) clean
+	$(MAKE) -C $(UNICORN_DIR) clean
 
 # Termux/Android one-shot installer: installs deps, fetches Capstone,
 # builds, and installs $(BINARY) into $PREFIX/bin. Accepts the same flags
@@ -84,7 +114,7 @@ vet:
 	go vet ./...
 
 fmt:
-	gofmt -w $$(find . -name '*.go' -not -path './capstone-*' -not -path './third_party/*')
+	gofmt -w $$(find . -name '*.go' -not -path './capstone-*' -not -path './unicorn-*' -not -path './third_party/*')
 
 lint:
 	golangci-lint run
@@ -97,12 +127,16 @@ help:
 	@echo ""
 	@echo "Usage:"
 	@echo "  make build    Build the binary (includes Capstone)"
+	@echo "  make build-unicorn  Build with optional Unicorn emulation (GPLv2)"
 	@echo "  make install-termux  Install to $$PREFIX/bin on Termux (flags: INSTALL_ARGS=\"--update\")"
 	@echo "  make uninstall-termux Remove the Termux install"
 	@echo "  make download Download pinned Capstone source (Capstone $(CAPSTONE_VERSION))"
 	@echo "  make update-capstone Fetch latest upstream Capstone and rebuild"
 	@echo "  make capstone-latest Print latest upstream Capstone tag"
 	@echo "  make capstone-clean Remove all fetched Capstone sources"
+	@echo "  make unicorn  Build pinned Unicorn $(UNICORN_VERSION) (AArch64 only, GPLv2)"
+	@echo "  make download-unicorn Download pinned Unicorn source"
+	@echo "  make unicorn-clean Remove fetched Unicorn sources"
 	@echo "  make clean    Remove build artifacts"
 	@echo "  make test     Run tests"
 	@echo "  make test-race Run tests with the race detector"

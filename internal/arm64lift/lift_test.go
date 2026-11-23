@@ -421,12 +421,14 @@ func TestLiftFunction_TestBitBranch(t *testing.T) {
 	}
 
 	stmts := LiftFunction(insns, nil, resolver, nil)
-	if len(stmts) != 1 {
-		t.Fatalf("expected exactly 1 top-level statement (the if), got %v", stmts)
+	var ifStmt *ir.IfStmt
+	for _, s := range stmts {
+		if v, ok := s.(*ir.IfStmt); ok {
+			ifStmt = v
+		}
 	}
-	ifStmt, ok := stmts[0].(*ir.IfStmt)
-	if !ok {
-		t.Fatalf("expected an IfStmt, got %T: %v", stmts[0], stmts[0])
+	if ifStmt == nil {
+		t.Fatalf("expected an IfStmt among %v", stmts)
 	}
 
 	neq, ok := ifStmt.Cond.(*ir.BinaryExpr)
@@ -520,7 +522,7 @@ func TestLiftFunction_ALUOps(t *testing.T) {
 		t.Fatalf("expected a call to \"step\" with at least 1 argument, got %#v", ret.Value)
 	}
 
-	and, ok := call.Args[0].(*ir.BinaryExpr)
+	and, ok := unwrapCasts(call.Args[0]).(*ir.BinaryExpr)
 	if !ok || and.Op != "&" {
 		t.Fatalf("expected the argument to be a \"&\" expression, got %#v", call.Args[0])
 	}
@@ -535,11 +537,11 @@ func TestLiftFunction_ALUOps(t *testing.T) {
 	if !ok || sub.Op != "-" {
 		t.Fatalf("expected the \"*\" left side to be a \"-\" expression, got %#v", mul.Left)
 	}
-	lhs, ok := sub.Left.(*ir.LocalVar)
+	lhs, ok := localVarOf(sub.Left)
 	if !ok || lhs.Name != "a" {
 		t.Errorf("expected the \"-\" left side to be param \"a\", got %#v", sub.Left)
 	}
-	rhs, ok := sub.Right.(*ir.LocalVar)
+	rhs, ok := localVarOf(sub.Right)
 	if !ok || rhs.Name != "b" {
 		t.Errorf("expected the \"-\" right side to be param \"b\", got %#v", sub.Right)
 	}
@@ -1424,7 +1426,7 @@ func TestLiftFunction_ParamStackReassignment(t *testing.T) {
 	if ret == nil {
 		t.Fatalf("expected a ReturnStmt among the top-level statements, got %v", stmts)
 	}
-	retVal, ok := ret.Value.(*ir.LocalVar)
+	retVal, ok := localVarOf(ret.Value)
 	if !ok || retVal.Name != "n" {
 		t.Errorf("expected the return value to be local var \"n\" (the reassigned value, not a stale pre-increment one), got %#v", ret.Value)
 	}
@@ -1514,7 +1516,7 @@ func TestLiftFunction_NonParamStackLocal(t *testing.T) {
 	if ret == nil {
 		t.Fatalf("expected a ReturnStmt among the top-level statements, got %v", stmts)
 	}
-	retVal, ok := ret.Value.(*ir.LocalVar)
+	retVal, ok := localVarOf(ret.Value)
 	if !ok || retVal.Name != target.Name {
 		t.Errorf("expected the return value to be the SAME local var the assignment targeted (%q), got %#v", target.Name, ret.Value)
 	}
@@ -1571,7 +1573,7 @@ func TestLiftFunction_PointerFieldLoad(t *testing.T) {
 	if !ok || call.Method != "log" || len(call.Args) != 1 {
 		t.Fatalf("expected the return value to be a call to \"log\" with 1 arg, got %#v", ret.Value)
 	}
-	field, ok := call.Args[0].(*ir.FieldAccess)
+	field, ok := unwrapCasts(call.Args[0]).(*ir.FieldAccess)
 	if !ok {
 		t.Fatalf("expected the call's argument to be a FieldAccess, got %#v", call.Args[0])
 	}
@@ -1622,7 +1624,7 @@ func TestLiftFunction_PointerFieldStore(t *testing.T) {
 	if !ok || obj.Name != "p" {
 		t.Errorf("expected the field's object to be local var \"p\", got %#v", field.Object)
 	}
-	value, ok := assign.Value.(*ir.LocalVar)
+	value, ok := localVarOf(assign.Value)
 	if !ok || value.Name != "v" {
 		t.Errorf("expected the assignment's value to be local var \"v\", got %#v", assign.Value)
 	}
@@ -2077,12 +2079,17 @@ func TestLiftFunction_IndirectTailCall(t *testing.T) {
 	if !ok || obj.Name != "obj" {
 		t.Errorf("expected the innermost object to be local var \"obj\", got %#v", inner.Object)
 	}
-	if len(call.Args) != 1 {
-		t.Fatalf("expected exactly 1 forwarded argument (obj, this thunk's own receiver), got %v", call.Args)
+	if len(call.Args) != 8 {
+		t.Fatalf("expected 8 forwarded argument registers, got %v", call.Args)
 	}
-	arg, ok := call.Args[0].(*ir.LocalVar)
+	arg, ok := localVarOf(call.Args[0])
 	if !ok || arg.Name != "obj" {
-		t.Errorf("expected the forwarded argument to be local var \"obj\", got %#v", call.Args[0])
+		t.Errorf("expected the first forwarded argument to be local var \"obj\", got %#v", call.Args[0])
+	}
+	for i := 1; i < 8; i++ {
+		if _, ok := localVarOf(call.Args[i]); !ok {
+			t.Errorf("arg %d is not a register value: %#v", i, call.Args[i])
+		}
 	}
 }
 
@@ -2528,7 +2535,7 @@ func TestLiftFunction_CcmpFoldsConjunction(t *testing.T) {
 	if condText == "" {
 		t.Fatalf("no IfStmt lifted:\n%s", renderStmtsToString(stmts))
 	}
-	want := "x0 != x1 && w2 == 0"
+	want := "x0 != x1 && (uint)x2 == 0"
 	if condText != want {
 		t.Errorf("ccmp+b.eq condition = %q, want %q", condText, want)
 	}

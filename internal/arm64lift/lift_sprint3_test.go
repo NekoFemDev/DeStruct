@@ -123,7 +123,7 @@ func TestLiftFunction_StackWidthTypeInference(t *testing.T) {
 	var b strings.Builder
 	RenderCFunctionWithOptions(&b, "test_fn", stmts, CRenderOptions{LocalTypes: opts.LocalTypes})
 	out := b.String()
-	if !strings.Contains(out, "int32_t local_8;") {
+	if !strings.Contains(out, "int32_t local_8 = 0;") {
 		t.Fatalf("width-based local type inference did not produce int32_t local_8:\n%s", out)
 	}
 }
@@ -159,10 +159,10 @@ func TestLiftFunction_DWARFLocalNameAndType(t *testing.T) {
 	var b strings.Builder
 	RenderCFunctionWithOptions(&b, "test_fn", stmts, CRenderOptions{LocalTypes: opts.LocalTypes})
 	out := b.String()
-	if !strings.Contains(out, "int32_t counter;") {
+	if !strings.Contains(out, "int32_t counter = 0;") {
 		t.Fatalf("DWARF local type not used in declarations:\n%s", out)
 	}
-	if !strings.Contains(out, "counter =") || !strings.Contains(out, "return counter;") {
+	if !strings.Contains(out, "counter =") || !strings.Contains(out, "return (uint32_t)counter;") {
 		t.Fatalf("DWARF local name not used in the body:\n%s", out)
 	}
 }

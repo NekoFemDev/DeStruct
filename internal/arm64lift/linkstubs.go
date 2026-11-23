@@ -52,6 +52,28 @@ var (
 // output file itself and stubs.c, and writes one stubs.c to outPath. An
 // empty outPath defaults to <dir>/stubs.c.
 func GenerateLinkStubsDir(dir, outPath string) (*LinkStubResult, error) {
+	return GenerateLinkStubsDirOptions(dir, outPath, true)
+}
+
+// GenerateLinkStubsDirNoMain is GenerateLinkStubsDir without the dummy
+// main, for embedding in a caller-provided driver.
+func GenerateLinkStubsDirNoMain(dir, outPath string) (*LinkStubResult, error) {
+	return GenerateLinkStubsDirOptions(dir, outPath, false)
+}
+
+// GenerateLinkStubsDirOptions is GenerateLinkStubsDir with explicit control
+// over the dummy main.
+func GenerateLinkStubsDirOptions(dir, outPath string, addMain bool) (*LinkStubResult, error) {
+	return generateLinkStubsDir(dir, outPath, addMain, false)
+}
+
+// GenerateLinkStubsDirForVerify builds no-op stubs matching the emulator's
+// import trampolines, for differential host-vs-emulator runs.
+func GenerateLinkStubsDirForVerify(dir, outPath string) (*LinkStubResult, error) {
+	return generateLinkStubsDir(dir, outPath, false, true)
+}
+
+func generateLinkStubsDir(dir, outPath string, addMain, noop bool) (*LinkStubResult, error) {
 	if outPath == "" {
 		outPath = filepath.Join(dir, "stubs.c")
 	}
@@ -77,6 +99,10 @@ func GenerateLinkStubsDir(dir, outPath string) (*LinkStubResult, error) {
 		if absPath == absOut || filepath.Base(path) == "stubs.c" {
 			return nil
 		}
+		switch filepath.Base(path) {
+		case "verify_driver.c", "verify_stubs.c":
+			return nil
+		}
 		files = append(files, path)
 		return nil
 	})
@@ -84,7 +110,7 @@ func GenerateLinkStubsDir(dir, outPath string) (*LinkStubResult, error) {
 		return nil, err
 	}
 	sort.Strings(files)
-	return GenerateLinkStubs(files, outPath)
+	return generateLinkStubs(files, outPath, addMain, noop)
 }
 
 // GenerateLinkStubs scans files, finds extern declarations without a
@@ -92,6 +118,14 @@ func GenerateLinkStubsDir(dir, outPath string) (*LinkStubResult, error) {
 // defines every missing symbol. A dummy main is added unless a main
 // definition was already found.
 func GenerateLinkStubs(files []string, outPath string) (*LinkStubResult, error) {
+	return GenerateLinkStubsOptions(files, outPath, true)
+}
+
+func GenerateLinkStubsOptions(files []string, outPath string, addMain bool) (*LinkStubResult, error) {
+	return generateLinkStubs(files, outPath, addMain, false)
+}
+
+func generateLinkStubs(files []string, outPath string, addMain, noop bool) (*LinkStubResult, error) {
 	externFuncs := make(map[string]bool)
 	externVars := make(map[string]bool)
 	defined := make(map[string]bool)
@@ -175,25 +209,37 @@ func GenerateLinkStubs(files []string, outPath string) (*LinkStubResult, error) 
 	}
 
 	if len(missingFuncs) > 0 {
-		b.WriteString("/* libc-backed wrappers */\n")
-		wroteLibc := false
-		for _, name := range missingFuncs {
-			if body, ok := libcStubBody(name); ok {
+		if noop {
+			b.WriteString("/* no-op import stubs (emulator-equivalent) */\n")
+			for _, name := range missingFuncs {
+				body := "    return 0;"
+				if name == "ext___errno" {
+					body = "    return (uint64_t)(uintptr_t)&eni_errno_storage;"
+				}
 				writeFunctionStub(&b, name, body)
-				result.LibcWrappers = append(result.LibcWrappers, name)
-				wroteLibc = true
+				result.GenericFunctions = append(result.GenericFunctions, name)
 			}
-		}
-		if !wroteLibc {
-			b.WriteString("/* none */\n")
-		}
-		b.WriteString("\n/* generic stubs */\n")
-		for _, name := range missingFuncs {
-			if _, ok := libcStubBody(name); ok {
-				continue
+		} else {
+			b.WriteString("/* libc-backed wrappers */\n")
+			wroteLibc := false
+			for _, name := range missingFuncs {
+				if body, ok := libcStubBody(name); ok {
+					writeFunctionStub(&b, name, body)
+					result.LibcWrappers = append(result.LibcWrappers, name)
+					wroteLibc = true
+				}
 			}
-			writeFunctionStub(&b, name, genericStubBody(name))
-			result.GenericFunctions = append(result.GenericFunctions, name)
+			if !wroteLibc {
+				b.WriteString("/* none */\n")
+			}
+			b.WriteString("\n/* generic stubs */\n")
+			for _, name := range missingFuncs {
+				if _, ok := libcStubBody(name); ok {
+					continue
+				}
+				writeFunctionStub(&b, name, genericStubBody(name))
+				result.GenericFunctions = append(result.GenericFunctions, name)
+			}
 		}
 	}
 
@@ -205,7 +251,7 @@ func GenerateLinkStubs(files []string, outPath string) (*LinkStubResult, error) 
 		}
 	}
 
-	if !defined["main"] {
+	if addMain && !defined["main"] {
 		b.WriteString("\n/* entry point for the dummy executable */\n")
 		b.WriteString("int main(void)\n{\n    return 0;\n}\n")
 		result.AddedMain = true

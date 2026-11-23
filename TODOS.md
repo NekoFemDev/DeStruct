@@ -1,6 +1,6 @@
 # DeStruct — Roadmap & TODOs
 
-Last updated: 2026-11-19.
+Last updated: 2026-11-23.
 
 ## Scope decisions
 
@@ -9,8 +9,9 @@ Last updated: 2026-11-19.
   Hermes/Flutter workflows remain.
 - **Focus:** AArch64 ELF decompilation, Android (DEX/APK), Unity IL2CPP, and
   analysis tooling that can run self-contained on Termux.
-- **Non-goals for now:** a full x86-64 decompiler, an emulator/debugger, and a
-  replacement for apktool/Ghidra on every format.
+- **Non-goals for now:** a full x86-64 decompiler, a full-system/debugger
+  emulator, and a replacement for apktool/Ghidra on every format. Function-level
+  AArch64 emulation is supported as an optional analysis aid.
 
 ## Done — quick wins (2026-11-19)
 
@@ -200,6 +201,44 @@ Remaining:
 - [ ] `destruct apk verify` (apksigner verify), `apk list`, `apk extract`.
 - [ ] `apk sign`: support `--password-file`/stdin and keystore alias selection.
 - [ ] End-to-end workflow: decompile → patch → rebuild → sign → install.
+
+## Emulation / verification
+
+Sprint 12 (2026-11-23) is complete:
+project relicensed to GPLv2; optional Unicorn Engine 2.1.4 backend
+(AArch64-only static build, `unicorn` Go build tag); `elf emulate`
+loads the original ELF image, applies relative/GOT/PLT relocations,
+redirects imported functions to a return-0 trampoline and reports final
+registers/return via text or JSON. Emulation immediately exposed a real
+pseudo-C bug: 32-bit `wN` parameter views were separate uninitialized
+locals; they are now seeded as `(uint32_t)xN` views, and `x0..x7` are
+always seeded from the function signature.
+
+Sprint 13 (2026-11-23) is complete:
+`elf verify` builds a host driver from the decompiled C and compares it
+against the Unicorn oracle; pointer-only return differences are separated
+from semantic mismatches. Emulator-guided review added `movi` vector-zero
+initialization, zero-extension of 32-bit register returns/call arguments,
+two-operand immediate shifts (`asr/lsl/lsr #imm`), correct GOT/data-slot
+loads when the resolver only has a section label, a default `return x0`
+for functions that end without an explicit return, and zero-initialized
+synthesized locals/registers. On `quazar_arm64`, `sub_9e002c`,
+`sub_90f934`, `sub_916820` and `sub_90f9bc` now match the oracle. The
+zero-argument verification profile currently reports 226 exact return
+matches, 28 pointer-only differences, 246 both-faulted functions and
+1,221 execution mismatches (1,211 host faults, 10 original faults);
+host faults are dominated by split outlined blocks that still lack caller
+register/stack context and by zero-argument pointer dereferences.
+
+- [x] Optional Unicorn backend behind the `unicorn` build tag
+      (`make unicorn build-unicorn`).
+- [x] `elf emulate` with image/relocation/import setup.
+- [x] `elf verify` host-vs-emulator differential runner.
+- [x] 32-bit parameter-view seeding and zero-extended returns.
+- [ ] Emulation-guided outlined-block context recovery (callee-saved
+      registers and stack slots).
+- [ ] Structured fuzzing with pointer/struct argument profiles.
+- [ ] Memory-effects comparison (writable image hash) in verify.
 
 ## Unity / IL2CPP
 

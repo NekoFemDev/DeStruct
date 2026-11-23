@@ -81,6 +81,47 @@ func TestTailThunkWithoutUnwindEntry(t *testing.T) {
 
 // TestRetWithoutExplicitX0 checks that a bare "ret" forwards the incoming
 // x0 argument instead of reading an uninitialized w0 placeholder.
+// TestNarrowParamView checks that wN reads are seeded as a 32-bit view of
+// the corresponding xN argument, not as an unrelated uninitialized local.
+func TestNarrowParamView(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		{Address: 0x0, Size: 4, Mnemonic: "cmp", OpStr: "w1, #2", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w1"},
+			{Type: native.OperandImm, Imm: 2},
+		}},
+		{Address: 0x4, Size: 4, Mnemonic: "cset", OpStr: "w0, eq", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+		}},
+		{Address: 0x8, Size: 4, Mnemonic: "ret"},
+	}
+	stmts := LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{})
+	out := renderForTest(stmts)
+	if !strings.Contains(out, "(uint32_t)x1 == 2") {
+		t.Fatalf("expected a truncated w1 view in:\n%s", out)
+	}
+	if strings.Contains(out, "w1") {
+		t.Fatalf("w1 leaked as an independent variable:\n%s", out)
+	}
+}
+
+// TestVectorMoviZero checks that "movi v0.2d, #0" initializes the vector
+// register instead of leaving q0 as an uninitialized local.
+func TestVectorMoviZero(t *testing.T) {
+	insns := disassembleWords(t, 0x4000, []uint32{
+		0x6f00e400, // movi v0.2d, #0
+		0x3d8007e0, // str q0, [sp, #16]
+		0xd65f03c0, // ret
+	})
+	stmts := LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{})
+	out := renderForTest(stmts)
+	if !strings.Contains(out, "local_16 = 0;") {
+		t.Fatalf("movi zero did not initialize the stored vector:\n%s", out)
+	}
+	if strings.Contains(out, "q0;") && !strings.Contains(out, "local_16 = 0;") {
+		t.Fatalf("q0 remained uninitialized:\n%s", out)
+	}
+}
+
 // TestCcmnCondition covers the conditional-compare-negative form used by
 // optimized bounds checks: "cmp; ccmn; csel" must produce a real combined
 // condition, not a cond placeholder.
@@ -109,11 +150,11 @@ func TestCcmnCondition(t *testing.T) {
 		for _, s := range list {
 			switch v := s.(type) {
 			case *ir.AssignStmt:
-				if tv, ok := v.Value.(*ir.TernaryExpr); ok {
+				if tv, ok := unwrapCasts(v.Value).(*ir.TernaryExpr); ok {
 					ternary = tv
 				}
 			case *ir.ReturnStmt:
-				if tv, ok := v.Value.(*ir.TernaryExpr); ok {
+				if tv, ok := unwrapCasts(v.Value).(*ir.TernaryExpr); ok {
 					ternary = tv
 				}
 			}
@@ -125,6 +166,80 @@ func TestCcmnCondition(t *testing.T) {
 	}
 	if lv, ok := ternary.Cond.(*ir.LocalVar); ok && lv.Name == "cond" {
 		t.Fatalf("ccmn condition remained unresolved: %s", ternary.Cond)
+	}
+}
+
+// TestGOTSectionLabelStillLoads checks that a section-label fallback for a
+// GOT slot address does not replace the load with the slot's own address.
+func TestGOTSectionLabelStillLoads(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		{Address: 0x0, Size: 4, Mnemonic: "adrp", OpStr: "x1, #0x1000", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x1"},
+			{Type: native.OperandImm, Imm: 0x1000},
+		}},
+		{Address: 0x4, Size: 4, Mnemonic: "ldr", OpStr: "x0, [x1]", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x1"}},
+		}},
+		{Address: 0x8, Size: 4, Mnemonic: "ret"},
+	}
+	resolver := func(addr uint64) (string, bool) {
+		if addr == 0x1000 {
+			return ".got+0x0", true
+		}
+		return "", false
+	}
+	out := renderForTest(LiftFunctionWithOptions(insns, nil, resolver, nil, nil, LiftOptions{}))
+	if !strings.Contains(out, "*(uint64_t*)") || !strings.Contains(out, "0x1000") {
+		t.Fatalf("GOT slot load was collapsed to its address:\n%s", out)
+	}
+}
+
+// TestImmediateShiftTwoOperands covers Capstone's two-operand encoding of
+// immediate shifts (the amount is only in OpStr).
+func TestImmediateShiftTwoOperands(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		{Address: 0x0, Size: 4, Mnemonic: "asr", OpStr: "x8, x8, #3", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x8"},
+			{Type: native.OperandReg, Reg: "x8"},
+		}},
+		{Address: 0x4, Size: 4, Mnemonic: "add", OpStr: "x9, x0, x8, lsl #3", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x9"},
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandReg, Reg: "x8", ShiftType: 1, ShiftValue: 3},
+		}},
+		{Address: 0x8, Size: 4, Mnemonic: "mov", OpStr: "x0, x9", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandReg, Reg: "x9"},
+		}},
+		{Address: 0xc, Size: 4, Mnemonic: "ret"},
+	}
+	out := renderForTest(LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{}))
+	if !strings.Contains(out, ">> 3") || !strings.Contains(out, "<< 3") {
+		t.Fatalf("immediate asr was dropped:\n%s", out)
+	}
+}
+
+// TestWReturnZeroExtends checks that a 32-bit w0 return is zero-extended
+// into x0 rather than returned as a sign-extended 64-bit value.
+func TestWReturnZeroExtends(t *testing.T) {
+	insns := []native.DetailedInstruction{
+		{Address: 0x0, Size: 4, Mnemonic: "mov", OpStr: "w0, #-1", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "w0"},
+			{Type: native.OperandImm, Imm: -1},
+		}},
+		{Address: 0x4, Size: 4, Mnemonic: "ret"},
+	}
+	ret := rawFirstReturn(t, LiftFunction(insns, nil, nil, nil))
+	cast, ok := ret.Value.(*ir.CastExpr)
+	if !ok {
+		t.Fatalf("return value = %#v, want a uint cast", ret.Value)
+	}
+	if pt, ok := cast.Type.(*ir.PrimitiveType); !ok || pt.Name != "uint" {
+		t.Fatalf("cast type = %#v, want uint", cast.Type)
+	}
+	if lit, ok := cast.Expr.(*ir.IntLit); !ok || lit.Value != -1 {
+		t.Fatalf("cast operand = %#v, want -1", cast.Expr)
 	}
 }
 

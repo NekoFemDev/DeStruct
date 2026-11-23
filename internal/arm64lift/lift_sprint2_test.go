@@ -227,7 +227,7 @@ func TestLiftFunction_SignExtend(t *testing.T) {
 		}},
 		ret(0x4),
 	}
-	val := firstReturn(t, LiftFunction(insns, []string{"a", "b"}, nil, nil)).Value
+	val := rawFirstReturn(t, LiftFunction(insns, []string{"a", "b"}, nil, nil)).Value
 	cast, ok := val.(*ir.CastExpr)
 	if !ok {
 		t.Fatalf("sxtw = %T, want *ir.CastExpr", val)
@@ -238,7 +238,7 @@ func TestLiftFunction_SignExtend(t *testing.T) {
 	}
 
 	insns[0].Mnemonic = "uxtw"
-	val = firstReturn(t, LiftFunction(insns, []string{"a", "b"}, nil, nil)).Value
+	val = rawFirstReturn(t, LiftFunction(insns, []string{"a", "b"}, nil, nil)).Value
 	cast, ok = val.(*ir.CastExpr)
 	if !ok {
 		t.Fatalf("uxtw = %T, want *ir.CastExpr", val)

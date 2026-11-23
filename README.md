@@ -5,16 +5,17 @@
 **Multi-format decompiler and reverse-engineering toolkit for Android, JVM, native binaries and Unity.**
 
 DeStruct is a self-contained Go + Capstone CLI (and library) for offline
-binary analysis. It decompiles JVM and Android bytecode to Java, lifts
+binary analysis, with optional Unicorn-based AArch64 function emulation. It decompiles JVM and Android bytecode to Java, lifts
 AArch64 ELF functions to readable pseudo-C, dumps Unity IL2CPP metadata,
 disassembles Flutter and Hermes bytecode, edits Hermes bytecode with an
 assembler and REPL, provides a mapped hex editor, and can rebuild and sign
 APKs. It is designed to work on a phone under Termux as well as on a
 desktop, with no external runtime decompiler required.
 
-**What it is not:** a debugger, an emulator, a full x86-64 decompiler, or a
-replacement for Ghidra/IDA on every format. `PE`, `Hermes → JS` and
-`Flutter → Dart` decompilation are intentionally out of scope.
+**What it is not:** a debugger, a full-system emulator, a full x86-64
+decompiler, or a replacement for Ghidra/IDA on every format. `PE`,
+`Hermes → JS` and `Flutter → Dart` decompilation are intentionally out of
+scope. AArch64 function emulation is available as an optional analysis aid.
 
 **Tags:** `decompiler` `reverse-engineering` `android` `arm64` `aarch64`
 `jvm` `java` `dex` `apk` `unity` `il2cpp` `hermes` `flutter` `elf`
@@ -25,6 +26,7 @@ replacement for Ghidra/IDA on every format. `PE`, `Hermes → JS` and
 - **JVM** — Full Java decompiler with control flow recovery (if/else, while, for, switch, try/catch, generics, lambdas). Streaming `.jar` mode for large files.
 - **DEX** — Android `.dex`/`.apk` → Java. Streaming per-class output, multidex support, MUTF-8 strings, switch/fill-array-data payloads, structured control flow recovery (if/else, while, do-while, switch), try/catch/finally and synchronized reconstruction, Java annotations, and debug_info parameter/local names.
 - **ARM64 ELF** — Lift disassembled AArch64 instructions to valid, recompilable pseudo-C with control flow recovery (if/else, while/do-while, struct field access, byte/halfword loads, indexed array accesses, conditional selects, pair loads/stores, pre/post-indexed writeback, scalar FP/SIMD, multi-register `ld1/st1`, lane-wise vector arithmetic, `fmla/fmls`, CAS, indirect calls). DWARF function/parameter names/types, return types, declaration source comments and typed locals are used when available; stripped binaries get refined boundaries from call targets, prologues, returns and relative function pointers. Offset comments, `CALL_VTABLE` macros, ASCII constants, goto reduction, per-function split output, generated link stubs, original ELF load-image reconstruction (`ENI_ADDR` + `image.bin`), replayed `R_AARCH64_RELATIVE`/GOT relocations with function-pointer redirection, LLVM IR export, and one-command `elf recompile` linking into a dummy executable.
+- **AArch64 emulation (optional)** — `elf emulate` runs original functions in Unicorn, with the original load image, applied relocations, imported-call stubs and register/return reporting. `elf verify` builds a host driver from decompiled C and differentially compares return values against the Unicorn oracle. Optional Unicorn build (`make unicorn build-unicorn`) is an analysis aid for verification, fuzzing and outlined-block context recovery.
 - **Hermes** — Disassemble React Native Hermes bytecode (`.hbc`/`.bundle`) to the exact hermes-dec `.hasm` format, reassemble edited functions, and patch interactively. JavaScript decompilation is not supported by design — edit `.hasm` instead.
 - **Flutter** — Disassemble Flutter `libapp.so` (Dart AOT) to readable ARM64 assembly + per-function binary blobs.
 - **IL2CPP** — Dump Unity `global-metadata.dat` + `libil2cpp.so` to `dump.cs` (images, types, fields, properties, methods with RVA/Offset/VA/Slot, default values, attributes). The same metadata powers `elf --decompile --il2cpp-metadata` for real managed method/parameter/field names.
@@ -40,6 +42,14 @@ replacement for Ghidra/IDA on every format. `PE`, `Hermes → JS` and
 git clone https://github.com/NekoFemDev/DeStruct.git
 cd DeStruct
 make build   # → ./destruct
+```
+
+Optional AArch64 emulation (fetches/builds the pinned Unicorn 2.1.4,
+AArch64-only static library; requires `cmake` and `curl`):
+
+```bash
+make build-unicorn   # → ./destruct with Unicorn support
+./destruct elf emulate lib.so 0x1234 --args 1,2
 ```
 
 Or, after fetching/building the pinned Capstone once:
@@ -153,6 +163,9 @@ destruct elf libnative.so -o output/ --decompile --emit-llvm
 destruct elf libil2cpp.so -o output/ --decompile --il2cpp-metadata global-metadata.dat
 destruct elf info libnative.so
 destruct elf recompile output/libnative.so_decompiled/ -o dummy
+destruct elf emulate libnative.so 0x1234 --args 1,2,3
+destruct elf emulate libnative.so sub_1234 --json   # requires build-unicorn
+destruct elf verify libnative.so output/libnative.so_decompiled/ --limit 100
 
 # Flutter
 destruct flutter libapp.so -o output/
@@ -230,6 +243,7 @@ internal/
   hermes/disasm/     ir.Module -> hermes-dec exact .hasm
   hermes/asm/        .hasm + original .hbc -> patched .hbc (jump relaxation)
   arm64lift/         ARM64 instruction lifter -> IR -> C-like pseudocode
+  emulate/           Optional Unicorn AArch64 function emulation (build tag `unicorn`)
   native/            ELF parser, Capstone disassembler, PLT/GOT resolution, ELF info
   java/              Java source generator from IR
   csharp/            C# source generator from IR (library API)
@@ -249,4 +263,8 @@ DEX debug info / try-catch, IL2CPP metadata integration and analysis commands).
 
 ## License
 
-MIT
+GNU General Public License, Version 2 (GPLv2). See [LICENSE](LICENSE).
+
+Optional AArch64 emulation links against Unicorn Engine (GPLv2); Unicorn is
+fetched and built from the pinned source release described in
+[NOTICE](NOTICE).

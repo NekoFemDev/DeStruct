@@ -2,8 +2,43 @@ DeStruct
 Copyright (c) 2026 NekoFemDev
 
 ================================================================================
+License
+================================================================================
+
+DeStruct is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free
+Software Foundation, version 2 of the License.
+
+DeStruct is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+more details.
+
+A copy of the GNU General Public License, Version 2 is included in this
+repository at LICENSE.
+
+================================================================================
 Third-party notices
 ================================================================================
+
+Unicorn Engine — GNU General Public License v2
+---------------------------------------------
+
+Optional AArch64 emulation support links against Unicorn Engine,
+Copyright (c) 2015-2024 Unicorn Engine contributors, licensed under the
+GNU General Public License, Version 2. Unicorn is built from the pinned
+source release fetched by third_party/unicorn/fetch-unicorn.sh.
+
+    https://github.com/unicorn-engine/unicorn
+
+Capstone — BSD 3-Clause License
+-------------------------------
+
+Disassembly support links against Capstone, Copyright (c) 2013, COSEINC.
+All rights reserved. Capstone is licensed under the BSD 3-Clause license.
+A copy is included with the fetched source tree and is available at:
+
+    https://github.com/capstone-engine/capstone/blob/master/LICENSE.TXT
 
 Kirlif/HBC-Tool — Apache License 2.0
 ------------------------------------

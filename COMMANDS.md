@@ -247,6 +247,7 @@ destruct elf libnative.so -o output/ --decompile --simplify-cfg      # CFG simpl
 destruct elf libnative.so -o output/ --decompile --emit-llvm         # also export lifted IR to LLVM IR (<name>.decompiled.ll)
 destruct elf libil2cpp.so -o output/ --decompile --il2cpp-metadata global-metadata.dat
 destruct elf recompile output/libnative.so_decompiled/ -o dummy      # stubs.c + clang link into a dummy executable
+destruct elf emulate libnative.so 0x90f98c --args 1,2                 # run a function (Unicorn build)
 destruct elf info libnative.so                                       # header/sections/symbols/security summary
 ```
 
@@ -324,6 +325,39 @@ writes land in the reconstructed image rather than an unmapped address.
 The output binary is still a dummy executable (stubbed imports, dummy
 `main`) suitable for link-time and structural validation, not a functional
 reimplementation of the original application.
+
+**`elf emulate <file> <function|0xaddress>`** (AArch64, requires a build with
+Unicorn: `make unicorn build-unicorn`): loads the original ELF image and
+relocations, patches imported functions to a `return 0` trampoline, places the
+arguments in `x0..xN`, and runs until the return sentinel. Prints the final
+`x0..x7`, `sp`, `pc`, `nzcv` and `return`.
+
+- `--args a0,a1,...` — initial integer arguments (decimal or `0x...`).
+- `--max-insns N` — instruction limit.
+- `--timeout MS` — wall-clock timeout.
+- `--json` — machine-readable result.
+
+This is function-level emulation for analysis/oracle work, not a full-system or
+Android-runtime emulator. Unicorn is GPLv2; the fetched static library is built
+AArch64-only by `make unicorn`.
+
+**`elf verify <original> <decompiled_dir>`** (requires Unicorn + clang): builds
+a host driver that dispatches to the decompiled `sub_*` functions and compares
+its return value with the original function running in Unicorn. Imported calls
+are stubbed identically on both sides, and synthesized locals/registers are
+zero-initialized.
+
+- `--function F` — verify one function name or `0xaddress`.
+- `--args a0,...` — fixed arguments (default zeros).
+- `--limit N` — stop after N functions.
+- `--max-insns N`, `--timeout MS` — execution limits.
+- `--rebuild` — force the host driver rebuild.
+- `--json` — machine-readable summary.
+
+Pointer-only return differences (a host string address versus the original
+image address) are counted separately from semantic mismatches. Host faults and
+both-faulted cases are reported independently; many are caused by zero-argument
+dereferences or by split outlined blocks that still need caller context.
 
 **`--emit-llvm`** (AArch64 only; implies `--decompile`): in addition to
 `.decompiled.c`, writes `<name>.decompiled.ll` — each lifted function as LLVM IR
