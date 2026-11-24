@@ -37,8 +37,8 @@ func TestLiftFunction_VectorArithmetic(t *testing.T) {
 	}
 	val := firstReturn(t, LiftFunction(insns, nil, nil, nil)).Value
 	call, ok := val.(*ir.StaticMethodCall)
-	if !ok || call.Method != "ENI_VADD_F32X4" {
-		t.Fatalf("vector fadd = %#v, want ENI_VADD_F32X4", val)
+	if !ok || call.Method != "DS_VADD_F32X4" {
+		t.Fatalf("vector fadd = %#v, want DS_VADD_F32X4", val)
 	}
 
 	// fmla v0.4s, v1.4s, v2.4s
@@ -46,8 +46,8 @@ func TestLiftFunction_VectorArithmetic(t *testing.T) {
 	insns[0] = fmla
 	val = firstReturn(t, LiftFunction(insns, nil, nil, nil)).Value
 	call, ok = val.(*ir.StaticMethodCall)
-	if !ok || call.Method != "ENI_VFMA_F32X4" {
-		t.Fatalf("fmla = %#v, want ENI_VFMA_F32X4", val)
+	if !ok || call.Method != "DS_VFMA_F32X4" {
+		t.Fatalf("fmla = %#v, want DS_VFMA_F32X4", val)
 	}
 
 	// add v0.4s, v1.4s, v2.4s
@@ -55,8 +55,8 @@ func TestLiftFunction_VectorArithmetic(t *testing.T) {
 	insns[0] = addv
 	val = firstReturn(t, LiftFunction(insns, nil, nil, nil)).Value
 	call, ok = val.(*ir.StaticMethodCall)
-	if !ok || call.Method != "ENI_VADD_U32X4" {
-		t.Fatalf("vector add = %#v, want ENI_VADD_U32X4", val)
+	if !ok || call.Method != "DS_VADD_U32X4" {
+		t.Fatalf("vector add = %#v, want DS_VADD_U32X4", val)
 	}
 }
 
@@ -72,8 +72,8 @@ func TestLiftFunction_VectorDup(t *testing.T) {
 	}
 	val := firstReturn(t, LiftFunction(insns, []string{"p"}, nil, nil)).Value
 	call, ok := val.(*ir.StaticMethodCall)
-	if !ok || call.Method != "ENI_VDUP_U32X4" {
-		t.Fatalf("dup = %#v, want ENI_VDUP_U32X4", val)
+	if !ok || call.Method != "DS_VDUP_U32X4" {
+		t.Fatalf("dup = %#v, want DS_VDUP_U32X4", val)
 	}
 }
 

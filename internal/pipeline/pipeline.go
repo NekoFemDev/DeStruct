@@ -773,7 +773,7 @@ func (p *Pipeline) decompileELFArm64(ctx context.Context) error {
 	if p.opts.SplitFunctions {
 		imageDir = splitDir
 	}
-	if ierr := writeTLSSupport(imageDir); ierr != nil {
+	if ierr := writeRuntimeSupport(imageDir); ierr != nil {
 		fmt.Fprintf(os.Stderr, "warning: cannot write TLS support file: %v\n", ierr)
 	}
 	p.elfImageBase, p.elfImageSize = 0, 0

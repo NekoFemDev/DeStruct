@@ -45,7 +45,7 @@ var (
 	// uint64_t sub_123(...) {  /  int main(void) {
 	linkDefRe = regexp.MustCompile(`(?m)^\s*(?:uint64_t|int|void)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{`)
 	// File-scope variable definitions (the generated support file uses
-	// these for eni_tls/eni_outlined_*): uintptr_t eni_outlined_sp;
+	// these for ds_tls/ds_outlined_*): uintptr_t ds_outlined_sp;
 	linkDefVarRe = regexp.MustCompile(`(?m)^(?:unsigned char|signed char|char|unsigned short|short|unsigned int|int|unsigned long|long|uint8_t|uint16_t|uint32_t|uint64_t|uintptr_t|size_t)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*(?:=[^;]*)?;`)
 	// any identifier followed by "(" after extern declarations are stripped
 	linkCallRe = regexp.MustCompile(`\b([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
@@ -211,7 +211,7 @@ func generateLinkStubs(files []string, outPath string, addMain, noop bool) (*Lin
 	if missingContains(missingFuncs, "ext___errno") {
 		b.WriteString("/* ext___errno() must return a writable pointer; generated code\n")
 		b.WriteString(" * calls it and dereferences the result. */\n")
-		b.WriteString("static uint32_t eni_errno_storage;\n\n")
+		b.WriteString("static uint32_t ds_errno_storage;\n\n")
 	}
 
 	if len(missingFuncs) > 0 {
@@ -220,7 +220,7 @@ func generateLinkStubs(files []string, outPath string, addMain, noop bool) (*Lin
 			for _, name := range missingFuncs {
 				body := "    return 0;"
 				if name == "ext___errno" {
-					body = "    return (uint64_t)(uintptr_t)&eni_errno_storage;"
+					body = "    return (uint64_t)(uintptr_t)&ds_errno_storage;"
 				}
 				writeFunctionStub(&b, name, body)
 				result.GenericFunctions = append(result.GenericFunctions, name)
@@ -315,7 +315,7 @@ func libcStubBody(name string) (string, bool) {
 	case "ext_abort":
 		return "    abort();\n    return 0;", true
 	case "ext___errno":
-		return "    return (uint64_t)(uintptr_t)&eni_errno_storage;", true
+		return "    return (uint64_t)(uintptr_t)&ds_errno_storage;", true
 	}
 	return "", false
 }

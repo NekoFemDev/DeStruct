@@ -95,13 +95,13 @@ type LiftOptions struct {
 
 	// OutlinedContextRegs, when non-empty, marks this function as an
 	// outlined entry that inherits these callee-saved registers from its
-	// dispatcher. The lifter loads them from eni_outlined_ctx before the
+	// dispatcher. The lifter loads them from ds_outlined_ctx before the
 	// body so the generated C no longer treats them as zero.
 	OutlinedContextRegs []string
 
 	// OutlinedStack marks this function as an outlined entry that also
 	// inherits its dispatcher's stack frame. sp/x29 are loaded from the
-	// shared eni_outlined_stack block.
+	// shared ds_outlined_stack block.
 	OutlinedStack bool
 
 	// OutlinedContextTargets maps each outlined entry to the caller state

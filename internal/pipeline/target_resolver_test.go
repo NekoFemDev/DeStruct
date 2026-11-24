@@ -17,7 +17,7 @@ func TestWriteTargetResolver(t *testing.T) {
 	if err := writeTargetResolver(dir, candidates, 0, 0x100000); err != nil {
 		t.Fatalf("writeTargetResolver: %v", err)
 	}
-	data, err := os.ReadFile(filepath.Join(dir, "eni_targets.c"))
+	data, err := os.ReadFile(filepath.Join(dir, "ds_targets.c"))
 	if err != nil {
 		t.Fatalf("read resolver: %v", err)
 	}
@@ -29,8 +29,8 @@ func TestWriteTargetResolver(t *testing.T) {
 		"{ 0x1000ULL, (void *)sub_1000 }",
 		"{ 0x2000ULL, (void *)sub_2000 }",
 		"{ 0x3000ULL, (void *)sub_3000 }",
-		"ENI_TARGET",
-		"ENI_RESOLVE_IMAGE_SIZE",
+		"DS_TARGET",
+		"DS_RESOLVE_IMAGE_SIZE",
 	} {
 		if !strings.Contains(src, want) {
 			t.Fatalf("resolver missing %q:\n%s", want, src)

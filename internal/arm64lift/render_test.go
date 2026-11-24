@@ -281,7 +281,7 @@ func TestRenderCFunction_ImageAndFunctionPointers(t *testing.T) {
 	})
 	out := buf.String()
 	for _, want := range []string{
-		"a = ENI_ADDR(0x2000);",
+		"a = DS_ADDR(0x2000);",
 		"b = (uintptr_t)&sub_3000;",
 		"extern uint64_t sub_3000();",
 	} {
@@ -367,6 +367,32 @@ func TestRenderCFunction_ExternalCallsAndStrings(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in:\n%s", want, out)
+		}
+	}
+}
+
+// TestPreambleUsesDSPrefix keeps the generated runtime namespace on the
+// ds_/DS_ convention; eni_/ENI_ was the historical prefix.
+func TestPreambleUsesDSPrefix(t *testing.T) {
+	var buf bytes.Buffer
+	WriteCFilePreambleWithImage(&buf, "lib.so", 0, 0x1000)
+	out := buf.String()
+	for _, want := range []string{
+		"typedef unsigned __int128 ds_uint128;",
+		"#define DS_ADDR(",
+		"extern unsigned char ds_image[];",
+		"extern unsigned char ds_tls[];",
+		"extern uint64_t ds_outlined_ctx[10];",
+		"extern uint64_t DS_TARGET(uintptr_t);",
+		"DS_DEFINE_VEC_BIN",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("preamble missing %q:\n%s", want, out)
+		}
+	}
+	for _, old := range []string{"eni_", "ENI_"} {
+		if strings.Contains(out, old) {
+			t.Fatalf("preamble still uses %q:\n%s", old, out)
 		}
 	}
 }

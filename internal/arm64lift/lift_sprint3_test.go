@@ -318,8 +318,8 @@ func TestLiftFunction_FPArithmetic(t *testing.T) {
 	}
 	val := firstReturn(t, LiftFunction(insns, nil, nil, nil)).Value
 	call, ok := val.(*ir.StaticMethodCall)
-	if !ok || call.Method != "ENI_BITCAST_U64" {
-		t.Fatalf("fmov bitcast = %#v, want ENI_BITCAST_U64(...)", val)
+	if !ok || call.Method != "DS_BITCAST_U64" {
+		t.Fatalf("fmov bitcast = %#v, want DS_BITCAST_U64(...)", val)
 	}
 	add, ok := call.Args[0].(*ir.BinaryExpr)
 	if !ok || add.Op != "+" {
@@ -347,8 +347,8 @@ func TestLiftFunction_FPReturn(t *testing.T) {
 	}
 	val := firstReturn(t, LiftFunction(insns, nil, nil, nil)).Value
 	call, ok := val.(*ir.StaticMethodCall)
-	if !ok || call.Method != "ENI_BITCAST_U64" {
-		t.Fatalf("FP return = %#v, want ENI_BITCAST_U64(d0)", val)
+	if !ok || call.Method != "DS_BITCAST_U64" {
+		t.Fatalf("FP return = %#v, want DS_BITCAST_U64(d0)", val)
 	}
 }
 

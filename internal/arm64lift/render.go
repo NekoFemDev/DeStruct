@@ -208,61 +208,61 @@ func WriteCFilePreamble(w io.Writer, sourceName string) {
 	sourceName = strings.ReplaceAll(sourceName, "*/", "* /")
 	fmt.Fprintf(w, "/*\n * DeStruct pseudo-C output for %s.\n * Unified --emit-pseudo mode: syntactically valid C, generated for\n * analysis/recompilation only (not intended to link as-is).\n */\n", sourceName)
 	io.WriteString(w, "#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n\n")
-	io.WriteString(w, "#if defined(__SIZEOF_INT128__)\ntypedef unsigned __int128 eni_uint128;\n#else\ntypedef struct { uint64_t lo; uint64_t hi; } eni_uint128;\n#endif\n\n")
+	io.WriteString(w, "#if defined(__SIZEOF_INT128__)\ntypedef unsigned __int128 ds_uint128;\n#else\ntypedef struct { uint64_t lo; uint64_t hi; } ds_uint128;\n#endif\n\n")
 	// Virtual-dispatch helper. The body is exactly the lifted shape:
 	// vtable = *(uint64_t**)obj; method = vtable[off/8]; method(args...).
 	io.WriteString(w, "#define CALL_VTABLE(obj, off, ...) \\\n")
 	io.WriteString(w, "    (((uint64_t (*)())(*(uint64_t*)((uintptr_t)(*(uint64_t*)((uintptr_t)(obj)))) + (off)))(__VA_ARGS__))\n\n")
-	io.WriteString(w, "static inline float eni_b2f(uint32_t u) { union { uint32_t u; float f; } v; v.u = u; return v.f; }\n")
-	io.WriteString(w, "static inline uint32_t eni_f2b(float f) { union { uint32_t u; float f; } v; v.f = f; return v.u; }\n")
-	io.WriteString(w, "static inline double eni_b2d(uint64_t u) { union { uint64_t u; double d; } v; v.u = u; return v.d; }\n")
-	io.WriteString(w, "static inline uint64_t eni_d2b(double d) { union { uint64_t u; double d; } v; v.d = d; return v.u; }\n")
-	io.WriteString(w, "#define ENI_BITCAST_F32(v) eni_b2f((uint32_t)(v))\n")
-	io.WriteString(w, "#define ENI_BITCAST_U32(v) eni_f2b((float)(v))\n")
-	io.WriteString(w, "#define ENI_BITCAST_F64(v) eni_b2d((uint64_t)(v))\n")
-	io.WriteString(w, "#define ENI_BITCAST_U64(v) eni_d2b((double)(v))\n\n")
+	io.WriteString(w, "static inline float ds_b2f(uint32_t u) { union { uint32_t u; float f; } v; v.u = u; return v.f; }\n")
+	io.WriteString(w, "static inline uint32_t ds_f2b(float f) { union { uint32_t u; float f; } v; v.f = f; return v.u; }\n")
+	io.WriteString(w, "static inline double ds_b2d(uint64_t u) { union { uint64_t u; double d; } v; v.u = u; return v.d; }\n")
+	io.WriteString(w, "static inline uint64_t ds_d2b(double d) { union { uint64_t u; double d; } v; v.d = d; return v.u; }\n")
+	io.WriteString(w, "#define DS_BITCAST_F32(v) ds_b2f((uint32_t)(v))\n")
+	io.WriteString(w, "#define DS_BITCAST_U32(v) ds_f2b((float)(v))\n")
+	io.WriteString(w, "#define DS_BITCAST_F64(v) ds_b2d((uint64_t)(v))\n")
+	io.WriteString(w, "#define DS_BITCAST_U64(v) ds_d2b((double)(v))\n\n")
 	// TPIDR_EL0 accesses (Android TLS: stack canary, errno, thread-local
 	// variables) become indexes into this zero-initialized block. The
 	// pointer sits in the middle so both positive and negative TLS
 	// offsets stay inside the array.
-	io.WriteString(w, "extern unsigned char eni_tls[];\n")
-	io.WriteString(w, "#define ENI_TLS_BASE ((uintptr_t)(eni_tls + 0x8000))\n")
-	io.WriteString(w, "extern uint64_t eni_outlined_ctx[10];\n")
-	io.WriteString(w, "extern unsigned char eni_outlined_stack[];\n")
-	io.WriteString(w, "extern uint64_t ENI_TARGET(uintptr_t);\n")
-	io.WriteString(w, "extern uintptr_t eni_outlined_sp;\n")
-	io.WriteString(w, "extern uintptr_t eni_outlined_fp;\n")
-	io.WriteString(w, "#define ENI_OUTLINED_STACK ((uintptr_t)eni_outlined_stack)\n")
-	io.WriteString(w, "#define ENI_OUTLINED_STACK_SP ((uintptr_t)(eni_outlined_stack + 0x8000))\n")
-	io.WriteString(w, "static inline void ENI_OUTLINED_STACK_RESET(void) { memset(eni_outlined_stack, 0, 0x10000); }\n\n")
-	// Lane-wise vector helpers. The IR keeps q-registers as eni_uint128,
+	io.WriteString(w, "extern unsigned char ds_tls[];\n")
+	io.WriteString(w, "#define DS_TLS_BASE ((uintptr_t)(ds_tls + 0x8000))\n")
+	io.WriteString(w, "extern uint64_t ds_outlined_ctx[10];\n")
+	io.WriteString(w, "extern unsigned char ds_outlined_stack[];\n")
+	io.WriteString(w, "extern uint64_t DS_TARGET(uintptr_t);\n")
+	io.WriteString(w, "extern uintptr_t ds_outlined_sp;\n")
+	io.WriteString(w, "extern uintptr_t ds_outlined_fp;\n")
+	io.WriteString(w, "#define DS_OUTLINED_STACK ((uintptr_t)ds_outlined_stack)\n")
+	io.WriteString(w, "#define DS_OUTLINED_STACK_SP ((uintptr_t)(ds_outlined_stack + 0x8000))\n")
+	io.WriteString(w, "static inline void DS_OUTLINED_STACK_RESET(void) { memset(ds_outlined_stack, 0, 0x10000); }\n\n")
+	// Lane-wise vector helpers. The IR keeps q-registers as ds_uint128,
 	// so these reinterpret the same 16 bytes with the arrangement named
 	// in the suffix (4s, 2d, 8h, 16b).
-	io.WriteString(w, "typedef struct { float e[4]; } eni_f32x4;\n")
-	io.WriteString(w, "typedef struct { double e[2]; } eni_f64x2;\n")
-	io.WriteString(w, "typedef struct { uint8_t e[16]; } eni_u8x16;\n")
-	io.WriteString(w, "typedef struct { uint16_t e[8]; } eni_u16x8;\n")
-	io.WriteString(w, "typedef struct { uint32_t e[4]; } eni_u32x4;\n")
-	io.WriteString(w, "typedef struct { uint64_t e[2]; } eni_u64x2;\n")
-	io.WriteString(w, `#define ENI_DEFINE_VEC_BIN(name, T, N, OP) \
-static inline eni_uint128 name(eni_uint128 a, eni_uint128 b) { \
-    union { eni_uint128 q; T e[N]; } ua, ub, ur; \
+	io.WriteString(w, "typedef struct { float e[4]; } ds_f32x4;\n")
+	io.WriteString(w, "typedef struct { double e[2]; } ds_f64x2;\n")
+	io.WriteString(w, "typedef struct { uint8_t e[16]; } ds_u8x16;\n")
+	io.WriteString(w, "typedef struct { uint16_t e[8]; } ds_u16x8;\n")
+	io.WriteString(w, "typedef struct { uint32_t e[4]; } ds_u32x4;\n")
+	io.WriteString(w, "typedef struct { uint64_t e[2]; } ds_u64x2;\n")
+	io.WriteString(w, `#define DS_DEFINE_VEC_BIN(name, T, N, OP) \
+static inline ds_uint128 name(ds_uint128 a, ds_uint128 b) { \
+    union { ds_uint128 q; T e[N]; } ua, ub, ur; \
     ua.q = a; ub.q = b; \
     for (int i = 0; i < N; i++) ur.e[i] = ua.e[i] OP ub.e[i]; \
     return ur.q; \
 }
 `)
-	io.WriteString(w, `#define ENI_DEFINE_VEC_FMA(name, T, N, SIGN) \
-static inline eni_uint128 name(eni_uint128 a, eni_uint128 b, eni_uint128 c) { \
-    union { eni_uint128 q; T e[N]; } ua, ub, uc, ur; \
+	io.WriteString(w, `#define DS_DEFINE_VEC_FMA(name, T, N, SIGN) \
+static inline ds_uint128 name(ds_uint128 a, ds_uint128 b, ds_uint128 c) { \
+    union { ds_uint128 q; T e[N]; } ua, ub, uc, ur; \
     ua.q = a; ub.q = b; uc.q = c; \
     for (int i = 0; i < N; i++) ur.e[i] = ua.e[i] SIGN ub.e[i] * uc.e[i]; \
     return ur.q; \
 }
 `)
-	io.WriteString(w, `#define ENI_DEFINE_VEC_DUP(name, T, N) \
-static inline eni_uint128 name(T x) { \
-    union { eni_uint128 q; T e[N]; } u; \
+	io.WriteString(w, `#define DS_DEFINE_VEC_DUP(name, T, N) \
+static inline ds_uint128 name(T x) { \
+    union { ds_uint128 q; T e[N]; } u; \
     for (int i = 0; i < N; i++) u.e[i] = x; \
     return u.q; \
 }
@@ -275,14 +275,14 @@ static inline eni_uint128 name(T x) { \
 		{"F32X4", "float", 4},
 		{"F64X2", "double", 2},
 	} {
-		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vadd_%s, %s, %d, +)\n", strings.ToLower(d.name), d.t, d.n)
-		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vsub_%s, %s, %d, -)\n", strings.ToLower(d.name), d.t, d.n)
-		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vmul_%s, %s, %d, *)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "DS_DEFINE_VEC_BIN(ds_vadd_%s, %s, %d, +)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "DS_DEFINE_VEC_BIN(ds_vsub_%s, %s, %d, -)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "DS_DEFINE_VEC_BIN(ds_vmul_%s, %s, %d, *)\n", strings.ToLower(d.name), d.t, d.n)
 		if d.name == "F32X4" || d.name == "F64X2" {
-			fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vdiv_%s, %s, %d, /)\n", strings.ToLower(d.name), d.t, d.n)
+			fmt.Fprintf(w, "DS_DEFINE_VEC_BIN(ds_vdiv_%s, %s, %d, /)\n", strings.ToLower(d.name), d.t, d.n)
 		}
-		fmt.Fprintf(w, "ENI_DEFINE_VEC_FMA(eni_vfma_%s, %s, %d, +)\n", strings.ToLower(d.name), d.t, d.n)
-		fmt.Fprintf(w, "ENI_DEFINE_VEC_FMA(eni_vfms_%s, %s, %d, -)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "DS_DEFINE_VEC_FMA(ds_vfma_%s, %s, %d, +)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "DS_DEFINE_VEC_FMA(ds_vfms_%s, %s, %d, -)\n", strings.ToLower(d.name), d.t, d.n)
 	}
 	for _, d := range []struct {
 		name string
@@ -294,22 +294,22 @@ static inline eni_uint128 name(T x) { \
 		{"U32X4", "uint32_t", 4},
 		{"U64X2", "uint64_t", 2},
 	} {
-		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vadd_%s, %s, %d, +)\n", strings.ToLower(d.name), d.t, d.n)
-		fmt.Fprintf(w, "ENI_DEFINE_VEC_BIN(eni_vsub_%s, %s, %d, -)\n", strings.ToLower(d.name), d.t, d.n)
-		fmt.Fprintf(w, "ENI_DEFINE_VEC_DUP(eni_vdup_%s, %s, %d)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "DS_DEFINE_VEC_BIN(ds_vadd_%s, %s, %d, +)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "DS_DEFINE_VEC_BIN(ds_vsub_%s, %s, %d, -)\n", strings.ToLower(d.name), d.t, d.n)
+		fmt.Fprintf(w, "DS_DEFINE_VEC_DUP(ds_vdup_%s, %s, %d)\n", strings.ToLower(d.name), d.t, d.n)
 	}
 	io.WriteString(w, "\n")
 }
 
 // WriteCFilePreambleWithImage is WriteCFilePreamble plus the original ELF
-// load-image mapping used by ENI_ADDR. imageBase is the lowest virtual
-// address covered by the linked eni_image blob.
+// load-image mapping used by DS_ADDR. imageBase is the lowest virtual
+// address covered by the linked ds_image blob.
 func WriteCFilePreambleWithImage(w io.Writer, sourceName string, imageBase, imageSize uint64) {
 	WriteCFilePreamble(w, sourceName)
-	fmt.Fprintf(w, "extern unsigned char eni_image[];\n")
-	fmt.Fprintf(w, "#define ENI_IMAGE_BASE ((uintptr_t)0x%x)\n", imageBase)
-	fmt.Fprintf(w, "#define ENI_IMAGE_SIZE ((size_t)0x%x)\n", imageSize)
-	io.WriteString(w, "#define ENI_ADDR(a) ((uintptr_t)(eni_image + ((uintptr_t)(a) - ENI_IMAGE_BASE)))\n\n")
+	fmt.Fprintf(w, "extern unsigned char ds_image[];\n")
+	fmt.Fprintf(w, "#define DS_IMAGE_BASE ((uintptr_t)0x%x)\n", imageBase)
+	fmt.Fprintf(w, "#define DS_IMAGE_SIZE ((size_t)0x%x)\n", imageSize)
+	io.WriteString(w, "#define DS_ADDR(a) ((uintptr_t)(ds_image + ((uintptr_t)(a) - DS_IMAGE_BASE)))\n\n")
 }
 
 // CRenderOptions controls the readability passes applied while emitting
@@ -343,7 +343,7 @@ type CRenderOptions struct {
 	ReturnType string
 	// ImageBase, when HasImage is true, is the lowest virtual address of
 	// the original ELF load image. Absolute address constants render as
-	// ENI_ADDR(orig), indexing the eni_image blob linked by elf recompile
+	// DS_ADDR(orig), indexing the ds_image blob linked by elf recompile
 	// instead of pointing at an unmapped host address.
 	ImageBase uint64
 	HasImage  bool
@@ -537,7 +537,7 @@ func cVarType(name string) string {
 		case 'w':
 			return "uint32_t"
 		case 'q':
-			return "eni_uint128"
+			return "ds_uint128"
 		case 'd':
 			return "double"
 		case 's':
@@ -574,7 +574,7 @@ func cTypeForWidth(width int) string {
 	case 4:
 		return "uint32_t"
 	case 16:
-		return "eni_uint128"
+		return "ds_uint128"
 	default:
 		return "uint64_t"
 	}
@@ -584,9 +584,9 @@ func (r *cRenderer) useVar(raw string) string {
 	if raw == "" {
 		raw = "_unnamed"
 	}
-	// eni_outlined_* names are extern globals declared by the preamble,
+	// ds_outlined_* names are extern globals declared by the preamble,
 	// not synthesized locals.
-	if raw == eniOutlinedCtx || raw == eniOutlinedSP || raw == eniOutlinedFP {
+	if raw == dsOutlinedCtx || raw == dsOutlinedSP || raw == dsOutlinedFP {
 		r.varNames[raw] = raw
 		r.origByMapped[raw] = raw
 		r.usedOrig[raw] = true
@@ -665,8 +665,8 @@ func (r *cRenderer) chooseParams() {
 func (r *cRenderer) writePrototypes(w io.Writer) {
 	names := make([]string, 0, len(r.calls))
 	for name := range r.calls {
-		if name == r.funcName || name == "CALL_VTABLE" || strings.HasPrefix(name, "ENI_") ||
-			strings.HasPrefix(name, "eni_v") || r.paramSet[name] {
+		if name == r.funcName || name == "CALL_VTABLE" || strings.HasPrefix(name, "DS_") ||
+			strings.HasPrefix(name, "ds_v") || r.paramSet[name] {
 			continue
 		}
 		if _, isVar := r.varTypes[name]; isVar {
@@ -683,7 +683,7 @@ func (r *cRenderer) writePrototypes(w io.Writer) {
 func (r *cRenderer) writeDecls(w io.Writer) {
 	typeOrder := []string{
 		"uint64_t", "uint32_t", "uint16_t", "uint8_t",
-		"int64_t", "uintptr_t", "eni_uint128",
+		"int64_t", "uintptr_t", "ds_uint128",
 	}
 	groups := make(map[string][]string)
 	for name, typ := range r.varTypes {
@@ -724,7 +724,7 @@ func (r *cRenderer) writeDecls(w io.Writer) {
 // registers/stack and avoiding nondeterministic garbage reads.
 func initializedDeclList(names []string, typ string) string {
 	zero := " = 0"
-	if typ == "eni_uint128" {
+	if typ == "ds_uint128" {
 		zero = " = {0}"
 	}
 	parts := make([]string, len(names))
@@ -793,8 +793,8 @@ func ExternalCName(raw string) string {
 
 func isVectorHelper(name string) bool {
 	for _, prefix := range []string{
-		"eni_vadd_", "eni_vsub_", "eni_vmul_", "eni_vdiv_",
-		"eni_vfma_", "eni_vfms_", "eni_vdup_",
+		"ds_vadd_", "ds_vsub_", "ds_vmul_", "ds_vdiv_",
+		"ds_vfma_", "ds_vfms_", "ds_vdup_",
 	} {
 		if strings.HasPrefix(name, prefix) {
 			return true
@@ -816,15 +816,15 @@ func (r *cRenderer) callName(raw string) string {
 	// existing pseudo-C vocabulary.
 	// Generated helper names from the preamble are not unresolved
 	// external symbols. Vector helpers are declared there in lowercase
-	// (eni_vadd_f32x4, ...), while the IR spells them ENI_VADD_F32X4.
-	if strings.HasPrefix(name, "ENI_V") {
+	// (ds_vadd_f32x4, ...), while the IR spells them DS_VADD_F32X4.
+	if strings.HasPrefix(name, "DS_V") {
 		lower := strings.ToLower(name)
 		if isVectorHelper(lower) {
 			r.calls[lower] = true
 			return lower
 		}
 	}
-	if strings.HasPrefix(name, "ENI_") {
+	if strings.HasPrefix(name, "DS_") {
 		r.calls[name] = true
 		return name
 	}
@@ -1142,17 +1142,17 @@ func (r *cRenderer) exprParen(e ir.Expr) string {
 	return s
 }
 
-// eniTLSBaseLabel marks a TPIDR_EL0-derived address. The renderer spells it
-// as the ENI_TLS_BASE macro instead of a numeric address.
-const eniTLSBaseLabel = "ENI_TLS_BASE"
+// dsTLSBaseLabel marks a TPIDR_EL0-derived address. The renderer spells it
+// as the DS_TLS_BASE macro instead of a numeric address.
+const dsTLSBaseLabel = "DS_TLS_BASE"
 
 // addrExpr renders an AddrLit. With an image blob attached it indexes the
 // original ELF load image; otherwise it stays a plain numeric pointer.
 func (r *cRenderer) addrExpr(v *ir.AddrLit) string {
-	if v.Label == eniTLSBaseLabel {
-		return eniTLSBaseLabel
+	if v.Label == dsTLSBaseLabel {
+		return dsTLSBaseLabel
 	}
-	if v.Label == eniOutlinedStackLabel || v.Label == eniOutlinedStackSP {
+	if v.Label == dsOutlinedStackLabel || v.Label == dsOutlinedStackSP {
 		return v.Label
 	}
 	if r.functionPtr != nil {
@@ -1167,7 +1167,7 @@ func (r *cRenderer) addrExpr(v *ir.AddrLit) string {
 	}
 	var s string
 	if r.hasImage {
-		s = fmt.Sprintf("ENI_ADDR(0x%x)", v.Value)
+		s = fmt.Sprintf("DS_ADDR(0x%x)", v.Value)
 	} else {
 		s = fmt.Sprintf("((uintptr_t)0x%x)", v.Value)
 	}
@@ -1388,8 +1388,8 @@ func (r *cRenderer) expr(e ir.Expr) string {
 	case *ir.IndirectCall:
 		return "((uint64_t (*)())(" + r.expr(v.Callee) + "))(" + r.exprList(v.Args) + ")"
 	case *ir.ArrayAccess:
-		if lv, ok := v.Array.(*ir.LocalVar); ok && lv.Name == eniOutlinedCtx && v.Width == 8 {
-			return eniOutlinedCtx + "[" + r.expr(v.Index) + "]"
+		if lv, ok := v.Array.(*ir.LocalVar); ok && lv.Name == dsOutlinedCtx && v.Width == 8 {
+			return dsOutlinedCtx + "[" + r.expr(v.Index) + "]"
 		}
 		ctype := cTypeForWidth(v.Width)
 		if v.CType != "" {

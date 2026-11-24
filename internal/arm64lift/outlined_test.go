@@ -51,7 +51,7 @@ func TestOutlinedContextSeedAndSave(t *testing.T) {
 		OutlinedContextRegs: []string{"x19"},
 	})
 	out := renderForTest(stmts)
-	if !strings.Contains(out, "x19 = eni_outlined_ctx[0];") {
+	if !strings.Contains(out, "x19 = ds_outlined_ctx[0];") {
 		t.Fatalf("outlined context was not seeded:\n%s", out)
 	}
 	if !strings.Contains(out, "*(uint64_t*)((uintptr_t)x19)") {
@@ -84,12 +84,12 @@ func TestJumpTableDispatchSavesOutlinedContext(t *testing.T) {
 	})
 	out := renderForTest(stmts)
 	for _, want := range []string{
-		"eni_outlined_ctx[0] = x19;",
-		"ENI_OUTLINED_STACK_RESET();",
-		"sp = ENI_OUTLINED_STACK_SP;",
-		"eni_outlined_sp = sp;",
-		"eni_outlined_fp = x29;",
-		"ENI_TARGET(",
+		"ds_outlined_ctx[0] = x19;",
+		"DS_OUTLINED_STACK_RESET();",
+		"sp = DS_OUTLINED_STACK_SP;",
+		"ds_outlined_sp = sp;",
+		"ds_outlined_fp = x29;",
+		"DS_TARGET(",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("jump-table dispatch missing %q:\n%s", want, out)
@@ -124,11 +124,11 @@ func TestOutlinedStackFrameAdjustments(t *testing.T) {
 	})
 	out := renderForTest(stmts)
 	for _, want := range []string{
-		"sp = ENI_OUTLINED_STACK_SP;",
+		"sp = DS_OUTLINED_STACK_SP;",
 		"sp = sp - 32;",
 		"x29 = sp;",
-		"eni_outlined_sp = sp;",
-		"eni_outlined_fp = x29;",
+		"ds_outlined_sp = sp;",
+		"ds_outlined_fp = x29;",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("outlined stack frame missing %q:\n%s", want, out)
@@ -193,7 +193,7 @@ func TestOutlinedStackEntry(t *testing.T) {
 		0xd65f03c0, // ret
 	})
 	out := renderForTest(LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{OutlinedStack: true}))
-	for _, want := range []string{"sp = eni_outlined_sp;", "x29 = eni_outlined_fp;"} {
+	for _, want := range []string{"sp = ds_outlined_sp;", "x29 = ds_outlined_fp;"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("outlined stack entry missing %q:\n%s", want, out)
 		}

@@ -46,7 +46,7 @@ func TestThreadPointerTLS(t *testing.T) {
 		0xd65f03c0, // ret
 	})
 	out := renderForTest(LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{}))
-	if !strings.Contains(out, "ENI_TLS_BASE + 0x28") {
+	if !strings.Contains(out, "DS_TLS_BASE + 0x28") {
 		t.Fatalf("TPIDR_EL0 was not lifted to the TLS base:\n%s", out)
 	}
 }
@@ -329,10 +329,10 @@ func TestFPStackSlotAliasing(t *testing.T) {
 	if strings.Contains(out, "dlocal_16") || strings.Contains(out, "flocal_16") {
 		t.Fatalf("FP stack slot was split into a second variable:\n%s", out)
 	}
-	if !strings.Contains(out, "ENI_BITCAST_U64(d0)") {
+	if !strings.Contains(out, "DS_BITCAST_U64(d0)") {
 		t.Fatalf("missing FP-to-integer bitcast:\n%s", out)
 	}
-	if !strings.Contains(out, "ENI_BITCAST_F64(local_16)") {
+	if !strings.Contains(out, "DS_BITCAST_F64(local_16)") {
 		t.Fatalf("missing integer-to-FP bitcast:\n%s", out)
 	}
 }

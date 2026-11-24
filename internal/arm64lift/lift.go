@@ -3268,7 +3268,7 @@ func vectorLayout(opstr string) string {
 }
 
 // liftVectorBin lifts lane-wise vector add/sub/mul/div through the
-// eni_v* helper functions emitted in the file preamble.
+// ds_v* helper functions emitted in the file preamble.
 func (l *lifter) liftVectorBin(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 3 || !isVectorReg(inst.Operands[0]) ||
 		!isVectorReg(inst.Operands[1]) || !isVectorReg(inst.Operands[2]) {
@@ -3306,13 +3306,13 @@ func (l *lifter) liftVectorBin(inst native.DetailedInstruction) []ir.Stmt {
 	prefix := ""
 	switch inst.Mnemonic {
 	case "fadd", "add":
-		prefix = "ENI_VADD_"
+		prefix = "DS_VADD_"
 	case "fsub", "sub":
-		prefix = "ENI_VSUB_"
+		prefix = "DS_VSUB_"
 	case "fmul":
-		prefix = "ENI_VMUL_"
+		prefix = "DS_VMUL_"
 	case "fdiv":
-		prefix = "ENI_VDIV_"
+		prefix = "DS_VDIV_"
 	default:
 		return nil
 	}
@@ -3351,9 +3351,9 @@ func (l *lifter) liftVectorFma(inst native.DetailedInstruction, negate bool) []i
 	l.consume(acc)
 	l.consume(a)
 	l.consume(b)
-	name := "ENI_VFMA_" + suffix
+	name := "DS_VFMA_" + suffix
 	if negate {
-		name = "ENI_VFMS_" + suffix
+		name = "DS_VFMS_" + suffix
 	}
 	return l.setReg(inst.Operands[0].Reg, &ir.StaticMethodCall{
 		Method: name,
@@ -3448,7 +3448,7 @@ func (l *lifter) liftVectorDup(inst native.DetailedInstruction) []ir.Stmt {
 		return nil
 	}
 	return l.setReg(inst.Operands[0].Reg, &ir.StaticMethodCall{
-		Method: "ENI_VDUP_" + suffix,
+		Method: "DS_VDUP_" + suffix,
 		Args:   []ir.Expr{val},
 	})
 }
@@ -3618,7 +3618,7 @@ func (l *lifter) liftFPConvertToInt(inst native.DetailedInstruction, signed bool
 }
 
 // liftFmov lifts register-register and immediate forms, plus the
-// integer<->FP bitcast forms through the ENI_BITCAST_* macros.
+// integer<->FP bitcast forms through the DS_BITCAST_* macros.
 func (l *lifter) liftFmov(inst native.DetailedInstruction) []ir.Stmt {
 	if len(inst.Operands) != 2 || inst.Operands[0].Type != native.OperandReg {
 		return nil
@@ -3648,13 +3648,13 @@ func (l *lifter) liftFmov(inst native.DetailedInstruction) []ir.Stmt {
 		macro := ""
 		switch {
 		case dst.Reg[0] == 's' && src.Reg[0] == 'w':
-			macro = "ENI_BITCAST_F32"
+			macro = "DS_BITCAST_F32"
 		case dst.Reg[0] == 'w' && src.Reg[0] == 's':
-			macro = "ENI_BITCAST_U32"
+			macro = "DS_BITCAST_U32"
 		case dst.Reg[0] == 'd' && src.Reg[0] == 'x':
-			macro = "ENI_BITCAST_F64"
+			macro = "DS_BITCAST_F64"
 		case dst.Reg[0] == 'x' && src.Reg[0] == 'd':
-			macro = "ENI_BITCAST_U64"
+			macro = "DS_BITCAST_U64"
 		default:
 			return nil
 		}
@@ -3866,9 +3866,9 @@ func bitcastFPToInt(e ir.Expr, ctype string) ir.Expr {
 	if e == nil {
 		return nil
 	}
-	macro := "ENI_BITCAST_U64"
+	macro := "DS_BITCAST_U64"
 	if ctype == "float" {
-		macro = "ENI_BITCAST_U32"
+		macro = "DS_BITCAST_U32"
 	}
 	return &ir.StaticMethodCall{Method: macro, Args: []ir.Expr{e}}
 }
@@ -3877,9 +3877,9 @@ func bitcastIntToFP(e ir.Expr, ctype string) ir.Expr {
 	if e == nil {
 		return nil
 	}
-	macro := "ENI_BITCAST_F64"
+	macro := "DS_BITCAST_F64"
 	if ctype == "float" {
-		macro = "ENI_BITCAST_F32"
+		macro = "DS_BITCAST_F32"
 	}
 	return &ir.StaticMethodCall{Method: macro, Args: []ir.Expr{e}}
 }
@@ -3896,15 +3896,15 @@ func fpViewBitcast(reg string, e ir.Expr, toBits bool) ir.Expr {
 	switch reg[0] {
 	case 'd':
 		if toBits {
-			macro = "ENI_BITCAST_U64"
+			macro = "DS_BITCAST_U64"
 		} else {
-			macro = "ENI_BITCAST_F64"
+			macro = "DS_BITCAST_F64"
 		}
 	case 's':
 		if toBits {
-			macro = "ENI_BITCAST_U32"
+			macro = "DS_BITCAST_U32"
 		} else {
-			macro = "ENI_BITCAST_F32"
+			macro = "DS_BITCAST_F32"
 		}
 	default:
 		return e
@@ -4507,7 +4507,7 @@ func (l *lifter) liftMov(inst native.DetailedInstruction) []ir.Stmt {
 // liftMRS models reads from the system registers this lifter understands.
 // TPIDR_EL0 is the AArch64 user thread pointer: Android code uses it for
 // the stack canary ([TPIDR_EL0, #0x28]) and TLS variables. Rendering it as
-// ENI_TLS_BASE lets the generated C, the host verifier and the Unicorn
+// DS_TLS_BASE lets the generated C, the host verifier and the Unicorn
 // oracle all share one zero-initialized TLS block instead of treating the
 // thread pointer as an uninitialized register (which made every canary
 // check a null dereference in host C).
@@ -4518,7 +4518,7 @@ func (l *lifter) liftMRS(inst native.DetailedInstruction) []ir.Stmt {
 	sys := systemRegisterName(inst.OpStr)
 	switch strings.ToUpper(sys) {
 	case "TPIDR_EL0":
-		return l.setReg(inst.Operands[0].Reg, &ir.AddrLit{Label: eniTLSBaseLabel})
+		return l.setReg(inst.Operands[0].Reg, &ir.AddrLit{Label: dsTLSBaseLabel})
 	}
 	return nil
 }
@@ -4934,7 +4934,7 @@ func (l *lifter) liftBr(inst native.DetailedInstruction) []ir.Stmt {
 		// lifted C function, not raw image bytes, so the saved register
 		// and stack context is actually consumed.
 		ic.Callee = &ir.StaticMethodCall{
-			Method: "ENI_TARGET",
+			Method: "DS_TARGET",
 			Args:   []ir.Expr{ic.Callee},
 		}
 	}
@@ -5649,7 +5649,7 @@ func (l *lifter) memBaseExpr(base string) ir.Expr {
 	}
 	// AddrLit deliberately stays an address expression: adrp/add-built
 	// tables (jump tables, arrays at a fixed VA) must keep their concrete
-	// base. Rendering it through ENI_ADDR is valid C, while falling back to
+	// base. Rendering it through DS_ADDR is valid C, while falling back to
 	// a placeholder register silently turned the access into a null
 	// dereference.
 	return v
@@ -5682,11 +5682,11 @@ func (l *lifter) liftRet() ir.Stmt {
 	if !l.written["x0"] && !l.written["w0"] {
 		if v, ok := l.regs["d0"]; ok {
 			l.consume(v)
-			return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "ENI_BITCAST_U64", Args: []ir.Expr{v}}}
+			return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "DS_BITCAST_U64", Args: []ir.Expr{v}}}
 		}
 		if v, ok := l.regs["s0"]; ok {
 			l.consume(v)
-			return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "ENI_BITCAST_U32", Args: []ir.Expr{v}}}
+			return &ir.ReturnStmt{Value: &ir.StaticMethodCall{Method: "DS_BITCAST_U32", Args: []ir.Expr{v}}}
 		}
 		// Neither integer return register was written: the ABI value
 		// is the incoming x0 argument unchanged.

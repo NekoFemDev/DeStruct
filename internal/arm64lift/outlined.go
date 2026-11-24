@@ -8,18 +8,18 @@ import (
 	"github.com/destruct/destruct/internal/native"
 )
 
-// eniOutlinedCtx is the generated-C context block used by outlined
+// dsOutlinedCtx is the generated-C context block used by outlined
 // entries (jump-table case bodies and similar compiler-split blocks)
 // that read callee-saved registers from the code that dispatches to
 // them. The dispatcher stores the live x19..x28 values here immediately
 // before the indirect branch; the outlined entry reloads them on entry.
 // Index i corresponds to x(19+i).
 const (
-	eniOutlinedCtx        = "eni_outlined_ctx"
-	eniOutlinedStackLabel = "ENI_OUTLINED_STACK"
-	eniOutlinedStackSP    = "ENI_OUTLINED_STACK_SP"
-	eniOutlinedSP         = "eni_outlined_sp"
-	eniOutlinedFP         = "eni_outlined_fp"
+	dsOutlinedCtx        = "ds_outlined_ctx"
+	dsOutlinedStackLabel = "DS_OUTLINED_STACK"
+	dsOutlinedStackSP    = "DS_OUTLINED_STACK_SP"
+	dsOutlinedSP         = "ds_outlined_sp"
+	dsOutlinedFP         = "ds_outlined_fp"
 )
 
 // OutlinedContext describes the caller state an outlined entry inherits.
@@ -381,7 +381,7 @@ func constantRegValue(insns []native.DetailedInstruction, end int, reg string) (
 }
 
 // seedOutlinedContext emits the entry assignments that reload inherited
-// callee-saved registers from eni_outlined_ctx. It also installs the
+// callee-saved registers from ds_outlined_ctx. It also installs the
 // registers as ordinary C locals so the lifted body keeps using the
 // readable x19..x28 names instead of inlining the context loads
 // everywhere.
@@ -403,7 +403,7 @@ func (l *lifter) seedOutlinedContext() []ir.Stmt {
 }
 
 // saveOutlinedContext materializes and stores the live values of the
-// given callee-saved registers into eni_outlined_ctx. Called right
+// given callee-saved registers into ds_outlined_ctx. Called right
 // before a call or jump-table dispatch whose outlined targets inherit
 // those registers.
 func (l *lifter) saveOutlinedContext(regs []string) []ir.Stmt {
@@ -483,11 +483,11 @@ func (l *lifter) saveOutlinedStack() []ir.Stmt {
 		}
 	}
 	stmts = append(stmts, &ir.AssignStmt{
-		Target: &ir.LocalVar{Name: eniOutlinedSP},
+		Target: &ir.LocalVar{Name: dsOutlinedSP},
 		Value:  &ir.LocalVar{Name: "sp"},
 	})
 	stmts = append(stmts, &ir.AssignStmt{
-		Target: &ir.LocalVar{Name: eniOutlinedFP},
+		Target: &ir.LocalVar{Name: dsOutlinedFP},
 		Value:  &ir.LocalVar{Name: "x29"},
 	})
 	return stmts
@@ -504,11 +504,11 @@ func (l *lifter) seedOutlinedStack() []ir.Stmt {
 	if l.opts.OutlinedStack {
 		stmts = append(stmts, &ir.AssignStmt{
 			Target: &ir.LocalVar{Name: "sp"},
-			Value:  &ir.LocalVar{Name: eniOutlinedSP},
+			Value:  &ir.LocalVar{Name: dsOutlinedSP},
 		})
 		stmts = append(stmts, &ir.AssignStmt{
 			Target: &ir.LocalVar{Name: "x29"},
-			Value:  &ir.LocalVar{Name: eniOutlinedFP},
+			Value:  &ir.LocalVar{Name: dsOutlinedFP},
 		})
 		l.regs["sp"] = &ir.LocalVar{Name: "sp"}
 		l.regs["x29"] = &ir.LocalVar{Name: "x29"}
@@ -519,10 +519,10 @@ func (l *lifter) seedOutlinedStack() []ir.Stmt {
 		l.x29Known = false
 		return stmts
 	}
-	stmts = append(stmts, &ir.ExprStmt{Expr: &ir.StaticMethodCall{Method: "ENI_OUTLINED_STACK_RESET"}})
+	stmts = append(stmts, &ir.ExprStmt{Expr: &ir.StaticMethodCall{Method: "DS_OUTLINED_STACK_RESET"}})
 	stmts = append(stmts, &ir.AssignStmt{
 		Target: &ir.LocalVar{Name: "sp"},
-		Value:  &ir.AddrLit{Label: eniOutlinedStackSP},
+		Value:  &ir.AddrLit{Label: dsOutlinedStackSP},
 	})
 	l.regs["sp"] = &ir.LocalVar{Name: "sp"}
 	l.markWritten("sp")
@@ -546,7 +546,7 @@ func outlinedContextExpr(reg string) ir.Expr {
 		return &ir.IntLit{Value: 0}
 	}
 	return &ir.ArrayAccess{
-		Array: &ir.LocalVar{Name: eniOutlinedCtx},
+		Array: &ir.LocalVar{Name: dsOutlinedCtx},
 		Index: &ir.IntLit{Value: int64(idx)},
 		Width: 8,
 	}

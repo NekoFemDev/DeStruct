@@ -312,12 +312,15 @@ Split ELF decompilation also writes:
 
 - `image.bin` — the original load image (allocated section contents, gaps
   zero-filled, bss zeroed);
-- `image.c` — an `.incbin` wrapper defining `eni_image`;
+- `image.c` — an `.incbin` wrapper defining `ds_image`;
+- `ds_runtime.c` — zero-initialized TLS, outlined register/stack context
+  and their helpers;
+- `ds_targets.c` — the indirect jump-table address-to-C resolver;
 - `image_relocs.c` — a constructor replaying `.rela.dyn` relative/GOT
   relocations against that image at startup.
 
 Absolute data addresses in the generated C render through
-`ENI_ADDR(orig_va)` instead of a raw pointer, function-address arguments
+`DS_ADDR(orig_va)` instead of a raw pointer, function-address arguments
 render as `&sub_*`/`&ext_*`, and data pointers in vtables/init arrays are
 rebased to host addresses before `main` runs. This makes global reads and
 writes land in the reconstructed image rather than an unmapped address.
@@ -359,13 +362,13 @@ image address) are counted separately from semantic mismatches. Host faults and
 both-faulted cases are reported independently; many are caused by zero-argument
 dereferences or by split outlined blocks that still need caller context.
 
-The generated C models `TPIDR_EL0` as a zero-initialized `eni_tls` block, so
+The generated C models `TPIDR_EL0` as a zero-initialized `ds_tls` block, so
 stack-canary and TLS reads match the emulator instead of dereferencing host
 NULL. `bti j` jump-table case bodies that inherit callee-saved registers reload
-them from `eni_outlined_ctx`; the dispatcher saves x19..x28 immediately before
+them from `ds_outlined_ctx`; the dispatcher saves x19..x28 immediately before
 the indirect branch. Stack-using entries also reload sp/x29 from
-`eni_outlined_stack`/`eni_outlined_sp`/`eni_outlined_fp`, and the dispatcher
-materializes its frame adjustments and saves the same frame. `eni_targets.c`
+`ds_outlined_stack`/`ds_outlined_sp`/`ds_outlined_fp`, and the dispatcher
+materializes its frame adjustments and saves the same frame. `ds_targets.c`
 resolves indirect jump-table addresses back to original VAs so the dispatcher
 calls a lifted `sub_*` function rather than raw image bytes. Prologue-less
 direct-branch fragments are folded back into the surrounding function instead

@@ -46,8 +46,8 @@ uint64_t sub_existing(uint64_t x0, uint64_t x1)
 		"uint64_t func_9799cc(",
 		"return 0;",
 		"uint64_t ext_some_global;",
-		"static uint32_t eni_errno_storage;",
-		"return (uint64_t)(uintptr_t)&eni_errno_storage;",
+		"static uint32_t ds_errno_storage;",
+		"return (uint64_t)(uintptr_t)&ds_errno_storage;",
 		"int main(void)",
 	} {
 		if !strings.Contains(got, want) {

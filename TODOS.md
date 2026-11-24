@@ -115,7 +115,7 @@ handler, annotation and monitor parsing.
 
 Sprint 9 (2026-11-20) is complete:
 valid C floating literals (`1.0f` instead of `1f`), integer-backed
-stack slots with `ENI_BITCAST_*` access for mixed int/FP views (so one
+stack slots with `DS_BITCAST_*` access for mixed int/FP views (so one
 slot no longer splits into `local_N`/`dlocal_N`), bitcasts for integer
 ALU ops on `d`/`s` registers, tail-call forwarding of untouched ABI
 argument registers, unresolved executable tail targets kept as calls,
@@ -129,7 +129,7 @@ links a dummy executable successfully.
 
 Sprint 10 (2026-11-20) is complete:
 original ELF load-image reconstruction (`image.bin` + `image.c`) and
-`ENI_ADDR` rewriting for absolute data references; `.rela.dyn`
+`DS_ADDR` rewriting for absolute data references; `.rela.dyn`
 `R_AARCH64_RELATIVE` and `GLOB_DAT`/`ABS64` relocation replay in
 `image_relocs.c` (data pointers rebased into the image, function
 pointers redirected to lifted `sub_*` or generated `ext_*` stubs);
@@ -227,15 +227,15 @@ synthesized locals/registers. On `quazar_arm64`, `sub_9e002c`,
 
 Sprint 14 (2026-11-23) is complete:
 emulation-guided outlined-context recovery. `mrs xN, TPIDR_EL0` now maps
-to a zero-initialized `eni_tls` block (`ENI_TLS_BASE`) on both the host
+to a zero-initialized `ds_tls` block (`DS_TLS_BASE`) on both the host
 and the Unicorn side, so Android stack-canary/TLS reads no longer become
 null dereferences. Direct-branch targets that have no prologue/BTI entry
 evidence are folded back into the surrounding function instead of being
 emitted as context-less fragments. Fixed-address table bases (`adrp`/`add`
-followed by an indexed load) keep their `ENI_ADDR` expression instead of
+followed by an indexed load) keep their `DS_ADDR` expression instead of
 degrading to an uninitialized placeholder register. `bti j` jump-table
 case bodies that read inherited callee-saved registers now reload them
-from `eni_outlined_ctx`; their dispatcher materializes and saves x19..x28
+from `ds_outlined_ctx`; their dispatcher materializes and saves x19..x28
 immediately before the indirect branch. On the zero-argument
 `quazar_arm64` profile this raised exact return matches from 226 to 321,
 pointer-only matches from 28 to 67, and reduced both-faulted functions
@@ -244,15 +244,15 @@ after fragment folding).
 
 Sprint 15 (2026-11-23) is complete:
 outlined stack-context recovery. A dispatcher that reaches a stack-using
-outlined entry now gets a fresh zeroed `eni_outlined_stack` frame and
+outlined entry now gets a fresh zeroed `ds_outlined_stack` frame and
 models sp/x29 as real pointers; `sub sp`/`add sp` and frame-pointer
 save/restore adjustments are materialized so frame slots stay
-addressable. The entry reloads sp/x29 from `eni_outlined_sp`/
-`eni_outlined_fp` and addresses the same bytes as its dispatcher.
-`ENI_TARGET` resolves jump-table targets back from host image pointers
+addressable. The entry reloads sp/x29 from `ds_outlined_sp`/
+`ds_outlined_fp` and addresses the same bytes as its dispatcher.
+`DS_TARGET` resolves jump-table targets back from host image pointers
 to original VAs and calls the lifted `sub_*` function, so the saved
 context is actually consumed. Generated helper calls now use the
-preamble's `ENI_V*`/`ENI_BITCAST_*` definitions instead of unresolved
+preamble's `DS_V*`/`DS_BITCAST_*` definitions instead of unresolved
 `ext_` stubs, and link-stub generation recognizes the support globals.
 The zero-argument `quazar_arm64` profile reports 325 exact matches, 70
 pointer-only, 217 both-faulted and 1,050 host faults.
@@ -263,15 +263,15 @@ pointer-only, 217 both-faulted and 1,050 host faults.
 - [x] `elf verify` host-vs-emulator differential runner.
 - [x] 32-bit parameter-view seeding and zero-extended returns.
 - [x] TPIDR_EL0 / TLS modeling.
-- [x] Outlined jump-table context (`eni_outlined_ctx`) for callee-saved
+- [x] Outlined jump-table context (`ds_outlined_ctx`) for callee-saved
       registers.
 - [x] Fold prologue-less direct-branch fragments into their surrounding
       function.
 - [x] Preserve fixed-address table bases in indexed accesses.
-- [x] Outlined stack context (`eni_outlined_stack`): dispatchers model
+- [x] Outlined stack context (`ds_outlined_stack`): dispatchers model
       sp/x29 as real pointers, materialize prologue/epilogue sp
       adjustments, and entries reload the same frame.
-- [x] Jump-table dispatcher resolver (`ENI_TARGET`) so an outlined
+- [x] Jump-table dispatcher resolver (`DS_TARGET`) so an outlined
       entry is called as lifted C instead of raw image bytes.
 - [ ] Per-depth outlined stack frames (a nested dispatcher currently
       reuses the single shared frame).
