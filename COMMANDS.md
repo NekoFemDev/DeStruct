@@ -364,9 +364,11 @@ dereferences or by split outlined blocks that still need caller context.
 
 The generated C models `TPIDR_EL0` as a zero-initialized `ds_tls` block, so
 stack-canary and TLS reads match the emulator instead of dereferencing host
-NULL. `bti j` jump-table case bodies that inherit callee-saved registers reload
-them from `ds_outlined_ctx`; the dispatcher saves x19..x28 immediately before
-the indirect branch. Stack-using entries also reload sp/x29 from
+NULL. Outlined entries that inherit callee-saved registers - `bti j`
+jump-table cases and frame-less non-`bti j` helpers alike - reload them from
+`ds_outlined_ctx`; the dispatcher saves x19..x28 immediately before the
+indirect branch. Context detection inspects only the prefix up to the first
+`ret` and rejects candidates that establish their own frame. Stack-using entries also reload sp/x29 from
 `ds_outlined_stack`/`ds_outlined_sp`/`ds_outlined_fp`, and the dispatcher
 materializes its frame adjustments and saves the same frame. Each dispatcher
 invocation allocates its own frame with `__builtin_alloca`

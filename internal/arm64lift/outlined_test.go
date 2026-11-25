@@ -218,4 +218,33 @@ func TestCallerStackUsed(t *testing.T) {
 	}) {
 		t.Fatal("CallerStackUsed false positive")
 	}
+	// Writing sp is not inheriting the caller's frame.
+	if CallerStackUsed([]native.DetailedInstruction{
+		{Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "sp"},
+			{Type: native.OperandReg, Reg: "x16"},
+		}},
+	}) {
+		t.Fatal("CallerStackUsed counted a write to sp")
+	}
+}
+
+func TestOwnsFrame(t *testing.T) {
+	if !OwnsFrame([]native.DetailedInstruction{
+		{Mnemonic: "sub", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "sp"},
+			{Type: native.OperandReg, Reg: "sp"},
+			{Type: native.OperandImm, Imm: 0x20},
+		}},
+	}) {
+		t.Fatal("OwnsFrame did not detect sub sp")
+	}
+	if OwnsFrame([]native.DetailedInstruction{
+		{Mnemonic: "ldr", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x1"}},
+		}},
+	}) {
+		t.Fatal("OwnsFrame false positive")
+	}
 }

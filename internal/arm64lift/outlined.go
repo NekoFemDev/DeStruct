@@ -82,22 +82,43 @@ func CallerContextRegs(insns []native.DetailedInstruction) []string {
 	return out
 }
 
+// OwnsFrame reports whether a block establishes its own stack frame
+// anywhere in the inspected prefix. Such a block is a real function entry
+// (or a merged candidate containing one), not an outlined continuation
+// that inherits sp/x29.
+func OwnsFrame(insns []native.DetailedInstruction) bool {
+	for _, in := range insns {
+		if isSpAdjust(in) {
+			return true
+		}
+		if _, ok := framePointerAddOffset(in); ok {
+			return true
+		}
+		if _, ok := framePointerSubOffset(in); ok {
+			return true
+		}
+		if isFramePointerEstablish(in) {
+			return true
+		}
+		if (in.Mnemonic == "stp" || in.Mnemonic == "str") && in.Writeback && !in.PostIndex {
+			for _, op := range in.Operands {
+				if op.Type == native.OperandMem && op.Mem.Base == "sp" && op.Mem.Disp < 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // CallerStackUsed reports whether a block addresses the caller's stack
 // frame through sp or x29. Outlined entries with this property need the
 // dispatcher's frame, not just its callee-saved registers.
 func CallerStackUsed(insns []native.DetailedInstruction) bool {
 	for _, in := range insns {
-		for _, op := range in.Operands {
-			switch op.Type {
-			case native.OperandMem:
-				if op.Mem.Base == "sp" || op.Mem.Base == "x29" {
-					return true
-				}
-			case native.OperandReg:
-				if normalizeXReg(op.Reg) == "sp" || normalizeXReg(op.Reg) == "x29" {
-					return true
-				}
-			}
+		reads, _ := instructionRegAccess(in)
+		if reads["sp"] || reads["x29"] {
+			return true
 		}
 	}
 	return false

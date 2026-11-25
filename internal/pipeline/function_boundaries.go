@@ -10,11 +10,10 @@ import (
 	"github.com/destruct/destruct/internal/native"
 )
 
-// computeOutlinedContexts finds "bti j" jump-table landing pads that read
-// callee-saved state produced by their dispatcher. A normal BTI call target
-// is "bti c" (or a conventional prologue); "bti j" is specifically the
-// branch-target entry a compiler emits for a jump-table case, so those are
-// the entries that need inherited x19..x28.
+// computeOutlinedContexts finds outlined entries that read caller state.
+// A "bti j" landing pad is always treated as a jump-table case; other
+// entries are accepted when they inherit callee-saved registers or address
+// sp/x29 without establishing their own frame.
 func computeOutlinedContexts(
 	candidates []funcCandidate,
 	elf *native.ELFParser,
@@ -31,15 +30,30 @@ func computeOutlinedContexts(
 		if !ok || len(code) < len(btiJ) {
 			continue
 		}
-		if code[0] != btiJ[0] || code[1] != btiJ[1] || code[2] != btiJ[2] || code[3] != btiJ[3] {
-			continue
-		}
+		isBtiJ := code[0] == btiJ[0] && code[1] == btiJ[1] &&
+			code[2] == btiJ[2] && code[3] == btiJ[3]
 		insns, err := d.DisassembleDetailed(code, c.addr)
 		if err != nil || len(insns) == 0 {
 			continue
 		}
-		regs := arm64lift.CallerContextRegs(insns)
-		stack := arm64lift.CallerStackUsed(insns)
+		// A `bti j` landing pad is a trusted jump-table case. For other
+		// candidates, inspect only up to the first `ret`: a coarse
+		// candidate may contain several real functions, and a later
+		// prologue must not make the first function look outlined.
+		prefix := insns
+		if !isBtiJ {
+			for i, in := range insns {
+				if in.Mnemonic == "ret" {
+					prefix = insns[:i]
+					break
+				}
+			}
+			if len(prefix) == 0 || arm64lift.OwnsFrame(prefix) {
+				continue
+			}
+		}
+		regs := arm64lift.CallerContextRegs(prefix)
+		stack := arm64lift.CallerStackUsed(prefix)
 		if len(regs) > 0 || stack {
 			out[c.addr] = arm64lift.OutlinedContext{Regs: regs, Stack: stack}
 		}

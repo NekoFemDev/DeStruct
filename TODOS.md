@@ -268,6 +268,17 @@ standalone outlined entries. The dynamic alloca also prevents sibling-call
 optimization from releasing the frame before the dispatched callee reads
 it.
 
+Sprint 17 (2026-11-25) is complete:
+non-`bti j` outlined entries. Context detection no longer requires a
+`bti j` landing pad: a candidate that reads inherited callee-saved
+registers or sp/x29 is accepted when it has no frame-establishing
+instruction in the inspected prefix. The prefix stops at the first `ret`,
+which avoids misclassifying coarse candidates that contain several real
+functions. `CallerStackUsed` now looks only at register reads, so a
+`mov sp, x16` stack switch is not mistaken for inherited stack state.
+On `quazar_arm64` this identifies four outlined entries (the three
+jump-table cases plus the register/context save helper at `sub_94435c`).
+
 - [x] Optional Unicorn backend behind the `unicorn` build tag
       (`make unicorn build-unicorn`).
 - [x] `elf emulate` with image/relocation/import setup.
@@ -285,10 +296,13 @@ it.
 - [x] Jump-table dispatcher resolver (`DS_TARGET`) so an outlined
       entry is called as lifted C instead of raw image bytes.
 - [x] Per-depth outlined stack frames (`DS_OUTLINED_FRAME_ALLOC`).
-- [ ] Extend outlined context recovery to non-`bti j` outlined
-      subroutines.
+- [x] Extend outlined context recovery to non-`bti j` outlined
+      subroutines (frame-owning candidates rejected; prefix stops at the
+      first `ret`).
 - [ ] Reconstruct jump-table switches whose case bodies branch back into
       the dispatcher (e.g. `sub_94242c`).
+- [ ] Propagate x30 and SIMD registers for context-save helpers like
+      `sub_94435c`.
 - [ ] Structured fuzzing with pointer/struct argument profiles.
 - [ ] Memory-effects comparison (writable image hash) in verify.
 
