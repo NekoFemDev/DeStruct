@@ -368,9 +368,12 @@ NULL. `bti j` jump-table case bodies that inherit callee-saved registers reload
 them from `ds_outlined_ctx`; the dispatcher saves x19..x28 immediately before
 the indirect branch. Stack-using entries also reload sp/x29 from
 `ds_outlined_stack`/`ds_outlined_sp`/`ds_outlined_fp`, and the dispatcher
-materializes its frame adjustments and saves the same frame. `ds_targets.c`
-resolves indirect jump-table addresses back to original VAs so the dispatcher
-calls a lifted `sub_*` function rather than raw image bytes. Prologue-less
+materializes its frame adjustments and saves the same frame. Each dispatcher
+invocation allocates its own frame with `__builtin_alloca`
+(`DS_OUTLINED_FRAME_ALLOC`), so nested outlined dispatches cannot clobber an
+outer frame. `ds_targets.c` resolves indirect jump-table addresses back to
+original VAs so the dispatcher calls a lifted `sub_*` function rather than raw
+image bytes. Prologue-less
 direct-branch fragments are folded back into the surrounding function instead
 of being emitted as standalone context-less entries.
 

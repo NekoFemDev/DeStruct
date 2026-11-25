@@ -519,11 +519,14 @@ func (l *lifter) seedOutlinedStack() []ir.Stmt {
 		l.x29Known = false
 		return stmts
 	}
-	stmts = append(stmts, &ir.ExprStmt{Expr: &ir.StaticMethodCall{Method: "DS_OUTLINED_STACK_RESET"}})
 	stmts = append(stmts, &ir.AssignStmt{
 		Target: &ir.LocalVar{Name: "sp"},
-		Value:  &ir.AddrLit{Label: dsOutlinedStackSP},
+		Value:  &ir.StaticMethodCall{Method: "DS_OUTLINED_FRAME_ALLOC"},
 	})
+	stmts = append(stmts, &ir.ExprStmt{Expr: &ir.StaticMethodCall{
+		Method: "DS_OUTLINED_FRAME_RESET",
+		Args:   []ir.Expr{&ir.LocalVar{Name: "sp"}},
+	}})
 	l.regs["sp"] = &ir.LocalVar{Name: "sp"}
 	l.markWritten("sp")
 	l.regWidths["sp"] = 64

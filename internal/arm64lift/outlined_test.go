@@ -85,8 +85,8 @@ func TestJumpTableDispatchSavesOutlinedContext(t *testing.T) {
 	out := renderForTest(stmts)
 	for _, want := range []string{
 		"ds_outlined_ctx[0] = x19;",
-		"DS_OUTLINED_STACK_RESET();",
-		"sp = DS_OUTLINED_STACK_SP;",
+		"DS_OUTLINED_FRAME_RESET(sp);",
+		"sp = DS_OUTLINED_FRAME_ALLOC();",
 		"ds_outlined_sp = sp;",
 		"ds_outlined_fp = x29;",
 		"DS_TARGET(",
@@ -124,7 +124,7 @@ func TestOutlinedStackFrameAdjustments(t *testing.T) {
 	})
 	out := renderForTest(stmts)
 	for _, want := range []string{
-		"sp = DS_OUTLINED_STACK_SP;",
+		"sp = DS_OUTLINED_FRAME_ALLOC();",
 		"sp = sp - 32;",
 		"x29 = sp;",
 		"ds_outlined_sp = sp;",

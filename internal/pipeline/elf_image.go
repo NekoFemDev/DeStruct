@@ -25,6 +25,7 @@ func writeRuntimeSupport(dir string) error {
  * and their helpers. The TLS base sits in the middle of its block so both
  * positive and negative thread-local offsets remain in bounds. */
 #include <stdint.h>
+#include <string.h>
 
 unsigned char ds_tls[0x10000];
 
@@ -40,6 +41,7 @@ uintptr_t ds_outlined_fp;
 
 __attribute__((constructor)) static void ds_outlined_stack_init(void)
 {
+    memset(ds_outlined_stack, 0, sizeof ds_outlined_stack);
     ds_outlined_sp = (uintptr_t)(ds_outlined_stack + 0x8000);
 }
 `

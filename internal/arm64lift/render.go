@@ -234,7 +234,11 @@ func WriteCFilePreamble(w io.Writer, sourceName string) {
 	io.WriteString(w, "extern uintptr_t ds_outlined_fp;\n")
 	io.WriteString(w, "#define DS_OUTLINED_STACK ((uintptr_t)ds_outlined_stack)\n")
 	io.WriteString(w, "#define DS_OUTLINED_STACK_SP ((uintptr_t)(ds_outlined_stack + 0x8000))\n")
-	io.WriteString(w, "static inline void DS_OUTLINED_STACK_RESET(void) { memset(ds_outlined_stack, 0, 0x10000); }\n\n")
+	// Each dispatcher invocation allocates its own frame on the C stack,
+	// so nested outlined dispatches cannot clobber an outer frame.
+	io.WriteString(w, "#define DS_OUTLINED_FRAME_SIZE ((size_t)0x8000)\n")
+	io.WriteString(w, "#define DS_OUTLINED_FRAME_ALLOC() ((uintptr_t)__builtin_alloca(DS_OUTLINED_FRAME_SIZE) + (DS_OUTLINED_FRAME_SIZE >> 1))\n")
+	io.WriteString(w, "#define DS_OUTLINED_FRAME_RESET(spv) memset((void*)((uintptr_t)(spv) - (DS_OUTLINED_FRAME_SIZE >> 1)), 0, DS_OUTLINED_FRAME_SIZE)\n\n")
 	// Lane-wise vector helpers. The IR keeps q-registers as ds_uint128,
 	// so these reinterpret the same 16 bytes with the arrangement named
 	// in the suffix (4s, 2d, 8h, 16b).

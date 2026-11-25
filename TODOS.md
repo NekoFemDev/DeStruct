@@ -257,6 +257,17 @@ preamble's `DS_V*`/`DS_BITCAST_*` definitions instead of unresolved
 The zero-argument `quazar_arm64` profile reports 325 exact matches, 70
 pointer-only, 217 both-faulted and 1,050 host faults.
 
+Sprint 16 (2026-11-25) is complete:
+per-depth outlined stack frames. Each dispatcher invocation now allocates
+its own 32 KiB frame with `__builtin_alloca` and sets `sp` to its midpoint
+(`DS_OUTLINED_FRAME_ALLOC`), then zeroes only that frame. A nested
+outlined dispatcher therefore gets a separate frame instead of resetting
+the single global buffer, and recursion/re-entry no longer clobbers an
+outer frame. The global `ds_outlined_stack` remains as a fallback for
+standalone outlined entries. The dynamic alloca also prevents sibling-call
+optimization from releasing the frame before the dispatched callee reads
+it.
+
 - [x] Optional Unicorn backend behind the `unicorn` build tag
       (`make unicorn build-unicorn`).
 - [x] `elf emulate` with image/relocation/import setup.
@@ -273,8 +284,7 @@ pointer-only, 217 both-faulted and 1,050 host faults.
       adjustments, and entries reload the same frame.
 - [x] Jump-table dispatcher resolver (`DS_TARGET`) so an outlined
       entry is called as lifted C instead of raw image bytes.
-- [ ] Per-depth outlined stack frames (a nested dispatcher currently
-      reuses the single shared frame).
+- [x] Per-depth outlined stack frames (`DS_OUTLINED_FRAME_ALLOC`).
 - [ ] Extend outlined context recovery to non-`bti j` outlined
       subroutines.
 - [ ] Reconstruct jump-table switches whose case bodies branch back into
