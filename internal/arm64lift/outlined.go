@@ -2,6 +2,7 @@ package arm64lift
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/destruct/destruct/internal/ir"
@@ -16,6 +17,7 @@ import (
 // Index i corresponds to x(19+i).
 const (
 	dsOutlinedCtx        = "ds_outlined_ctx"
+	dsOutlinedVec        = "ds_outlined_vec"
 	dsOutlinedStackLabel = "DS_OUTLINED_STACK"
 	dsOutlinedStackSP    = "DS_OUTLINED_STACK_SP"
 	dsOutlinedSP         = "ds_outlined_sp"
@@ -23,24 +25,47 @@ const (
 )
 
 // OutlinedContext describes the caller state an outlined entry inherits.
-// Regs lists the callee-saved registers read before being written; Stack
-// reports that the entry also addresses its dispatcher's stack frame
-// through sp/x29.
+// Regs lists callee-saved GPRs read before being written, Vec the
+// double-precision SIMD registers, Stack inherited sp/x29, and Link an
+// inherited x30 return address.
 type OutlinedContext struct {
 	Regs  []string
+	Vec   []string
 	Stack bool
+	Link  bool
 }
 
 // outlinedDispatch is the per-"br" form of OutlinedContext used while
 // lifting a dispatcher.
 type outlinedDispatch struct {
 	regs  []string
+	vec   []string
 	stack bool
+	link  bool
 }
 
 var outlinedContextRegs = []string{
 	"x19", "x20", "x21", "x22", "x23",
 	"x24", "x25", "x26", "x27", "x28",
+}
+
+var outlinedVectorRegs = func() []string {
+	out := make([]string, 32)
+	for i := range out {
+		out[i] = "d" + strconv.Itoa(i)
+	}
+	return out
+}()
+
+func outlinedVectorIndex(reg string) int {
+	if len(reg) < 2 || reg[0] != 'd' {
+		return -1
+	}
+	n, err := strconv.Atoi(reg[1:])
+	if err != nil || n < 0 || n > 31 {
+		return -1
+	}
+	return n
 }
 
 func outlinedContextIndex(reg string) int {
@@ -80,6 +105,98 @@ func CallerContextRegs(insns []native.DetailedInstruction) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// CallerVectorRegs returns the double-precision SIMD registers a block
+// reads before writing them - vector state inherited from its caller.
+func CallerVectorRegs(insns []native.DetailedInstruction) []string {
+	unwritten := make(map[string]bool, len(outlinedVectorRegs))
+	for _, r := range outlinedVectorRegs {
+		unwritten[r] = true
+	}
+	var out []string
+	for _, in := range insns {
+		reads, writes := instructionRegAccess(in)
+		for _, reg := range outlinedVectorRegs {
+			if unwritten[reg] && reads[reg] {
+				out = append(out, reg)
+				delete(unwritten, reg)
+			}
+		}
+		for _, reg := range outlinedVectorRegs {
+			if writes[reg] {
+				delete(unwritten, reg)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return outlinedVectorIndex(out[i]) < outlinedVectorIndex(out[j])
+	})
+	return out
+}
+
+// IsVectorSaveHelper reports whether a block stores a large set of SIMD
+// registers to caller-provided memory - the setjmp/context-save shape.
+func IsVectorSaveHelper(insns []native.DetailedInstruction) bool {
+	seen := make(map[int]bool)
+	for _, in := range insns {
+		if in.Mnemonic != "stp" && in.Mnemonic != "str" {
+			continue
+		}
+		toMemory := false
+		for _, op := range in.Operands {
+			if op.Type == native.OperandMem && op.Mem.Base != "sp" {
+				toMemory = true
+			}
+		}
+		if !toMemory {
+			continue
+		}
+		for _, op := range in.Operands {
+			if op.Type != native.OperandReg {
+				continue
+			}
+			if idx := outlinedVectorIndex(op.Reg); idx >= 0 {
+				seen[idx] = true
+			}
+		}
+	}
+	return len(seen) >= 16
+}
+
+// CallerVectorContext selects the SIMD state an outlined entry should
+// inherit. A context-save helper keeps every dN it reads; ordinary
+// entries are limited to the callee-saved d8..d15 range so FP argument
+// registers are not mistaken for hidden context.
+func CallerVectorContext(insns []native.DetailedInstruction) []string {
+	regs := CallerVectorRegs(insns)
+	if IsVectorSaveHelper(insns) {
+		return regs
+	}
+	out := make([]string, 0, len(regs))
+	for _, reg := range regs {
+		if idx := outlinedVectorIndex(reg); idx >= 8 && idx < 16 {
+			out = append(out, reg)
+		}
+	}
+	return out
+}
+
+// ReadsLinkRegister reports whether a block reads x30 before writing it.
+// Outlined context-save helpers store the return address and must see the
+// real LR rather than a zero-initialized local.
+func ReadsLinkRegister(insns []native.DetailedInstruction) bool {
+	unwritten := true
+	for _, in := range insns {
+		reads, writes := instructionRegAccess(in)
+		if unwritten && reads["x30"] {
+			return true
+		}
+		if writes["x30"] {
+			unwritten = false
+		}
+	}
+	return false
 }
 
 // OwnsFrame reports whether a block establishes its own stack frame
@@ -326,7 +443,9 @@ func analyzeJumpTableContext(
 			continue
 		}
 		needed := make(map[string]bool)
+		neededVec := make(map[string]bool)
 		needStack := false
+		needLink := false
 		entries := 0
 		for off := 0; off+loadWidth <= len(data) && entries < 512; off += loadWidth {
 			var v uint64
@@ -344,10 +463,14 @@ func analyzeJumpTableContext(
 				for _, reg := range ctx.Regs {
 					needed[reg] = true
 				}
+				for _, reg := range ctx.Vec {
+					neededVec[reg] = true
+				}
 				needStack = needStack || ctx.Stack
+				needLink = needLink || ctx.Link
 			}
 		}
-		if len(needed) == 0 && !needStack {
+		if len(needed) == 0 && len(neededVec) == 0 && !needStack && !needLink {
 			continue
 		}
 		regs := make([]string, 0, len(needed))
@@ -356,7 +479,13 @@ func analyzeJumpTableContext(
 				regs = append(regs, reg)
 			}
 		}
-		out[in.Address] = outlinedDispatch{regs: regs, stack: needStack}
+		vec := make([]string, 0, len(neededVec))
+		for _, reg := range outlinedVectorRegs {
+			if neededVec[reg] {
+				vec = append(vec, reg)
+			}
+		}
+		out[in.Address] = outlinedDispatch{regs: regs, vec: vec, stack: needStack, link: needLink}
 	}
 	return out
 }
@@ -420,6 +549,29 @@ func (l *lifter) seedOutlinedContext() []ir.Stmt {
 		l.markWritten(reg)
 		l.regWidths[reg] = 64
 	}
+	for _, reg := range l.opts.OutlinedVec {
+		if outlinedVectorIndex(reg) < 0 {
+			continue
+		}
+		stmts = append(stmts, &ir.AssignStmt{
+			Target: &ir.LocalVar{Name: reg},
+			Value: &ir.StaticMethodCall{
+				Method: "DS_BITCAST_F64",
+				Args:   []ir.Expr{outlinedVectorExpr(reg)},
+			},
+		})
+		l.regs[reg] = &ir.LocalVar{Name: reg}
+		l.markWritten(reg)
+	}
+	if l.opts.OutlinedLink {
+		stmts = append(stmts, &ir.AssignStmt{
+			Target: &ir.LocalVar{Name: "x30"},
+			Value:  &ir.StaticMethodCall{Method: "DS_RETURN_ADDRESS"},
+		})
+		l.regs["x30"] = &ir.LocalVar{Name: "x30"}
+		l.markWritten("x30")
+		l.regWidths["x30"] = 64
+	}
 	return stmts
 }
 
@@ -471,7 +623,12 @@ func directTargetNeedsOutlinedStack(insns []native.DetailedInstruction, targets 
 
 // saveOutlinedTarget is saveOutlinedDispatch for a directly named target.
 func (l *lifter) saveOutlinedTarget(ctx OutlinedContext) []ir.Stmt {
-	return l.saveOutlinedDispatch(outlinedDispatch{regs: ctx.Regs, stack: ctx.Stack})
+	return l.saveOutlinedDispatch(outlinedDispatch{
+		regs:  ctx.Regs,
+		vec:   ctx.Vec,
+		stack: ctx.Stack,
+		link:  ctx.Link,
+	})
 }
 
 // saveOutlinedDispatch saves everything a dispatcher's outlined target
@@ -479,8 +636,38 @@ func (l *lifter) saveOutlinedTarget(ctx OutlinedContext) []ir.Stmt {
 // pointer/frame pointer into the shared outlined stack block.
 func (l *lifter) saveOutlinedDispatch(d outlinedDispatch) []ir.Stmt {
 	stmts := l.saveOutlinedContext(d.regs)
+	stmts = append(stmts, l.saveOutlinedVectors(d.vec)...)
 	if d.stack && l.outlinedStack {
 		stmts = append(stmts, l.saveOutlinedStack()...)
+	}
+	return stmts
+}
+
+// saveOutlinedVectors materializes and stores SIMD state for outlined
+// context-save helpers. dN is stored as its raw 64-bit pattern.
+func (l *lifter) saveOutlinedVectors(regs []string) []ir.Stmt {
+	var stmts []ir.Stmt
+	for _, reg := range regs {
+		if outlinedVectorIndex(reg) < 0 {
+			continue
+		}
+		val := l.regValue(reg)
+		l.consume(val)
+		if lv, ok := val.(*ir.LocalVar); !ok || lv.Name != reg {
+			stmts = append(stmts, &ir.AssignStmt{
+				Target: &ir.LocalVar{Name: reg},
+				Value:  val,
+			})
+			l.regs[reg] = &ir.LocalVar{Name: reg}
+			l.markWritten(reg)
+		}
+		stmts = append(stmts, &ir.AssignStmt{
+			Target: outlinedVectorExpr(reg),
+			Value: &ir.StaticMethodCall{
+				Method: "DS_BITCAST_U64",
+				Args:   []ir.Expr{&ir.LocalVar{Name: reg}},
+			},
+		})
 	}
 	return stmts
 }
@@ -571,6 +758,19 @@ func outlinedContextExpr(reg string) ir.Expr {
 	}
 	return &ir.ArrayAccess{
 		Array: &ir.LocalVar{Name: dsOutlinedCtx},
+		Index: &ir.IntLit{Value: int64(idx)},
+		Width: 8,
+	}
+}
+
+// outlinedVectorExpr is the C expression for one saved SIMD slot.
+func outlinedVectorExpr(reg string) ir.Expr {
+	idx := outlinedVectorIndex(reg)
+	if idx < 0 {
+		return &ir.IntLit{Value: 0}
+	}
+	return &ir.ArrayAccess{
+		Array: &ir.LocalVar{Name: dsOutlinedVec},
 		Index: &ir.IntLit{Value: int64(idx)},
 		Width: 8,
 	}

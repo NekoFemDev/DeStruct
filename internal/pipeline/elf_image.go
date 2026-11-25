@@ -32,6 +32,7 @@ unsigned char ds_tls[0x10000];
 /* Callee-saved context saved by a jump-table dispatcher and reloaded by
  * an outlined entry. Index i corresponds to x(19+i). */
 uint64_t ds_outlined_ctx[10];
+uint64_t ds_outlined_vec[32];
 
 /* Shared stack frame used when an outlined entry inherits its
  * dispatcher's sp/x29. */

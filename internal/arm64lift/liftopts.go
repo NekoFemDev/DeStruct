@@ -99,6 +99,14 @@ type LiftOptions struct {
 	// body so the generated C no longer treats them as zero.
 	OutlinedContextRegs []string
 
+	// OutlinedVec lists double-precision SIMD registers inherited from
+	// the dispatcher. The lifter loads them from ds_outlined_vec.
+	OutlinedVec []string
+
+	// OutlinedLink marks an outlined entry that saves x30; the lifter
+	// loads the real return address via DS_RETURN_ADDRESS().
+	OutlinedLink bool
+
 	// OutlinedStack marks this function as an outlined entry that also
 	// inherits its dispatcher's stack frame. sp/x29 are loaded from the
 	// shared ds_outlined_stack block.

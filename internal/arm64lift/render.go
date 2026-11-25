@@ -228,8 +228,10 @@ func WriteCFilePreamble(w io.Writer, sourceName string) {
 	io.WriteString(w, "extern unsigned char ds_tls[];\n")
 	io.WriteString(w, "#define DS_TLS_BASE ((uintptr_t)(ds_tls + 0x8000))\n")
 	io.WriteString(w, "extern uint64_t ds_outlined_ctx[10];\n")
+	io.WriteString(w, "extern uint64_t ds_outlined_vec[32];\n")
 	io.WriteString(w, "extern unsigned char ds_outlined_stack[];\n")
 	io.WriteString(w, "extern uint64_t DS_TARGET(uintptr_t);\n")
+	io.WriteString(w, "#define DS_RETURN_ADDRESS() ((uint64_t)(uintptr_t)__builtin_return_address(0))\n")
 	io.WriteString(w, "extern uintptr_t ds_outlined_sp;\n")
 	io.WriteString(w, "extern uintptr_t ds_outlined_fp;\n")
 	io.WriteString(w, "#define DS_OUTLINED_STACK ((uintptr_t)ds_outlined_stack)\n")
@@ -590,7 +592,7 @@ func (r *cRenderer) useVar(raw string) string {
 	}
 	// ds_outlined_* names are extern globals declared by the preamble,
 	// not synthesized locals.
-	if raw == dsOutlinedCtx || raw == dsOutlinedSP || raw == dsOutlinedFP {
+	if raw == dsOutlinedCtx || raw == dsOutlinedVec || raw == dsOutlinedSP || raw == dsOutlinedFP {
 		r.varNames[raw] = raw
 		r.origByMapped[raw] = raw
 		r.usedOrig[raw] = true
@@ -1392,8 +1394,13 @@ func (r *cRenderer) expr(e ir.Expr) string {
 	case *ir.IndirectCall:
 		return "((uint64_t (*)())(" + r.expr(v.Callee) + "))(" + r.exprList(v.Args) + ")"
 	case *ir.ArrayAccess:
-		if lv, ok := v.Array.(*ir.LocalVar); ok && lv.Name == dsOutlinedCtx && v.Width == 8 {
-			return dsOutlinedCtx + "[" + r.expr(v.Index) + "]"
+		if lv, ok := v.Array.(*ir.LocalVar); ok && v.Width == 8 {
+			if lv.Name == dsOutlinedCtx {
+				return dsOutlinedCtx + "[" + r.expr(v.Index) + "]"
+			}
+			if lv.Name == dsOutlinedVec {
+				return dsOutlinedVec + "[" + r.expr(v.Index) + "]"
+			}
 		}
 		ctype := cTypeForWidth(v.Width)
 		if v.CType != "" {

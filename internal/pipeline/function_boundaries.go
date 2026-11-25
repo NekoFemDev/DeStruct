@@ -53,9 +53,16 @@ func computeOutlinedContexts(
 			}
 		}
 		regs := arm64lift.CallerContextRegs(prefix)
+		vec := arm64lift.CallerVectorContext(prefix)
 		stack := arm64lift.CallerStackUsed(prefix)
-		if len(regs) > 0 || stack {
-			out[c.addr] = arm64lift.OutlinedContext{Regs: regs, Stack: stack}
+		link := arm64lift.ReadsLinkRegister(prefix)
+		if len(regs) > 0 || len(vec) > 0 || stack || link {
+			out[c.addr] = arm64lift.OutlinedContext{
+				Regs:  regs,
+				Vec:   vec,
+				Stack: stack,
+				Link:  link,
+			}
 		}
 	}
 	return out

@@ -1,6 +1,7 @@
 package arm64lift
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -39,6 +40,79 @@ func TestCallerContextRegsIgnoresSpillAndLocalWrite(t *testing.T) {
 	}
 	if got := CallerContextRegs(insns); len(got) != 0 {
 		t.Fatalf("CallerContextRegs = %v, want none", got)
+	}
+}
+
+func TestCallerVectorContext(t *testing.T) {
+	// A context-save helper stores the full d0..d31 range.
+	var save []native.DetailedInstruction
+	for i := 0; i < 16; i++ {
+		save = append(save, native.DetailedInstruction{
+			Mnemonic: "stp",
+			Operands: []native.Operand{
+				{Type: native.OperandReg, Reg: fmt.Sprintf("d%d", 2*i)},
+				{Type: native.OperandReg, Reg: fmt.Sprintf("d%d", 2*i+1)},
+				{Type: native.OperandMem, Mem: native.MemOperand{Base: "x0"}},
+			},
+		})
+	}
+	if got := CallerVectorContext(save); len(got) != 32 {
+		t.Fatalf("save helper vector context = %v, want 32 regs", got)
+	}
+
+	// An ordinary entry only inherits callee-saved d8..d15; d0 is an FP
+	// argument register, not hidden context.
+	ordinary := []native.DetailedInstruction{
+		{Mnemonic: "str", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "d0"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x0"}},
+		}},
+		{Mnemonic: "str", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "d8"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x1"}},
+		}},
+	}
+	if got := CallerVectorContext(ordinary); len(got) != 1 || got[0] != "d8" {
+		t.Fatalf("ordinary vector context = %v, want [d8]", got)
+	}
+}
+
+func TestReadsLinkRegister(t *testing.T) {
+	if !ReadsLinkRegister([]native.DetailedInstruction{
+		{Mnemonic: "str", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x30"},
+			{Type: native.OperandMem, Mem: native.MemOperand{Base: "x0"}},
+		}},
+	}) {
+		t.Fatal("ReadsLinkRegister missed x30")
+	}
+	if ReadsLinkRegister([]native.DetailedInstruction{
+		{Mnemonic: "mov", Operands: []native.Operand{
+			{Type: native.OperandReg, Reg: "x30"},
+			{Type: native.OperandReg, Reg: "x0"},
+		}},
+	}) {
+		t.Fatal("ReadsLinkRegister counted a write")
+	}
+}
+
+func TestOutlinedVectorAndLinkSeed(t *testing.T) {
+	insns := disassembleWords(t, 0x1000, []uint32{
+		0xfd000008, // str d8, [x0]
+		0xf900001e, // str x30, [x0]
+		0xd65f03c0, // ret
+	})
+	out := renderForTest(LiftFunctionWithOptions(insns, nil, nil, nil, nil, LiftOptions{
+		OutlinedVec:  []string{"d8"},
+		OutlinedLink: true,
+	}))
+	for _, want := range []string{
+		"d8 = DS_BITCAST_F64(ds_outlined_vec[8]);",
+		"x30 = DS_RETURN_ADDRESS();",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("outlined vector/link seed missing %q:\n%s", want, out)
+		}
 	}
 }
 

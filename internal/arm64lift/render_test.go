@@ -383,7 +383,9 @@ func TestPreambleUsesDSPrefix(t *testing.T) {
 		"extern unsigned char ds_image[];",
 		"extern unsigned char ds_tls[];",
 		"extern uint64_t ds_outlined_ctx[10];",
+		"extern uint64_t ds_outlined_vec[32];",
 		"extern uint64_t DS_TARGET(uintptr_t);",
+		"#define DS_RETURN_ADDRESS()",
 		"DS_DEFINE_VEC_BIN",
 	} {
 		if !strings.Contains(out, want) {

@@ -279,6 +279,19 @@ functions. `CallerStackUsed` now looks only at register reads, so a
 On `quazar_arm64` this identifies four outlined entries (the three
 jump-table cases plus the register/context save helper at `sub_94435c`).
 
+Sprint 18 (2026-11-25) is complete:
+x30 and SIMD outlined context. A context-save helper that stores x30 now
+loads the real return address with `DS_RETURN_ADDRESS()`
+(`__builtin_return_address(0)`). SIMD state is carried in
+`ds_outlined_vec[32]`: callers save the d-register bit patterns before the
+dispatch and entries rebind them with `DS_BITCAST_F64`. Ordinary outlined
+entries inherit only the callee-saved d8..d15 range, while a detected
+full-register save helper keeps d0..d31 so FP argument registers are not
+mistaken for hidden context. The zero-argument verify profile remains
+325 exact matches, 70 pointer-only, 217 both-faulted and 1,050 host
+faults; the improvement is in recompiled context contents, which the
+return-value oracle does not observe.
+
 - [x] Optional Unicorn backend behind the `unicorn` build tag
       (`make unicorn build-unicorn`).
 - [x] `elf emulate` with image/relocation/import setup.
@@ -299,10 +312,12 @@ jump-table cases plus the register/context save helper at `sub_94435c`).
 - [x] Extend outlined context recovery to non-`bti j` outlined
       subroutines (frame-owning candidates rejected; prefix stops at the
       first `ret`).
+- [x] Propagate x30 and SIMD context for context-save helpers
+      (`DS_RETURN_ADDRESS`, `ds_outlined_vec`).
 - [ ] Reconstruct jump-table switches whose case bodies branch back into
       the dispatcher (e.g. `sub_94242c`).
-- [ ] Propagate x30 and SIMD registers for context-save helpers like
-      `sub_94435c`.
+- [ ] Propagate x1..x18 for full register-save helpers; the current
+      context covers x19..x30, sp/x29 and d0..d31.
 - [ ] Structured fuzzing with pointer/struct argument profiles.
 - [ ] Memory-effects comparison (writable image hash) in verify.
 

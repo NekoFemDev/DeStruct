@@ -4929,7 +4929,8 @@ func (l *lifter) liftBr(inst native.DetailedInstruction) []ir.Stmt {
 	}
 	d := l.jumpTableCtx[inst.Address]
 	call := l.buildIndirectCall(inst.Operands[0].Reg, true)
-	if ic, ok := call.(*ir.IndirectCall); ok && (len(d.regs) > 0 || d.stack) {
+	if ic, ok := call.(*ir.IndirectCall); ok &&
+		(len(d.regs) > 0 || len(d.vec) > 0 || d.stack || d.link) {
 		// A jump table that reaches an outlined entry must dispatch to the
 		// lifted C function, not raw image bytes, so the saved register
 		// and stack context is actually consumed.

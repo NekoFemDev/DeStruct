@@ -368,7 +368,10 @@ NULL. Outlined entries that inherit callee-saved registers - `bti j`
 jump-table cases and frame-less non-`bti j` helpers alike - reload them from
 `ds_outlined_ctx`; the dispatcher saves x19..x28 immediately before the
 indirect branch. Context detection inspects only the prefix up to the first
-`ret` and rejects candidates that establish their own frame. Stack-using entries also reload sp/x29 from
+`ret` and rejects candidates that establish their own frame. Context-save
+helpers additionally reload x30 via `DS_RETURN_ADDRESS()` and d-register bit
+patterns from `ds_outlined_vec`; ordinary entries inherit only the callee-saved
+d8..d15 range. Stack-using entries also reload sp/x29 from
 `ds_outlined_stack`/`ds_outlined_sp`/`ds_outlined_fp`, and the dispatcher
 materializes its frame adjustments and saves the same frame. Each dispatcher
 invocation allocates its own frame with `__builtin_alloca`

@@ -1270,6 +1270,8 @@ func (p *Pipeline) liftOptionsFor(c funcCandidate) arm64lift.LiftOptions {
 		CodeContains:           p.codeContains,
 		KnownFunction:          p.knownFunction,
 		OutlinedContextRegs:    p.outlinedContexts[c.addr].Regs,
+		OutlinedVec:            p.outlinedContexts[c.addr].Vec,
+		OutlinedLink:           p.outlinedContexts[c.addr].Link,
 		OutlinedStack:          p.outlinedContexts[c.addr].Stack,
 		OutlinedContextTargets: p.outlinedContexts,
 		CondMiss: func(op string, addr uint64) {
